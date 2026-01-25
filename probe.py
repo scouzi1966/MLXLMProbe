@@ -38,6 +38,92 @@ except ImportError as e:
     print("Install with: pip install -r requirements.txt")
     sys.exit(1)
 
+try:
+    from huggingface_hub import HfApi, list_models
+    HF_HUB_AVAILABLE = True
+except ImportError:
+    HF_HUB_AVAILABLE = False
+
+
+# =============================================================================
+# HuggingFace Model Browser
+# =============================================================================
+
+# Model architectures supported by mlx-lm (from mlx_lm/models/)
+MLX_LM_SUPPORTED_ARCHITECTURES = {
+    "llama", "mistral", "mixtral", "phi", "phi3", "phimoe",
+    "qwen", "qwen2", "qwen2_moe", "gemma", "gemma2",
+    "starcoder", "starcoder2", "cohere", "dbrx", "deepseek",
+    "falcon", "gpt2", "gpt_bigcode", "gpt_neox", "internlm2",
+    "mamba", "minicpm", "nemotron", "olmo", "openelm",
+    "stablelm", "plamo", "recurrentgemma", "afm7"
+}
+
+
+@st.cache_data(ttl=3600, show_spinner=False)  # Cache for 1 hour
+def fetch_mlx_community_models(limit: int = 200) -> List[Dict]:
+    """
+    Fetch models from mlx-community on HuggingFace.
+
+    Returns list of model info dicts with id, downloads, likes, etc.
+    Only returns models that are likely compatible with mlx-lm.
+    """
+    if not HF_HUB_AVAILABLE:
+        return []
+
+    try:
+        api = HfApi()
+        models = list(api.list_models(
+            author="mlx-community",
+            sort="downloads",
+            direction=-1,
+            limit=limit
+        ))
+
+        model_list = []
+        for model in models:
+            model_id = model.id
+
+            # Filter: must have model files (safetensors or similar)
+            # Most mlx-community models follow naming patterns
+            model_name_lower = model_id.lower()
+
+            # Check if it's likely an LLM (not embedding, not image, etc.)
+            skip_keywords = ['embed', 'clip', 'image', 'vision', 'audio', 'whisper', 'encoder-only']
+            if any(kw in model_name_lower for kw in skip_keywords):
+                continue
+
+            # Get model info
+            model_info = {
+                'id': model_id,
+                'name': model_id.split('/')[-1],
+                'downloads': getattr(model, 'downloads', 0) or 0,
+                'likes': getattr(model, 'likes', 0) or 0,
+            }
+            model_list.append(model_info)
+
+        return model_list
+
+    except Exception as e:
+        st.warning(f"Could not fetch models: {e}")
+        return []
+
+
+def format_model_option(model: Dict) -> str:
+    """Format model info for display in selectbox."""
+    name = model['name']
+    downloads = model['downloads']
+
+    # Format downloads
+    if downloads >= 1_000_000:
+        dl_str = f"{downloads/1_000_000:.1f}M"
+    elif downloads >= 1_000:
+        dl_str = f"{downloads/1_000:.1f}K"
+    else:
+        dl_str = str(downloads)
+
+    return f"{name} ({dl_str} downloads)"
+
 
 # =============================================================================
 # Data Classes
@@ -728,38 +814,113 @@ def main():
     # Sidebar
     st.sidebar.header("Model")
 
-    # Model path input
-    default_model = st.sidebar.text_input(
-        "Model path or HuggingFace ID",
-        value="mlx-community/Llama-3.2-1B-Instruct-4bit",
-        help="Path to local MLX model or HuggingFace model ID"
+    # Model selection mode
+    input_mode = st.sidebar.radio(
+        "Select model by",
+        ["Browse mlx-community", "Enter path manually"],
+        horizontal=True,
+        label_visibility="collapsed"
     )
 
+    selected_model = None
+
+    if input_mode == "Browse mlx-community":
+        # Fetch and display mlx-community models
+        if HF_HUB_AVAILABLE:
+            with st.sidebar.container():
+                st.caption("Browse [mlx-community](https://huggingface.co/mlx-community) models")
+
+                # Fetch models (cached)
+                with st.spinner("Loading model list..."):
+                    models = fetch_mlx_community_models(limit=300)
+
+                if models:
+                    # Search filter
+                    search = st.text_input(
+                        "🔍 Filter models",
+                        placeholder="e.g., llama, mistral, 4bit...",
+                        key="model_search"
+                    )
+
+                    # Filter models by search
+                    if search:
+                        search_lower = search.lower()
+                        filtered = [m for m in models if search_lower in m['name'].lower()]
+                    else:
+                        filtered = models
+
+                    if filtered:
+                        # Create options
+                        options = {format_model_option(m): m['id'] for m in filtered[:100]}
+
+                        selected_display = st.selectbox(
+                            "Select model",
+                            options=list(options.keys()),
+                            key="model_select"
+                        )
+
+                        if selected_display:
+                            selected_model = options[selected_display]
+                            st.caption(f"`{selected_model}`")
+                    else:
+                        st.warning("No models match your search.")
+                else:
+                    st.warning("Could not load model list.")
+        else:
+            st.sidebar.warning("Install `huggingface-hub` to browse models")
+            input_mode = "Enter path manually"
+
+    if input_mode == "Enter path manually":
+        # Manual path input
+        selected_model = st.sidebar.text_input(
+            "Model path or HuggingFace ID",
+            value="mlx-community/Llama-3.2-1B-Instruct-4bit",
+            help="Path to local MLX model or HuggingFace model ID"
+        )
+
     # Load model button
-    if st.sidebar.button("Load Model", type="primary"):
-        with st.spinner(f"Loading {default_model}..."):
-            try:
-                from mlx_lm import load
-                model, tokenizer = load(default_model)
-                st.session_state.model = model
-                st.session_state.tokenizer = tokenizer
-                st.session_state.model_path = default_model
-                st.sidebar.success("Model loaded!")
-            except Exception as e:
-                st.sidebar.error(f"Error loading model: {e}")
+    if selected_model:
+        if st.sidebar.button("Load Model", type="primary", use_container_width=True):
+            with st.spinner(f"Loading {selected_model}..."):
+                try:
+                    from mlx_lm import load
+                    model, tokenizer = load(selected_model)
+                    st.session_state.model = model
+                    st.session_state.tokenizer = tokenizer
+                    st.session_state.model_path = selected_model
+                    st.sidebar.success("Model loaded!")
+                except Exception as e:
+                    st.sidebar.error(f"Error loading model: {e}")
 
     # Check if model is loaded
     if 'model' not in st.session_state:
-        st.info("👆 Enter a model path and click 'Load Model' to get started.")
-        st.markdown("""
-        **Supported models:**
-        - Any MLX model from [mlx-community](https://huggingface.co/mlx-community)
-        - Local MLX model directories
+        st.info("👈 Browse or enter a model in the sidebar, then click 'Load Model' to get started.")
 
-        **Examples:**
-        - `mlx-community/Llama-3.2-1B-Instruct-4bit`
-        - `mlx-community/Mistral-7B-Instruct-v0.3-4bit`
-        - `mlx-community/Phi-3-mini-4k-instruct-4bit`
+        col1, col2 = st.columns(2)
+
+        with col1:
+            st.markdown("""
+            ### 🔍 Browse Models
+            Use the sidebar to browse models from **mlx-community** on HuggingFace.
+            - Filter by name (e.g., "llama", "4bit")
+            - Sorted by popularity (downloads)
+            - Only MLX-compatible models shown
+            """)
+
+        with col2:
+            st.markdown("""
+            ### 📁 Manual Entry
+            Or enter a model path directly:
+            - `mlx-community/Llama-3.2-1B-Instruct-4bit`
+            - `mlx-community/Mistral-7B-Instruct-v0.3-4bit`
+            - Local path: `/path/to/mlx/model`
+            """)
+
+        st.markdown("---")
+        st.markdown("""
+        **Supported architectures:** Llama, Mistral, Mixtral, Phi, Qwen, Gemma, StarCoder, Falcon, GPT-2, and more.
+
+        All models from [mlx-community](https://huggingface.co/mlx-community) that are compatible with `mlx-lm` will work.
         """)
         return
 
