@@ -5022,63 +5022,296 @@ def main():
 
     # Tab 3: Token Probabilities
     with tab3:
-        st.subheader("Next Token Prediction")
+        st.subheader("Token Probabilities by Position")
 
         with st.expander("ℹ️ What is this? (click to learn)", expanded=False):
-            st.markdown(metric_help("token_probability"))
+            st.markdown("""
+**Token Probabilities** shows what the model predicted at each position:
 
-        if results.top_k_tokens:
-            # Check if distribution is peaked
-            top_prob = results.top_k_tokens[0][1]
-            if top_prob > 0.99:
-                st.info("⚠️ **Peaked Distribution**: The model is extremely confident (>99%) in its top prediction. "
-                        "This causes numerical underflow in softmax, making other probabilities appear as 0. "
-                        "The chart below shows **logit differences from max** instead of probabilities for better visibility.")
+- **Input tokens**: The tokens you provided (no predictions - these were given)
+- **Generated tokens**: For each position, shows:
+  - The **chosen token** and its probability
+  - **Top alternatives** the model considered
+  - Whether the choice was **confident** (high probability) or **uncertain** (close alternatives)
 
-            fig = plot_token_probabilities(results)
-            st.plotly_chart(fig, use_container_width=True)
+**How to read:**
+- 🟢 High confidence (>80%): Model was very sure
+- 🟡 Medium confidence (30-80%): Reasonable certainty
+- 🔴 Low confidence (<30%): Close call between alternatives
+            """)
 
-            # Token probability table - show logit values when peaked
-            if top_prob > 0.99 and results.logits is not None:
-                # Show logit values instead of probabilities for peaked distributions
-                table_data = []
-                for t in results.top_k_tokens:
-                    token_id = t[0]
-                    token_text = t[2]
-                    if 0 <= token_id < len(results.logits):
-                        logit_val = float(results.logits[token_id])
-                    else:
-                        logit_val = 0.0
-                    table_data.append((token_id, logit_val, token_text))
-                df = pd.DataFrame(table_data, columns=["Token ID", "Logit", "Token"])
-                df["Logit"] = df["Logit"].apply(lambda x: f"{x:.2f}")
+        # Detect sections for grouping
+        sections = detect_prompt_sections(results, tokenizer)
+        input_len = len(results.input_tokens) if results.input_tokens else 0
+        gen_len = len(results.generated_tokens) if results.generated_tokens else 0
+
+        st.caption(f"Total: {input_len} input tokens + {gen_len} generated tokens = {input_len + gen_len} total")
+
+        # Group sections into Input and Response categories
+        input_sections = {}
+        response_sections = {}
+
+        for name, bounds in sections.items():
+            if any(k in name for k in ["System", "User", "Input"]):
+                input_sections[name] = bounds
+            elif any(k in name for k in ["Response", "Reasoning", "Final", "🤖", "🧠", "✅"]):
+                response_sections[name] = bounds
             else:
-                df = pd.DataFrame(results.top_k_tokens, columns=["Token ID", "Probability", "Token"])
-                # Format probability: use percentage for > 0.01%, scientific notation for smaller
-                def format_prob(x):
-                    if x >= 0.0001:
-                        return f"{x:.4f} ({x*100:.2f}%)"
-                    elif x > 0:
-                        return f"{x:.2e}"
-                    else:
-                        return "~0"
-                df["Probability"] = df["Probability"].apply(format_prob)
-            st.dataframe(df, hide_index=True)
+                if bounds[0] >= input_len:
+                    response_sections[name] = bounds
+                else:
+                    input_sections[name] = bounds
 
-            # AI Interpretation
-            if ai_interpret:
-                interp_label = "Claude" if interp_choice == "claude" else "Local LLM"
-                with st.expander("🧠 AI Interpretation", expanded=True):
-                    render_cached_interpretation(
-                        f"token_prob_{interp_choice}",
-                        results,
-                        lambda: get_token_prob_interpretation(
-                            results, model, tokenizer, use_ai=True, interpreter=interp_choice
-                        ),
-                        interp_label
-                    )
-        else:
-            st.info("Enable 'Capture Token Probabilities' to see this visualization.")
+        # Calculate totals
+        input_total = sum(e - s for s, e in input_sections.values()) if input_sections else 0
+        response_total = sum(e - s for s, e in response_sections.values()) if response_sections else 0
+
+        # === INPUT SEQUENCE ===
+        if input_sections:
+            with st.expander(f"📥 **Input Sequence** ({input_total} tokens) - no predictions", expanded=False):
+                st.caption("Input tokens are provided by you, not predicted by the model.")
+
+                for sub_name, (start, end) in input_sections.items():
+                    token_count = end - start
+                    st.markdown(f"**{sub_name}** ({token_count} tokens)")
+
+                    # Show tokens in this section
+                    section_data = []
+                    for pos in range(start, min(end, input_len)):
+                        if pos < len(results.input_tokens):
+                            tok_id = results.input_tokens[pos]
+                            try:
+                                tok_text = tokenizer.decode([tok_id])
+                                display_text = repr(tok_text)[1:-1]
+                            except:
+                                display_text = f"[{tok_id}]"
+                            section_data.append({
+                                "Pos": pos,
+                                "Token": display_text,
+                                "ID": tok_id
+                            })
+
+                    if section_data:
+                        # Limit display with show more
+                        max_show = 30
+                        if len(section_data) > max_show:
+                            st.dataframe(pd.DataFrame(section_data[:max_show]), hide_index=True, use_container_width=True)
+                            st.caption(f"... and {len(section_data) - max_show} more tokens")
+                        else:
+                            st.dataframe(pd.DataFrame(section_data), hide_index=True, use_container_width=True)
+                    st.markdown("---")
+
+        # === RESPONSE (Generated tokens with alternatives) ===
+        if response_sections and results.per_token_alternatives:
+            with st.expander(f"🤖 **Response** ({response_total} tokens) - with prediction alternatives", expanded=True):
+                st.caption("For each generated token: chosen token, probability, and what alternatives were considered.")
+
+                # Helper to format probability
+                def format_prob(p):
+                    if p >= 0.8:
+                        return f"🟢 {p:.1%}"
+                    elif p >= 0.3:
+                        return f"🟡 {p:.1%}"
+                    else:
+                        return f"🔴 {p:.1%}"
+
+                for sub_name, (start, end) in response_sections.items():
+                    # Only process positions in the generated range
+                    gen_start_pos = max(start, input_len)
+                    gen_end_pos = min(end, input_len + gen_len)
+
+                    if gen_end_pos <= gen_start_pos:
+                        continue
+
+                    token_count = gen_end_pos - gen_start_pos
+                    if "Reasoning" in sub_name:
+                        st.markdown(f"🧠 **Reasoning Loop** ({token_count} tokens)")
+                    elif "Final" in sub_name:
+                        st.markdown(f"✅ **Final Response** ({token_count} tokens)")
+                    else:
+                        st.markdown(f"**{sub_name}** ({token_count} tokens)")
+
+                    # Show tokens with alternatives
+                    section_data = []
+                    for pos in range(gen_start_pos, gen_end_pos):
+                        gen_idx = pos - input_len  # Index into generated_tokens and per_token_alternatives
+
+                        if gen_idx < 0 or gen_idx >= len(results.generated_tokens):
+                            continue
+                        if gen_idx >= len(results.per_token_alternatives):
+                            continue
+
+                        # Get the chosen token
+                        chosen_id = results.generated_tokens[gen_idx]
+                        try:
+                            chosen_text = tokenizer.decode([chosen_id])
+                            chosen_display = repr(chosen_text)[1:-1]
+                        except:
+                            chosen_display = f"[{chosen_id}]"
+
+                        # Get alternatives (already sorted descending by probability from argsort[-10:][::-1])
+                        # alternatives[0] = highest probability, alternatives[-1] = lowest of top-10
+                        alternatives = results.per_token_alternatives[gen_idx]
+
+                        # Find the chosen token's probability
+                        chosen_prob = 0.0
+                        chosen_rank = "?"
+                        for rank_idx, (alt_id, alt_prob, alt_text) in enumerate(alternatives):
+                            if alt_id == chosen_id:
+                                chosen_prob = alt_prob
+                                chosen_rank = rank_idx + 1  # 1-indexed rank
+                                break
+
+                        # Get top-3 alternatives for display
+                        # alternatives is already sorted: [0]=highest, [1]=second, [2]=third
+                        top3_str = ", ".join([
+                            f"{alt[2][:8]}({alt[1]:.0%})"
+                            for alt in alternatives[:3]
+                        ])
+
+                        section_data.append({
+                            "Pos": pos,
+                            "Chosen": chosen_display[:15],
+                            "Prob": format_prob(chosen_prob),
+                            "Rank": f"#{chosen_rank}" if isinstance(chosen_rank, int) else chosen_rank,
+                            "Top 3 Alternatives": top3_str
+                        })
+
+                    if section_data:
+                        max_show = 30
+                        show_key = f"show_all_probs_{sub_name}"
+                        if show_key not in st.session_state:
+                            st.session_state[show_key] = False
+
+                        if len(section_data) > max_show and not st.session_state[show_key]:
+                            st.dataframe(pd.DataFrame(section_data[:max_show]), hide_index=True, use_container_width=True)
+                            if st.button(f"Show all {len(section_data)} tokens...", key=f"btn_{show_key}"):
+                                st.session_state[show_key] = True
+                                st.rerun()
+                        else:
+                            st.dataframe(pd.DataFrame(section_data), hide_index=True, use_container_width=True)
+                            if len(section_data) > max_show:
+                                if st.button("Show less", key=f"btn_less_{show_key}"):
+                                    st.session_state[show_key] = False
+                                    st.rerun()
+                    st.markdown("---")
+
+        elif not results.per_token_alternatives:
+            st.info("No per-token alternatives captured. Run generation to see token-by-token predictions.")
+
+        # === Final Prediction (what comes next) ===
+        if results.top_k_tokens:
+            with st.expander("🔮 **Next Token Prediction** (what would come after the response)", expanded=False):
+                st.caption("If generation continued, what token would the model predict next?")
+
+                # Check if distribution is peaked
+                top_prob = results.top_k_tokens[0][1]
+                if top_prob > 0.99:
+                    st.info("⚠️ **Peaked Distribution**: Model is >99% confident. Showing logit differences instead of probabilities.")
+
+                fig = plot_token_probabilities(results)
+                st.plotly_chart(fig, use_container_width=True)
+
+                # Token probability table
+                if top_prob > 0.99 and results.logits is not None:
+                    table_data = []
+                    for t in results.top_k_tokens:
+                        token_id = t[0]
+                        token_text = t[2]
+                        if 0 <= token_id < len(results.logits):
+                            logit_val = float(results.logits[token_id])
+                        else:
+                            logit_val = 0.0
+                        table_data.append((token_id, logit_val, token_text))
+                    df = pd.DataFrame(table_data, columns=["Token ID", "Logit", "Token"])
+                    df["Logit"] = df["Logit"].apply(lambda x: f"{x:.2f}")
+                else:
+                    df = pd.DataFrame(results.top_k_tokens, columns=["Token ID", "Probability", "Token"])
+                    def format_prob_table(x):
+                        if x >= 0.0001:
+                            return f"{x:.4f} ({x*100:.2f}%)"
+                        elif x > 0:
+                            return f"{x:.2e}"
+                        else:
+                            return "~0"
+                    df["Probability"] = df["Probability"].apply(format_prob_table)
+                st.dataframe(df, hide_index=True)
+
+        # Verification panel
+        if results.per_token_alternatives:
+            with st.expander("🔍 Verify Token Probability Data (Debug)", expanded=False):
+                st.caption("Sanity check: verify alternatives are sorted correctly (highest probability first)")
+
+                # Run sanity check
+                violations = []
+                for gen_idx, alternatives in enumerate(results.per_token_alternatives):
+                    if len(alternatives) < 2:
+                        continue
+                    # Check that probabilities are in descending order
+                    # alternatives[0] should have highest prob, alternatives[1] second highest, etc.
+                    for i in range(len(alternatives) - 1):
+                        if alternatives[i][1] < alternatives[i + 1][1]:
+                            violations.append((gen_idx, i, alternatives[i], alternatives[i + 1]))
+
+                if violations:
+                    st.error(f"⚠️ Found {len(violations)} ordering violations!")
+                    for v in violations[:5]:
+                        st.write(f"Gen token {v[0]}: alt[{v[1]}] ({v[2][2]}, {v[2][1]:.2%}) < alt[{v[1]+1}] ({v[3][2]}, {v[3][1]:.2%})")
+                else:
+                    st.success(f"✅ All {len(results.per_token_alternatives)} positions pass: alternatives sorted correctly (highest prob first)")
+
+                # Inspect single position
+                st.markdown("---")
+                st.markdown("**Inspect single generated token:**")
+
+                if results.generated_tokens:
+                    inspect_idx = st.slider("Generated token index", 0, len(results.generated_tokens) - 1, 0, key="inspect_gen_idx")
+
+                    # Show chosen token
+                    chosen_id = results.generated_tokens[inspect_idx]
+                    try:
+                        chosen_text = tokenizer.decode([chosen_id])
+                    except:
+                        chosen_text = f"[{chosen_id}]"
+
+                    st.write(f"**Position {input_len + inspect_idx}** (gen index {inspect_idx})")
+                    st.write(f"**Chosen token:** `{chosen_text}` (ID: {chosen_id})")
+
+                    if inspect_idx < len(results.per_token_alternatives):
+                        alternatives = results.per_token_alternatives[inspect_idx]
+                        st.write(f"**Top {len(alternatives)} alternatives** (should be descending by probability):")
+
+                        alt_df = pd.DataFrame([
+                            {
+                                "Rank": i + 1,
+                                "Token": alt[2][:20],
+                                "ID": alt[0],
+                                "Prob": f"{alt[1]:.4%}",
+                                "Chosen": "✅" if alt[0] == chosen_id else ""
+                            }
+                            for i, alt in enumerate(alternatives)
+                        ])
+                        st.dataframe(alt_df, hide_index=True, use_container_width=True)
+
+                        # Verify chosen is in alternatives
+                        chosen_in_alts = any(alt[0] == chosen_id for alt in alternatives)
+                        if chosen_in_alts:
+                            st.success("✅ Chosen token found in alternatives list")
+                        else:
+                            st.warning("⚠️ Chosen token not in top-10 alternatives (may happen with sampling)")
+
+        # AI Interpretation
+        if ai_interpret and results.top_k_tokens:
+            interp_label = "Claude" if interp_choice == "claude" else "Local LLM"
+            with st.expander("🧠 AI Interpretation", expanded=False):
+                render_cached_interpretation(
+                    f"token_prob_{interp_choice}",
+                    results,
+                    lambda: get_token_prob_interpretation(
+                        results, model, tokenizer, use_ai=True, interpreter=interp_choice
+                    ),
+                    interp_label
+                )
 
     # Tab 4: Tokens
     with tab4:
