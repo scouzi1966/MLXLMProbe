@@ -5,17 +5,33 @@ MLXLMProbe - Universal probing tool for MLX language models.
 A visual interpretability tool that works with any mlx-lm compatible model.
 Supports Llama, Mistral, Phi, Qwen, Gemma, and other architectures.
 
+Features:
+    - Layer activation analysis
+    - FFN gate patterns
+    - Token probability distributions
+    - Embedding visualization (PCA)
+    - Layer similarity heatmaps
+    - Residual stream tracking
+    - AI interpretation
+    - PDF and HTML export
+
 Usage:
     streamlit run probe.py
     streamlit run probe.py -- --model mlx-community/Llama-3.2-1B-Instruct-4bit
 """
 
 import argparse
+import colorsys
 import sys
+import hashlib
+import threading
+from concurrent.futures import ThreadPoolExecutor, Future
 from dataclasses import dataclass, field
+from functools import lru_cache
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Any
 import json
+from datetime import datetime
 
 import numpy as np
 
@@ -39,35 +55,346 @@ except ImportError as e:
     sys.exit(1)
 
 try:
-    from huggingface_hub import HfApi, list_models
+    from huggingface_hub import HfApi, list_models, snapshot_download, hf_hub_download
+    import time
     HF_HUB_AVAILABLE = True
 except ImportError:
     HF_HUB_AVAILABLE = False
+
+# PDF support (optional)
+try:
+    from fpdf import FPDF
+    PDF_AVAILABLE = True
+except ImportError:
+    PDF_AVAILABLE = False
+
+import shutil
+import subprocess
+
+
+# =============================================================================
+# Performance Utilities - Caching and Background Processing
+# =============================================================================
+
+# Global thread pool for background tasks
+_thread_pool = ThreadPoolExecutor(max_workers=4)
+_background_tasks: Dict[str, Future] = {}
+
+
+def get_results_hash(results) -> str:
+    """Generate a hash of probe results for cache invalidation."""
+    # Create a simple hash based on key result attributes
+    hash_data = f"{results.input_text[:100]}_{len(results.input_tokens)}_{results.num_layers}_{results.is_moe}"
+    if results.moe_expert_load:
+        hash_data += f"_{len(results.moe_expert_load)}"
+    return hashlib.md5(hash_data.encode()).hexdigest()[:16]
+
+
+def run_in_background(task_id: str, func, *args, **kwargs) -> Future:
+    """Run a function in background thread. Returns Future."""
+    future = _thread_pool.submit(func, *args, **kwargs)
+    _background_tasks[task_id] = future
+    return future
+
+
+def get_background_result(task_id: str, timeout: float = 0.1):
+    """Get result from background task if ready, else None."""
+    if task_id not in _background_tasks:
+        return None
+    future = _background_tasks[task_id]
+    if future.done():
+        try:
+            return future.result()
+        except Exception as e:
+            return f"Error: {e}"
+    return None  # Not ready yet
+
+
+def is_task_running(task_id: str) -> bool:
+    """Check if a background task is still running."""
+    if task_id not in _background_tasks:
+        return False
+    return not _background_tasks[task_id].done()
+
+
+def cancel_task(task_id: str):
+    """Cancel a background task if possible."""
+    if task_id in _background_tasks:
+        _background_tasks[task_id].cancel()
+        del _background_tasks[task_id]
+
+
+def get_cached_plot(cache_key: str, plot_func, *args, **kwargs):
+    """Get a cached plot or compute and cache it."""
+    if cache_key not in st.session_state:
+        st.session_state[cache_key] = plot_func(*args, **kwargs)
+    return st.session_state[cache_key]
+
+
+def invalidate_plot_cache():
+    """Invalidate all cached plots (call when results change)."""
+    keys_to_delete = [k for k in st.session_state.keys() if k.startswith('_plot_')]
+    for key in keys_to_delete:
+        del st.session_state[key]
+
+
+def start_background_interpretation(task_id: str, model, tokenizer, context: str, question: str, interpreter: str):
+    """Start AI interpretation in background thread."""
+    if is_task_running(task_id):
+        return  # Already running
+
+    def run_interpretation():
+        return generate_ai_interpretation(model, tokenizer, context, question, interpreter)
+
+    run_in_background(task_id, run_interpretation)
+
+
+def render_background_interpretation(task_id: str, label: str = "AI Interpretation"):
+    """Render interpretation result if ready, or show spinner if still computing."""
+    if is_task_running(task_id):
+        st.info(f"⏳ {label} is being generated in background...")
+        return None
+
+    result = get_background_result(task_id)
+    if result:
+        if isinstance(result, str) and result.startswith("Error:"):
+            st.warning(result)
+        else:
+            st.markdown(f"**Analysis:**\n\n{result}")
+        return result
+    return None
+
+
+def get_cached_interpretation(
+    cache_key: str,
+    results_hash: str,
+    interpret_func,
+    *args,
+    force_refresh: bool = False,
+    **kwargs
+):
+    """
+    Get cached AI interpretation or compute it.
+
+    Args:
+        cache_key: Unique key for this interpretation
+        results_hash: Hash of the probe results for invalidation
+        interpret_func: Function to call for interpretation
+        force_refresh: If True, recompute even if cached
+        *args, **kwargs: Arguments to pass to interpret_func
+    """
+    full_key = f"_interp_{cache_key}"
+    hash_key = f"_interp_hash_{cache_key}"
+
+    # Check cache validity
+    if not force_refresh and full_key in st.session_state:
+        if hash_key in st.session_state and st.session_state[hash_key] == results_hash:
+            return st.session_state[full_key]
+
+    # Compute and cache
+    result = interpret_func(*args, **kwargs)
+    st.session_state[full_key] = result
+    st.session_state[hash_key] = results_hash
+    return result
+
+
+def render_cached_interpretation(
+    cache_key: str,
+    results,
+    interpret_func,
+    interp_label: str,
+    *args,
+    **kwargs
+):
+    """Render AI interpretation with caching and manual trigger for Claude."""
+    results_hash = get_results_hash(results)
+    is_claude = interp_label == "Claude"
+
+    # Cache keys include interpreter to separate Claude vs Local results
+    full_key = f"_interp_{cache_key}"
+    hash_key = f"_interp_hash_{cache_key}"
+    source_key = f"_interp_source_{cache_key}"  # Track which interpreter generated it
+
+    has_cache = (
+        full_key in st.session_state and
+        hash_key in st.session_state and
+        st.session_state[hash_key] == results_hash
+    )
+
+    if has_cache:
+        # Get the source that generated this cache
+        cached_source = st.session_state.get(source_key, "Unknown")
+
+        # Show cached result with refresh button
+        col1, col2 = st.columns([6, 1])
+        with col2:
+            force_refresh = st.button("🔄", key=f"refresh_{cache_key}", help=f"Regenerate with {interp_label}")
+
+        if force_refresh:
+            # User requested refresh
+            if is_claude:
+                st.warning("⚠️ **Token Usage Warning**: This will consume Claude API or Claude Code subscription tokens.")
+            with st.spinner(f"Generating interpretation via {interp_label}..."):
+                interpretation = interpret_func(*args, **kwargs)
+                st.session_state[full_key] = interpretation
+                st.session_state[hash_key] = results_hash
+                st.session_state[source_key] = interp_label  # Store source
+                st.markdown(f"**Analysis via {interp_label}:**\n\n{interpretation}")
+        else:
+            # Display cached - show which interpreter generated it
+            interpretation = st.session_state[full_key]
+            st.markdown(f"**Analysis via {cached_source}:** *(cached)*\n\n{interpretation}")
+    else:
+        # No cache - require user action for Claude, auto-generate for local LLM
+        if is_claude:
+            st.info("💡 No Claude analysis yet. Click the button below to generate.")
+            st.warning("⚠️ **Token Usage Warning**: This will consume Claude API or Claude Code subscription tokens.")
+            if st.button(f"🧠 Generate with Claude", key=f"generate_{cache_key}", type="primary"):
+                with st.spinner(f"Generating interpretation via Claude..."):
+                    interpretation = interpret_func(*args, **kwargs)
+                    st.session_state[full_key] = interpretation
+                    st.session_state[hash_key] = results_hash
+                    st.session_state[source_key] = "Claude"  # Store source
+                    st.rerun()
+        else:
+            # Local LLM - auto-generate (free)
+            with st.spinner(f"Generating interpretation via Local LLM..."):
+                interpretation = interpret_func(*args, **kwargs)
+                st.session_state[full_key] = interpretation
+                st.session_state[hash_key] = results_hash
+                st.session_state[source_key] = "Local LLM"  # Store source
+                st.markdown(f"**Analysis via Local LLM:**\n\n{interpretation}")
+
+
+# Cached computation decorators
+def cache_with_hash(func):
+    """Decorator to cache function results in session state based on input hash."""
+    def wrapper(*args, **kwargs):
+        # Generate cache key from function name and args
+        cache_key = f"_cache_{func.__name__}"
+        hash_key = f"_hash_{func.__name__}"
+
+        # Try to get results object from args for hashing
+        results = None
+        for arg in args:
+            if hasattr(arg, 'input_tokens') and hasattr(arg, 'moe_expert_load'):
+                results = arg
+                break
+
+        current_hash = get_results_hash(results) if results else str(args)[:100]
+
+        # Check if cached and hash matches
+        if cache_key in st.session_state and hash_key in st.session_state:
+            if st.session_state[hash_key] == current_hash:
+                return st.session_state[cache_key]
+
+        # Compute and cache
+        result = func(*args, **kwargs)
+        st.session_state[cache_key] = result
+        st.session_state[hash_key] = current_hash
+        return result
+
+    return wrapper
+
+
+# =============================================================================
+# Claude Code Detection and Integration
+# =============================================================================
+
+def detect_claude_code() -> bool:
+    """Detect if Claude Code CLI is available."""
+    if shutil.which("claude") is not None:
+        return True
+    common_paths = [
+        Path.home() / ".claude" / "local" / "claude",
+        Path("/usr/local/bin/claude"),
+        Path.home() / ".local" / "bin" / "claude",
+    ]
+    for path in common_paths:
+        if path.exists():
+            return True
+    return False
+
+
+def get_claude_code_path() -> Optional[str]:
+    """Get the path to Claude Code CLI."""
+    claude_path = shutil.which("claude")
+    if claude_path:
+        return claude_path
+    common_paths = [
+        Path.home() / ".claude" / "local" / "claude",
+        Path("/usr/local/bin/claude"),
+        Path.home() / ".local" / "bin" / "claude",
+    ]
+    for path in common_paths:
+        if path.exists():
+            return str(path)
+    return None
+
+
+def generate_claude_interpretation(context: str, question: str, max_tokens: int = 300) -> str:
+    """
+    Use Claude Code CLI to generate interpretation.
+    """
+    claude_path = get_claude_code_path()
+    if not claude_path:
+        return "Claude Code not found."
+
+    prompt = f"""You are an expert in neural network interpretability analyzing probe data from an MLX language model.
+
+Based on this probe data:
+
+{context}
+
+{question}
+
+Provide a clear, concise interpretation (2-3 sentences)."""
+
+    try:
+        result = subprocess.run(
+            [claude_path, "--print", "-p", prompt],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            env={**subprocess.os.environ, "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1"}
+        )
+
+        if result.returncode == 0:
+            return result.stdout.strip()
+        else:
+            result = subprocess.run(
+                [claude_path, "-p", prompt, "--output-format", "text"],
+                capture_output=True,
+                text=True,
+                timeout=60
+            )
+            if result.returncode == 0:
+                return result.stdout.strip()
+            return f"Claude Code error: {result.stderr[:100]}"
+
+    except subprocess.TimeoutExpired:
+        return "Claude Code timed out."
+    except Exception as e:
+        return f"Claude Code error: {str(e)[:50]}"
 
 
 # =============================================================================
 # HuggingFace Model Browser
 # =============================================================================
 
-# Model architectures supported by mlx-lm (from mlx_lm/models/)
 MLX_LM_SUPPORTED_ARCHITECTURES = {
     "llama", "mistral", "mixtral", "phi", "phi3", "phimoe",
     "qwen", "qwen2", "qwen2_moe", "gemma", "gemma2",
     "starcoder", "starcoder2", "cohere", "dbrx", "deepseek",
     "falcon", "gpt2", "gpt_bigcode", "gpt_neox", "internlm2",
     "mamba", "minicpm", "nemotron", "olmo", "openelm",
-    "stablelm", "plamo", "recurrentgemma", "afm7"
+    "stablelm", "plamo", "recurrentgemma"
 }
 
 
-@st.cache_data(ttl=3600, show_spinner=False)  # Cache for 1 hour
+@st.cache_data(ttl=3600, show_spinner=False)
 def fetch_mlx_community_models(limit: int = 200) -> List[Dict]:
-    """
-    Fetch models from mlx-community on HuggingFace.
-
-    Returns list of model info dicts with id, downloads, likes, etc.
-    Only returns models that are likely compatible with mlx-lm.
-    """
+    """Fetch models from mlx-community on HuggingFace."""
     if not HF_HUB_AVAILABLE:
         return []
 
@@ -83,17 +410,12 @@ def fetch_mlx_community_models(limit: int = 200) -> List[Dict]:
         model_list = []
         for model in models:
             model_id = model.id
-
-            # Filter: must have model files (safetensors or similar)
-            # Most mlx-community models follow naming patterns
             model_name_lower = model_id.lower()
 
-            # Check if it's likely an LLM (not embedding, not image, etc.)
             skip_keywords = ['embed', 'clip', 'image', 'vision', 'audio', 'whisper', 'encoder-only']
             if any(kw in model_name_lower for kw in skip_keywords):
                 continue
 
-            # Get model info
             model_info = {
                 'id': model_id,
                 'name': model_id.split('/')[-1],
@@ -103,9 +425,7 @@ def fetch_mlx_community_models(limit: int = 200) -> List[Dict]:
             model_list.append(model_info)
 
         return model_list
-
     except Exception as e:
-        st.warning(f"Could not fetch models: {e}")
         return []
 
 
@@ -114,7 +434,6 @@ def format_model_option(model: Dict) -> str:
     name = model['name']
     downloads = model['downloads']
 
-    # Format downloads
     if downloads >= 1_000_000:
         dl_str = f"{downloads/1_000_000:.1f}M"
     elif downloads >= 1_000:
@@ -123,6 +442,208 @@ def format_model_option(model: Dict) -> str:
         dl_str = str(downloads)
 
     return f"{name} ({dl_str} downloads)"
+
+
+def format_bytes(size: int) -> str:
+    """Format bytes to human readable string."""
+    for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
+        if size < 1024:
+            return f"{size:.1f}{unit}"
+        size /= 1024
+    return f"{size:.1f}PB"
+
+
+def download_model_with_progress(model_id: str, progress_bar, status_text) -> str:
+    """Download a model from HuggingFace with progress tracking."""
+    if not HF_HUB_AVAILABLE:
+        raise ImportError("huggingface_hub not available")
+
+    from huggingface_hub import snapshot_download, HfApi, hf_hub_download
+    from huggingface_hub.utils import disable_progress_bars, enable_progress_bars
+
+    api = HfApi()
+    status_text.text("Fetching model info...")
+    progress_bar.progress(0)
+
+    try:
+        repo_info = api.repo_info(repo_id=model_id, files_metadata=True)
+        files = []
+        total_size = 0
+
+        for sibling in repo_info.siblings:
+            size = getattr(sibling, 'size', None) or 0
+            files.append({'name': sibling.rfilename, 'size': size})
+            total_size += size
+
+        important_extensions = {'.safetensors', '.json', '.model', '.txt', '.py', '.bin'}
+        files = [f for f in files if any(f['name'].endswith(ext) for ext in important_extensions)]
+        total_size = sum(f['size'] for f in files)
+
+    except Exception as e:
+        status_text.text(f"Downloading model...")
+        disable_progress_bars()
+        try:
+            local_path = snapshot_download(repo_id=model_id)
+            progress_bar.progress(1.0)
+            status_text.text("Download complete!")
+            return local_path
+        finally:
+            enable_progress_bars()
+
+    downloaded_size = 0
+    num_files = len(files)
+    disable_progress_bars()
+
+    try:
+        for i, file_info in enumerate(files):
+            filename = file_info['name']
+            file_size = file_info['size']
+
+            short_name = filename.split('/')[-1]
+            if len(short_name) > 30:
+                short_name = short_name[:27] + "..."
+
+            pct = downloaded_size / total_size if total_size > 0 else 0
+            status_text.text(
+                f"Downloading ({i+1}/{num_files}): {short_name} | "
+                f"{format_bytes(downloaded_size)}/{format_bytes(total_size)} ({pct*100:.0f}%)"
+            )
+            progress_bar.progress(pct)
+
+            try:
+                hf_hub_download(repo_id=model_id, filename=filename, local_files_only=False)
+            except Exception:
+                pass
+
+            downloaded_size += file_size
+
+        progress_bar.progress(1.0)
+        status_text.text("Download complete!")
+        local_path = snapshot_download(repo_id=model_id, local_files_only=True)
+        return local_path
+
+    except Exception as e:
+        status_text.text("Finalizing download...")
+        local_path = snapshot_download(repo_id=model_id)
+        progress_bar.progress(1.0)
+        status_text.text("Download complete!")
+        return local_path
+
+    finally:
+        enable_progress_bars()
+
+
+# =============================================================================
+# Reasoning Model Formats (extensible for different architectures)
+# =============================================================================
+
+@dataclass
+class ReasoningFormat:
+    """Defines a reasoning model's output format for detection and parsing."""
+    name: str
+    # Markers that indicate this format is being used
+    detection_markers: List[str]
+    # Markers that indicate reasoning section
+    reasoning_start: List[str]
+    reasoning_end: List[str]
+    # Markers that indicate final response section
+    response_start: List[str]
+    # Stop generation when we see response_start followed by any of these
+    stop_after_response: List[str]
+
+    def detect(self, text: str) -> bool:
+        """Check if text uses this reasoning format."""
+        return any(marker in text for marker in self.detection_markers)
+
+    def should_stop(self, text: str) -> bool:
+        """Check if generation should stop (response complete)."""
+        for resp_marker in self.response_start:
+            if resp_marker in text:
+                resp_pos = text.find(resp_marker)
+                for stop_marker in self.stop_after_response:
+                    if text.find(stop_marker, resp_pos) != -1:
+                        return True
+        return False
+
+    def parse(self, text: str) -> Tuple[str, str]:
+        """Extract (reasoning, answer) from text."""
+        reasoning = ""
+        answer = ""
+
+        # Find reasoning section
+        for start_marker in self.reasoning_start:
+            if start_marker in text:
+                start_pos = text.find(start_marker) + len(start_marker)
+                # Find end of reasoning
+                end_pos = len(text)
+                for end_marker in self.reasoning_end:
+                    pos = text.find(end_marker, start_pos)
+                    if pos != -1 and pos < end_pos:
+                        end_pos = pos
+                reasoning = text[start_pos:end_pos].strip()
+                break
+
+        # Find response section
+        for resp_marker in self.response_start:
+            if resp_marker in text:
+                resp_pos = text.find(resp_marker) + len(resp_marker)
+                answer = text[resp_pos:].strip()
+                # Clean any trailing stop markers
+                for stop_marker in self.stop_after_response:
+                    if stop_marker in answer:
+                        answer = answer[:answer.find(stop_marker)].strip()
+                break
+
+        return reasoning, answer
+
+
+# Registry of known reasoning formats - add new architectures here
+REASONING_FORMATS = [
+    # GPT-OSS / Channel-based format
+    ReasoningFormat(
+        name="oss_channel",
+        detection_markers=['<|channel|>analysis<|message|>', '<|channel|>final<|message|>'],
+        reasoning_start=['<|channel|>analysis<|message|>'],
+        reasoning_end=['<|end|>', '<|channel|>'],
+        response_start=['<|channel|>final<|message|>', '<|channel|>response<|message|>'],
+        stop_after_response=['<|end|>'],
+    ),
+    # DeepSeek / Think format
+    ReasoningFormat(
+        name="deepseek_think",
+        detection_markers=['<think>', '</think>'],
+        reasoning_start=['<think>'],
+        reasoning_end=['</think>'],
+        response_start=['</think>'],
+        stop_after_response=['<|end|>', '<|endoftext|>', '</s>'],
+    ),
+    # Generic reasoning tags
+    ReasoningFormat(
+        name="generic_reasoning",
+        detection_markers=['<reasoning>', '</reasoning>'],
+        reasoning_start=['<reasoning>'],
+        reasoning_end=['</reasoning>'],
+        response_start=['</reasoning>'],
+        stop_after_response=['<|end|>', '<|endoftext|>', '</s>'],
+    ),
+    # Analysis tags
+    ReasoningFormat(
+        name="generic_analysis",
+        detection_markers=['<analysis>', '</analysis>'],
+        reasoning_start=['<analysis>'],
+        reasoning_end=['</analysis>'],
+        response_start=['</analysis>'],
+        stop_after_response=['<|end|>', '<|endoftext|>', '</s>'],
+    ),
+]
+
+
+def detect_reasoning_format(text: str) -> Optional[ReasoningFormat]:
+    """Detect which reasoning format (if any) the text uses."""
+    for fmt in REASONING_FORMATS:
+        if fmt.detect(text):
+            return fmt
+    return None
 
 
 # =============================================================================
@@ -137,8 +658,60 @@ class ProbeConfig:
     capture_ffn_activations: bool = True
     capture_logits: bool = True
     capture_residual_stream: bool = True
-    layer_indices: Optional[List[int]] = None  # None = all layers
-    max_sequence_positions: int = 512  # Limit for memory
+    capture_token_probs: bool = True
+    layer_indices: Optional[List[int]] = None
+    max_sequence_positions: int = 512
+
+
+def clean_special_tokens(text: str) -> str:
+    """Remove special tokens from text."""
+    import re
+    # Common special tokens to remove
+    special_tokens = [
+        r'<\|channel\|>\w*<\|message\|>',  # <|channel|>xxx<|message|>
+        r'<\|end\|>',
+        r'<\|start\|>',
+        r'<\|assistant\|>',
+        r'<\|user\|>',
+        r'<\|system\|>',
+        r'<\|im_start\|>',
+        r'<\|im_end\|>',
+        r'<\|endoftext\|>',
+        r'<\|pad\|>',
+        r'assistant<\|channel\|>\w*<\|message\|>',  # assistant<|channel|>final<|message|>
+    ]
+
+    result = text
+    for pattern in special_tokens:
+        result = re.sub(pattern, '', result)
+
+    # Clean up extra whitespace
+    result = re.sub(r'\n\s*\n', '\n\n', result)
+    return result.strip()
+
+
+def parse_reasoning_output(text: str) -> Tuple[str, str]:
+    """
+    Parse model output to separate reasoning from final answer.
+    Uses the REASONING_FORMATS registry for extensible format support.
+
+    Returns:
+        Tuple of (reasoning, answer). If no reasoning found, reasoning is empty.
+    """
+    # Try each registered format
+    fmt = detect_reasoning_format(text)
+    if fmt:
+        reasoning, answer = fmt.parse(text)
+        answer = clean_special_tokens(answer)
+
+        # If we have reasoning but no answer, generation was likely incomplete
+        if reasoning and not answer:
+            answer = "(Response generation incomplete - increase max tokens)"
+
+        return reasoning, answer
+
+    # No reasoning pattern found - still clean special tokens
+    return "", clean_special_tokens(text)
 
 
 @dataclass
@@ -147,8 +720,13 @@ class ProbeResults:
     # Input/Output
     input_tokens: List[int] = field(default_factory=list)
     input_text: str = ""
-    output_tokens: List[int] = field(default_factory=list)
-    output_text: str = ""
+
+    # Generation
+    generated_tokens: List[int] = field(default_factory=list)
+    generated_text: str = ""
+    reasoning_text: str = ""  # Separated reasoning/thinking
+    answer_text: str = ""     # Final answer after reasoning
+    per_token_alternatives: List[List[Tuple]] = field(default_factory=list)  # Top alternatives at each generation step
 
     # Embeddings
     embeddings: Optional[np.ndarray] = None
@@ -159,9 +737,10 @@ class ProbeResults:
     # FFN activations
     ffn_activations: Dict[int, np.ndarray] = field(default_factory=dict)
 
-    # Logits
+    # Logits and token probabilities
     logits: Optional[np.ndarray] = None
-    top_k_tokens: List[Tuple[int, float]] = field(default_factory=list)
+    token_probs: Optional[np.ndarray] = None
+    top_k_tokens: List[Tuple[int, float, str]] = field(default_factory=list)
 
     # Residual stream
     residual_stream: Dict[str, np.ndarray] = field(default_factory=dict)
@@ -174,50 +753,471 @@ class ProbeResults:
     hidden_dim: int = 0
     vocab_size: int = 0
 
+    # MoE (Mixture of Experts) specific
+    is_moe: bool = False
+    num_experts: int = 0
+    num_experts_per_tok: int = 0  # top-k experts selected
+    # Per-layer router outputs: {layer_idx: {"probs": np.array, "selected": np.array}}
+    moe_router_outputs: Dict[int, Dict[str, np.ndarray]] = field(default_factory=dict)
+    # Expert load: {layer_idx: {expert_idx: token_count}}
+    moe_expert_load: Dict[int, Dict[int, int]] = field(default_factory=dict)
+    # Expert token assignments: {expert_idx: [(token_id, position, layer_idx, router_prob), ...]}
+    moe_expert_tokens: Dict[int, List[Tuple[int, int, int, float]]] = field(default_factory=dict)
+
 
 # =============================================================================
 # Model Prober
 # =============================================================================
 
+def get_model_topology(model, tokenizer, model_path: str = None) -> Dict[str, Any]:
+    """
+    Extract model topology/architecture information.
+
+    Reads from config.json if model_path is provided, otherwise infers from model structure.
+    Returns a dictionary with model structure details.
+    """
+    topology = {
+        "model_type": "Unknown",
+        "architecture": [],
+        "config": {},
+        "layer_details": [],
+        "total_parameters": 0,
+        "is_moe": False,
+    }
+
+    # Get inner model
+    inner_model = model.model if hasattr(model, 'model') else model
+
+    # Try to get model type from class name
+    model_class = type(inner_model).__name__
+    topology["model_type"] = model_class
+
+    # Detect MoE from class name
+    if 'moe' in model_class.lower() or 'mixture' in model_class.lower():
+        topology["is_moe"] = True
+
+    # Try to read config.json directly from model path
+    config_dict = {}
+    if model_path:
+        import os
+        config_paths = [
+            os.path.join(model_path, "config.json"),
+            os.path.join(os.path.expanduser(model_path), "config.json"),
+        ]
+        # Also check HuggingFace cache
+        if "/" in model_path and not os.path.exists(model_path):
+            from huggingface_hub import hf_hub_download
+            try:
+                config_file = hf_hub_download(repo_id=model_path, filename="config.json")
+                config_paths.insert(0, config_file)
+            except:
+                pass
+
+        for config_path in config_paths:
+            if os.path.exists(config_path):
+                try:
+                    import json
+                    with open(config_path, 'r') as f:
+                        config_dict = json.load(f)
+                    break
+                except:
+                    pass
+
+    # Fallback to model.config attributes
+    if hasattr(model, 'config'):
+        config = model.config
+    elif hasattr(inner_model, 'config'):
+        config = inner_model.config
+    else:
+        config = None
+
+    # Priority: config.json > model.config attributes
+    config_attrs = [
+        'model_type', 'hidden_size', 'intermediate_size', 'num_hidden_layers',
+        'num_attention_heads', 'num_key_value_heads', 'vocab_size',
+        'max_position_embeddings', 'rms_norm_eps', 'rope_theta',
+        'head_dim', 'tie_word_embeddings', 'hidden_act',
+        # MoE specific
+        'num_experts', 'num_experts_per_tok', 'num_local_experts',
+        'num_experts_per_token', 'moe_intermediate_size', 'router_aux_loss_coef',
+        'num_selected_experts', 'n_routed_experts'
+    ]
+
+    # First from config.json
+    for attr in config_attrs:
+        if attr in config_dict:
+            val = config_dict[attr]
+            if val is not None:
+                topology["config"][attr] = val
+
+    # Then from model.config (if not already set)
+    if config:
+        for attr in config_attrs:
+            if attr not in topology["config"] and hasattr(config, attr):
+                val = getattr(config, attr)
+                if val is not None:
+                    topology["config"][attr] = val
+
+    # Detect MoE from config
+    moe_indicators = ['num_experts', 'num_local_experts', 'num_experts_per_tok',
+                      'num_selected_experts', 'n_routed_experts', 'moe_intermediate_size']
+    for indicator in moe_indicators:
+        if topology["config"].get(indicator):
+            topology["is_moe"] = True
+            break
+
+    # Build architecture list
+    arch = []
+
+    # Embedding layer
+    if hasattr(inner_model, 'embed_tokens'):
+        emb = inner_model.embed_tokens
+        if hasattr(emb, 'weight'):
+            shape = emb.weight.shape
+            arch.append(f"Embedding: {shape[0]:,} tokens × {shape[1]:,} dim")
+            topology["total_parameters"] += shape[0] * shape[1]
+    elif hasattr(inner_model, 'wte'):
+        emb = inner_model.wte
+        if hasattr(emb, 'weight'):
+            shape = emb.weight.shape
+            arch.append(f"Embedding (wte): {shape[0]:,} tokens × {shape[1]:,} dim")
+            topology["total_parameters"] += shape[0] * shape[1]
+
+    # Transformer layers
+    if hasattr(inner_model, 'layers'):
+        layers = list(inner_model.layers)
+        num_layers = len(layers)
+        arch.append(f"Transformer Layers: {num_layers}")
+
+        # Analyze first layer for structure
+        if layers:
+            first_layer = layers[0]
+            layer_info = {"index": 0, "components": []}
+
+            # Self attention
+            if hasattr(first_layer, 'self_attn'):
+                attn = first_layer.self_attn
+                attn_info = "Self-Attention"
+
+                if hasattr(attn, 'num_heads'):
+                    attn_info += f" ({attn.num_heads} heads"
+                elif hasattr(attn, 'n_heads'):
+                    attn_info += f" ({attn.n_heads} heads"
+
+                if hasattr(attn, 'num_kv_heads'):
+                    attn_info += f", {attn.num_kv_heads} KV heads"
+                elif hasattr(attn, 'n_kv_heads'):
+                    attn_info += f", {attn.n_kv_heads} KV heads"
+
+                if hasattr(attn, 'head_dim'):
+                    attn_info += f", {attn.head_dim} head_dim"
+
+                if '(' in attn_info:
+                    attn_info += ")"
+
+                layer_info["components"].append(attn_info)
+
+                # Count attention parameters
+                for proj_name in ['q_proj', 'k_proj', 'v_proj', 'o_proj', 'qkv_proj']:
+                    if hasattr(attn, proj_name):
+                        proj = getattr(attn, proj_name)
+                        if hasattr(proj, 'weight'):
+                            shape = proj.weight.shape
+                            topology["total_parameters"] += shape[0] * shape[1] * num_layers
+
+            # MLP/FFN
+            if hasattr(first_layer, 'mlp'):
+                mlp = first_layer.mlp
+                mlp_info = "MLP/FFN"
+
+                if hasattr(mlp, 'gate_proj') and hasattr(mlp.gate_proj, 'weight'):
+                    shape = mlp.gate_proj.weight.shape
+                    mlp_info += f" (hidden: {shape[0]:,})"
+                    # gate_proj, up_proj, down_proj
+                    topology["total_parameters"] += shape[0] * shape[1] * 3 * num_layers
+                elif hasattr(mlp, 'fc1') and hasattr(mlp.fc1, 'weight'):
+                    shape = mlp.fc1.weight.shape
+                    mlp_info += f" (hidden: {shape[0]:,})"
+                    topology["total_parameters"] += shape[0] * shape[1] * 2 * num_layers
+
+                layer_info["components"].append(mlp_info)
+
+            # MoE (Mixture of Experts) detection
+            moe_module = None
+            moe_attr_names = ['block_sparse_moe', 'moe', 'sparse_moe', 'experts', 'switch_mlp']
+            for attr_name in moe_attr_names:
+                if hasattr(first_layer, attr_name):
+                    moe_module = getattr(first_layer, attr_name)
+                    break
+
+            # Also check inside layer.mlp for MoE (e.g., GPT-OSS structure)
+            if moe_module is None and hasattr(first_layer, 'mlp'):
+                mlp = first_layer.mlp
+                # MoE inside MLP has experts and router attributes
+                if hasattr(mlp, 'experts') and hasattr(mlp, 'router'):
+                    moe_module = mlp
+
+            if moe_module is not None:
+                topology["is_moe"] = True
+                moe_info = "MoE"
+
+                # Get number of experts (priority: config_dict > module attributes > model.config)
+                num_experts = None
+                # First check config_dict (from config.json)
+                if config_dict.get('num_local_experts'):
+                    num_experts = config_dict['num_local_experts']
+                elif config_dict.get('num_experts'):
+                    num_experts = config_dict['num_experts']
+                elif config_dict.get('n_routed_experts'):
+                    num_experts = config_dict['n_routed_experts']
+                # Then check module attributes
+                elif hasattr(moe_module, 'experts'):
+                    if hasattr(moe_module.experts, '__len__'):
+                        num_experts = len(moe_module.experts)
+                elif hasattr(moe_module, 'num_experts'):
+                    num_experts = moe_module.num_experts
+                # Finally check model.config
+                elif config and hasattr(config, 'num_local_experts'):
+                    num_experts = config.num_local_experts
+                elif config and hasattr(config, 'num_experts'):
+                    num_experts = config.num_experts
+
+                if num_experts:
+                    topology["num_experts"] = num_experts
+                    moe_info += f" ({num_experts} experts"
+
+                # Get top-k experts per token (priority: config_dict > module attributes > model.config)
+                top_k = None
+                # First check config_dict (from config.json)
+                if config_dict.get('num_experts_per_tok'):
+                    top_k = config_dict['num_experts_per_tok']
+                elif config_dict.get('num_experts_per_token'):
+                    top_k = config_dict['num_experts_per_token']
+                elif config_dict.get('num_selected_experts'):
+                    top_k = config_dict['num_selected_experts']
+                # Then check module attributes
+                elif hasattr(moe_module, 'num_experts_per_tok'):
+                    top_k = moe_module.num_experts_per_tok
+                elif hasattr(moe_module, 'top_k'):
+                    top_k = moe_module.top_k
+                # Finally check model.config
+                elif config and hasattr(config, 'num_experts_per_tok'):
+                    top_k = config.num_experts_per_tok
+                elif config and hasattr(config, 'num_experts_per_token'):
+                    top_k = config.num_experts_per_token
+
+                if top_k:
+                    topology["num_experts_per_tok"] = top_k
+                    moe_info += f", top-{top_k}"
+
+                # Check for router/gate
+                if hasattr(moe_module, 'gate') or hasattr(moe_module, 'router'):
+                    moe_info += ", gated"
+
+                if '(' in moe_info:
+                    moe_info += ")"
+
+                layer_info["components"].append(moe_info)
+                arch.append(f"  └─ {moe_info}")
+
+            # Layer norms
+            norm_count = 0
+            for norm_name in ['input_layernorm', 'post_attention_layernorm', 'ln_1', 'ln_2']:
+                if hasattr(first_layer, norm_name):
+                    norm_count += 1
+
+            if norm_count > 0:
+                layer_info["components"].append(f"LayerNorm × {norm_count}")
+
+            topology["layer_details"].append(layer_info)
+
+            # Add layer structure to arch
+            arch.append(f"  └─ Per layer: {' → '.join(layer_info['components'])}")
+
+    # Output norm
+    if hasattr(inner_model, 'norm'):
+        arch.append("Output LayerNorm")
+    elif hasattr(inner_model, 'ln_f'):
+        arch.append("Output LayerNorm (ln_f)")
+
+    # LM head
+    if hasattr(model, 'lm_head'):
+        lm_head = model.lm_head
+        if hasattr(lm_head, 'weight'):
+            shape = lm_head.weight.shape
+            arch.append(f"LM Head: {shape[1]:,} → {shape[0]:,} (vocab)")
+            topology["total_parameters"] += shape[0] * shape[1]
+    elif hasattr(inner_model, 'embed_tokens') and hasattr(inner_model.embed_tokens, 'as_linear'):
+        arch.append("LM Head: tied to embeddings")
+
+    topology["architecture"] = arch
+
+    # Calculate total parameters from config if available (more accurate)
+    cfg = topology["config"]
+    if cfg.get("hidden_size") and cfg.get("num_hidden_layers"):
+        hidden = cfg["hidden_size"]
+        n_layers = cfg["num_hidden_layers"]
+        vocab = cfg.get("vocab_size", 0)
+        intermediate = cfg.get("intermediate_size", hidden * 4)
+        n_heads = cfg.get("num_attention_heads", 1)
+        n_kv_heads = cfg.get("num_key_value_heads", n_heads)
+        head_dim = cfg.get("head_dim", hidden // n_heads)
+
+        # Embedding
+        params = vocab * hidden
+
+        # Per layer: attention + FFN + norms
+        # Attention: Q, K, V, O projections
+        attn_params = (hidden * n_heads * head_dim) + (hidden * n_kv_heads * head_dim) * 2 + (n_heads * head_dim * hidden)
+
+        # FFN
+        if topology["is_moe"]:
+            num_experts = cfg.get("num_experts") or cfg.get("num_local_experts") or cfg.get("n_routed_experts", 8)
+            moe_intermediate = cfg.get("moe_intermediate_size", intermediate)
+            # Each expert has gate, up, down projections
+            ffn_params = num_experts * (hidden * moe_intermediate * 3)
+            # Plus router
+            ffn_params += hidden * num_experts
+            topology["num_experts"] = num_experts
+            topology["num_experts_per_tok"] = cfg.get("num_experts_per_tok") or cfg.get("num_selected_experts", 2)
+        else:
+            # Standard FFN: gate, up, down
+            ffn_params = hidden * intermediate * 3
+
+        # Layer norms (2 per layer typically)
+        norm_params = hidden * 4
+
+        layer_params = attn_params + ffn_params + norm_params
+        params += layer_params * n_layers
+
+        # Output norm + LM head (if not tied)
+        params += hidden  # final norm
+        if not cfg.get("tie_word_embeddings", True):
+            params += vocab * hidden
+
+        topology["total_parameters"] = int(params)
+
+    # Tokenizer info
+    if tokenizer:
+        topology["tokenizer"] = {
+            "type": type(tokenizer).__name__,
+        }
+        if hasattr(tokenizer, 'vocab_size'):
+            topology["tokenizer"]["vocab_size"] = tokenizer.vocab_size
+
+        # Handle max_length carefully - some tokenizers have absurdly large defaults
+        max_len = None
+        if hasattr(tokenizer, 'model_max_length'):
+            max_len = tokenizer.model_max_length
+            # Sanity check - if it's > 1M, use max_position_embeddings from config instead
+            if max_len and max_len > 1_000_000:
+                max_len = cfg.get("max_position_embeddings")
+        if max_len is None:
+            max_len = cfg.get("max_position_embeddings")
+        if max_len:
+            topology["tokenizer"]["max_length"] = max_len
+
+        if hasattr(tokenizer, 'bos_token') and tokenizer.bos_token:
+            topology["tokenizer"]["bos_token"] = repr(tokenizer.bos_token)
+        if hasattr(tokenizer, 'eos_token') and tokenizer.eos_token:
+            topology["tokenizer"]["eos_token"] = repr(tokenizer.eos_token)
+
+    return topology
+
+
+def format_topology_display(topology: Dict[str, Any]) -> str:
+    """Format topology dict for display."""
+    lines = []
+
+    lines.append(f"**Model Type:** `{topology['model_type']}`")
+    lines.append("")
+
+    # Config table
+    if topology.get("config"):
+        lines.append("**Configuration:**")
+        lines.append("| Parameter | Value |")
+        lines.append("|-----------|-------|")
+        for key, val in topology["config"].items():
+            # Format key nicely
+            display_key = key.replace('_', ' ').title()
+            # Format value
+            if isinstance(val, int) and val > 1000:
+                display_val = f"{val:,}"
+            else:
+                display_val = str(val)
+            lines.append(f"| {display_key} | {display_val} |")
+        lines.append("")
+
+    # Architecture
+    if topology.get("architecture"):
+        lines.append("**Architecture:**")
+        lines.append("```")
+        for item in topology["architecture"]:
+            lines.append(item)
+        lines.append("```")
+        lines.append("")
+
+    # MoE info
+    if topology.get("is_moe"):
+        lines.append("**🔀 Mixture of Experts:**")
+        moe_info = []
+        if topology.get("num_experts"):
+            moe_info.append(f"{topology['num_experts']} experts")
+        if topology.get("num_experts_per_tok"):
+            moe_info.append(f"top-{topology['num_experts_per_tok']} selection")
+        if moe_info:
+            lines.append(" | ".join(moe_info))
+        lines.append("")
+
+    # Parameters
+    if topology.get("total_parameters") > 0:
+        params = topology["total_parameters"]
+        if params >= 1e9:
+            param_str = f"{params/1e9:.2f}B"
+        elif params >= 1e6:
+            param_str = f"{params/1e6:.1f}M"
+        else:
+            param_str = f"{params:,}"
+        lines.append(f"**Estimated Parameters:** ~{param_str}")
+        lines.append("")
+
+    # Tokenizer
+    if topology.get("tokenizer"):
+        lines.append("**Tokenizer:**")
+        tok = topology["tokenizer"]
+        tok_info = [f"Type: `{tok.get('type', 'Unknown')}`"]
+        if 'vocab_size' in tok:
+            tok_info.append(f"Vocab: {tok['vocab_size']:,}")
+        if 'max_length' in tok:
+            tok_info.append(f"Max length: {tok['max_length']:,}")
+        lines.append(" | ".join(tok_info))
+
+    return "\n".join(lines)
+
+
 class ModelProber:
-    """
-    Universal prober for MLX language models.
+    """Universal prober for MLX language models."""
 
-    Works with any model loaded via mlx_lm.load().
-    """
-
-    def __init__(self, model, tokenizer, config: Optional[ProbeConfig] = None):
-        """
-        Initialize the prober.
-
-        Args:
-            model: MLX model from mlx_lm.load()
-            tokenizer: Tokenizer from mlx_lm.load()
-            config: Probe configuration
-        """
+    def __init__(self, model, tokenizer, config: Optional[ProbeConfig] = None, topology: Optional[Dict] = None):
         self.model = model
         self.tokenizer = tokenizer
         self.config = config or ProbeConfig()
+        self.topology = topology or {}
         self.results = ProbeResults()
-
-        # Detect model architecture
         self._detect_architecture()
 
     def _detect_architecture(self):
         """Detect model architecture and layer structure."""
-        # Get the inner model (usually model.model for mlx-lm models)
         if hasattr(self.model, 'model'):
             self.inner_model = self.model.model
         else:
             self.inner_model = self.model
 
-        # Detect layers
         if hasattr(self.inner_model, 'layers'):
             self.layers = list(self.inner_model.layers)
         else:
             self.layers = []
 
-        # Detect embedding
         if hasattr(self.inner_model, 'embed_tokens'):
             self.embedding = self.inner_model.embed_tokens
         elif hasattr(self.inner_model, 'embedding'):
@@ -227,7 +1227,6 @@ class ModelProber:
         else:
             self.embedding = None
 
-        # Detect output norm
         if hasattr(self.inner_model, 'norm'):
             self.output_norm = self.inner_model.norm
         elif hasattr(self.inner_model, 'final_layernorm'):
@@ -237,10 +1236,8 @@ class ModelProber:
         else:
             self.output_norm = None
 
-        # Store model info
         self.results.num_layers = len(self.layers)
 
-        # Try to get hidden dim
         if self.layers:
             first_layer = self.layers[0]
             if hasattr(first_layer, 'hidden_size'):
@@ -248,41 +1245,246 @@ class ModelProber:
             elif hasattr(first_layer, 'self_attn') and hasattr(first_layer.self_attn, 'hidden_size'):
                 self.results.hidden_dim = first_layer.self_attn.hidden_size
 
-        # Try to get vocab size
         if hasattr(self.model, 'model') and hasattr(self.model.model, 'vocab_size'):
             self.results.vocab_size = self.model.model.vocab_size
         elif self.embedding is not None and hasattr(self.embedding, 'num_embeddings'):
             self.results.vocab_size = self.embedding.num_embeddings
 
+        # MoE detection - use topology if available, then check class name
+        if self.topology.get("is_moe"):
+            self.results.is_moe = True
+            # Get num_experts from topology or config dict
+            num_experts = self.topology.get("num_experts", 0)
+            if not num_experts:
+                cfg = self.topology.get("config", {})
+                num_experts = cfg.get("num_local_experts") or cfg.get("num_experts") or cfg.get("n_routed_experts") or 0
+            self.results.num_experts = num_experts
+
+            # Get num_experts_per_tok from topology or config dict
+            num_per_tok = self.topology.get("num_experts_per_tok", 0)
+            if not num_per_tok:
+                cfg = self.topology.get("config", {})
+                num_per_tok = cfg.get("num_experts_per_tok") or cfg.get("num_experts_per_token") or cfg.get("num_selected_experts") or 2
+            self.results.num_experts_per_tok = num_per_tok
+        else:
+            model_class = type(self.inner_model).__name__
+            if 'moe' in model_class.lower() or 'mixture' in model_class.lower():
+                self.results.is_moe = True
+
+        # Also check layer structure for MoE modules
+        self.moe_modules = {}  # {layer_idx: moe_module}
+        if self.layers:
+            for i, layer in enumerate(self.layers):
+                moe_found = False
+                # Check direct layer attributes first
+                moe_attr_names = ['block_sparse_moe', 'moe', 'sparse_moe', 'switch_mlp', 'experts']
+                for attr_name in moe_attr_names:
+                    if hasattr(layer, attr_name):
+                        self.moe_modules[i] = getattr(layer, attr_name)
+                        moe_found = True
+                        break
+
+                # Also check inside layer.mlp for MoE (e.g., GPT-OSS structure)
+                if not moe_found and hasattr(layer, 'mlp'):
+                    mlp = layer.mlp
+                    if hasattr(mlp, 'experts') and hasattr(mlp, 'router'):
+                        self.moe_modules[i] = mlp
+
+        if self.moe_modules:
+            self.results.is_moe = True
+            # Get expert count from first MoE module (if not already set from topology)
+            if not self.results.num_experts:
+                first_moe = list(self.moe_modules.values())[0]
+                if hasattr(first_moe, 'experts') and hasattr(first_moe.experts, '__len__'):
+                    self.results.num_experts = len(first_moe.experts)
+                elif hasattr(first_moe, 'num_experts'):
+                    self.results.num_experts = first_moe.num_experts
+
+            # If still no expert count, try topology config (for SwitchGLU-style MoE)
+            if not self.results.num_experts:
+                cfg = self.topology.get("config", {})
+                self.results.num_experts = cfg.get("num_local_experts") or cfg.get("num_experts") or cfg.get("n_routed_experts") or 0
+
+            # Get top-k (if not already set from topology)
+            if not self.results.num_experts_per_tok:
+                first_moe = list(self.moe_modules.values())[0]
+                if hasattr(first_moe, 'num_experts_per_tok'):
+                    self.results.num_experts_per_tok = first_moe.num_experts_per_tok
+                elif hasattr(first_moe, 'top_k'):
+                    self.results.num_experts_per_tok = first_moe.top_k
+
+            # If still no top-k, try topology config
+            if not self.results.num_experts_per_tok:
+                cfg = self.topology.get("config", {})
+                self.results.num_experts_per_tok = cfg.get("num_experts_per_tok") or cfg.get("num_experts_per_token") or cfg.get("num_selected_experts") or 2
+
     def _should_capture_layer(self, layer_idx: int) -> bool:
-        """Check if we should capture this layer."""
         if self.config.layer_indices is None:
             return True
         return layer_idx in self.config.layer_indices
 
     def _to_numpy(self, x: mx.array, max_positions: Optional[int] = None) -> np.ndarray:
-        """Convert MLX array to numpy."""
+        """Convert MLX array to numpy, handling bfloat16 and other dtypes."""
         mx.eval(x)
-        arr = np.array(x)
+        # Always convert to float32 first for numpy compatibility
+        x_f32 = x.astype(mx.float32)
+        mx.eval(x_f32)
+        try:
+            # Try direct conversion first (faster)
+            arr = np.array(x_f32)
+        except (RuntimeError, TypeError, ValueError):
+            # Fall back to tolist (slower but always works)
+            arr = np.array(x_f32.tolist(), dtype=np.float32)
         if max_positions and len(arr.shape) >= 2:
             arr = arr[..., :max_positions, :]
         return arr
 
     def reset_results(self):
-        """Clear results for new probe."""
+        # Preserve MoE info before reset
+        old_is_moe = getattr(self.results, 'is_moe', False) if hasattr(self, 'results') else False
+        old_num_experts = getattr(self.results, 'num_experts', 0) if hasattr(self, 'results') else 0
+        old_num_per_tok = getattr(self.results, 'num_experts_per_tok', 0) if hasattr(self, 'results') else 0
+
         self.results = ProbeResults()
         self.results.num_layers = len(self.layers)
 
-    def _capture_activations(self, x: mx.array):
-        """
-        Run forward pass and capture activations.
+        # Restore MoE info
+        if hasattr(self, 'moe_modules') and self.moe_modules:
+            self.results.is_moe = True
+            self.results.num_experts = old_num_experts
+            self.results.num_experts_per_tok = old_num_per_tok
 
-        This is the core probing logic that works across architectures.
+    def _install_router_hooks(self):
         """
+        Note: MLX doesn't support runtime hooks like PyTorch.
+        Router capture during generation would require modifying the model architecture.
+        For now, we only capture router outputs during the initial probe (input tokens).
+        """
+        self._router_hooks_installed = False
+        # Router hooks are not implemented for MLX - generation routing not captured
+
+    def _remove_router_hooks(self):
+        """Remove router hooks (no-op for MLX)."""
+        self._router_hooks_installed = False
+
+    def _collect_router_captures(self, gen_step: int):
+        """Collect router captures (no-op - MLX doesn't support generation-time hooks)."""
+        pass  # Router outputs during generation not captured in MLX
+
+    def _capture_moe_router(self, layer_idx: int, layer, hidden_state: mx.array):
+        """Capture MoE router outputs for a layer."""
+        try:
+            moe = self.moe_modules.get(layer_idx)
+            if moe is None:
+                return
+
+            # Get the router/gate module
+            router = None
+            if hasattr(moe, 'gate'):
+                router = moe.gate
+            elif hasattr(moe, 'router'):
+                router = moe.router
+
+            if router is None:
+                return
+
+            # Get hidden state before MoE (need pre-FFN state)
+            # For most architectures, we need the state after attention + norm
+            pre_moe_state = hidden_state
+
+            # Some layers have input_layernorm before MLP
+            if hasattr(layer, 'post_attention_layernorm'):
+                # State should be normalized before going to MoE
+                pre_moe_state = layer.post_attention_layernorm(hidden_state)
+            elif hasattr(layer, 'ffn_norm'):
+                pre_moe_state = layer.ffn_norm(hidden_state)
+
+            mx.eval(pre_moe_state)
+
+            # Run router to get expert selection
+            # Router input shape: (batch, seq, hidden) -> (batch * seq, hidden)
+            batch_size, seq_len, hidden_dim = pre_moe_state.shape
+            router_input = pre_moe_state.reshape(-1, hidden_dim)
+
+            # Get router logits
+            router_logits = router(router_input)
+            mx.eval(router_logits)
+
+            # Convert to probabilities
+            router_probs = mx.softmax(router_logits, axis=-1)
+            mx.eval(router_probs)
+
+            # Get top-k selections
+            num_experts_per_tok = self.results.num_experts_per_tok
+            if not num_experts_per_tok:
+                # Try topology config as fallback
+                cfg = self.topology.get("config", {})
+                num_experts_per_tok = cfg.get("num_experts_per_tok") or cfg.get("num_experts_per_token") or cfg.get("num_selected_experts") or 2
+                self.results.num_experts_per_tok = num_experts_per_tok
+            top_k_indices = mx.argsort(router_probs, axis=-1)[:, -num_experts_per_tok:]
+            mx.eval(top_k_indices)
+
+            # Store results
+            self.results.moe_router_outputs[layer_idx] = {
+                "probs": self._to_numpy(router_probs, None).reshape(batch_size, seq_len, -1),
+                "selected": self._to_numpy(top_k_indices, None).reshape(batch_size, seq_len, -1).astype(np.int32)
+            }
+
+            # Compute expert load (how many tokens go to each expert)
+            selected_flat = top_k_indices.reshape(-1)
+            mx.eval(selected_flat)
+            selected_np = np.array(selected_flat.tolist())
+
+            # Get num_experts - fallback to router output shape if not set
+            num_experts = self.results.num_experts
+            if not num_experts:
+                # Infer from router output shape (router outputs probabilities over all experts)
+                num_experts = router_probs.shape[-1]
+                self.results.num_experts = num_experts
+
+            expert_counts = {}
+            for expert_idx in range(num_experts):
+                expert_counts[expert_idx] = int(np.sum(selected_np == expert_idx))
+            self.results.moe_expert_load[layer_idx] = expert_counts
+
+            # Collect expert-to-token mappings (which tokens each expert processed)
+            # Initialize if needed
+            if not self.results.moe_expert_tokens:
+                self.results.moe_expert_tokens = {e: [] for e in range(num_experts)}
+
+            # Get selected experts and their probabilities for each token
+            selected_2d = top_k_indices.reshape(seq_len, -1)  # (seq_len, top_k)
+            probs_2d = router_probs.reshape(seq_len, -1)  # (seq_len, num_experts)
+
+            for pos in range(seq_len):
+                # Get token_id from input or generated tokens
+                if pos < len(self.results.input_tokens):
+                    token_id = self.results.input_tokens[pos]
+                elif hasattr(self.results, 'generated_tokens') and self.results.generated_tokens:
+                    gen_idx = pos - len(self.results.input_tokens)
+                    token_id = self.results.generated_tokens[gen_idx] if gen_idx < len(self.results.generated_tokens) else -1
+                else:
+                    token_id = -1
+                selected_experts = selected_2d[pos].tolist()
+                expert_probs = probs_2d[pos].tolist()
+
+                for expert_id in selected_experts:
+                    if isinstance(expert_id, (list, np.ndarray)):
+                        expert_id = int(expert_id[0]) if len(expert_id) > 0 else 0
+                    expert_id = int(expert_id)
+                    prob = float(expert_probs[expert_id]) if expert_id < len(expert_probs) else 0.0
+                    if expert_id in self.results.moe_expert_tokens:
+                        self.results.moe_expert_tokens[expert_id].append((token_id, pos, layer_idx, prob))
+
+        except Exception as e:
+            # MoE capture failed - not critical
+            pass
+
+    def _capture_activations(self, x: mx.array):
+        """Run forward pass and capture activations."""
         max_pos = self.config.max_sequence_positions
 
         def compute_norm(arr: np.ndarray) -> float:
-            """Compute mean L2 norm."""
             return float(np.linalg.norm(arr, axis=-1).mean())
 
         # 1. Embedding
@@ -299,14 +1501,11 @@ class ModelProber:
                 self.results.residual_stream_norms.append(("Embed", compute_norm(h_np)))
                 prev_h = h_np
         else:
-            # Fallback: use model directly
             h = x
             prev_h = None
 
         # 2. Transformer layers
         for i, layer in enumerate(self.layers):
-            # Forward through layer
-            # Most layers accept (hidden_states, mask, cache) or similar
             try:
                 h = layer(h, mask=None, cache=None)
             except TypeError:
@@ -319,19 +1518,15 @@ class ModelProber:
                         continue
             mx.eval(h)
 
-            # Handle tuple outputs (some models return (hidden, present_kv))
             if isinstance(h, tuple):
                 h = h[0]
 
-            # Capture layer output
             if self.config.capture_layer_outputs and self._should_capture_layer(i):
                 self.results.layer_outputs[i] = self._to_numpy(h, max_pos)
 
-            # Capture FFN activations (approximate via output)
             if self.config.capture_ffn_activations and self._should_capture_layer(i):
                 self.results.ffn_activations[i] = self._to_numpy(h, max_pos)
 
-            # Capture residual stream
             if self.config.capture_residual_stream and self._should_capture_layer(i):
                 h_np = self._to_numpy(h, max_pos)
                 self.results.residual_stream[f"layer_{i}"] = h_np
@@ -343,6 +1538,10 @@ class ModelProber:
                     self.results.residual_stream_deltas.append((f"L{i}", delta))
                 prev_h = h_np
 
+            # MoE router capturing
+            if i in self.moe_modules and self._should_capture_layer(i):
+                self._capture_moe_router(i, layer, h)
+
         # 3. Output normalization
         if self.output_norm is not None:
             h = self.output_norm(h)
@@ -350,7 +1549,6 @@ class ModelProber:
 
         # 4. Get logits
         if self.config.capture_logits:
-            # Most models use embedding weights for output projection
             if hasattr(self.embedding, 'as_linear'):
                 logits = self.embedding.as_linear(h)
             elif hasattr(self.model, 'lm_head'):
@@ -358,33 +1556,40 @@ class ModelProber:
             elif hasattr(self.inner_model, 'lm_head'):
                 logits = self.inner_model.lm_head(h)
             else:
-                logits = h  # Fallback
+                logits = h
 
             mx.eval(logits)
-            self.results.logits = np.array(logits[0, -1, :])
+            logits_slice = logits[0, -1, :].astype(mx.float32)
+            mx.eval(logits_slice)
+            try:
+                self.results.logits = np.array(logits_slice)
+            except (RuntimeError, TypeError, ValueError):
+                self.results.logits = np.array(logits_slice.tolist(), dtype=np.float32)
 
-            # Get top-k tokens
+            # Compute probabilities
+            if self.config.capture_token_probs:
+                max_logit = self.results.logits.max()
+                exp_logits = np.exp(self.results.logits - max_logit)
+                self.results.token_probs = exp_logits / exp_logits.sum()
+
+            # Get top-k tokens with text
             top_k = 20
             top_indices = np.argsort(self.results.logits)[-top_k:][::-1]
-            self.results.top_k_tokens = [
-                (int(idx), float(self.results.logits[idx]))
-                for idx in top_indices
-            ]
+            self.results.top_k_tokens = []
+            for idx in top_indices:
+                idx_int = int(idx)
+                logit_val = float(self.results.logits[idx])
+                prob = float(self.results.token_probs[idx]) if self.results.token_probs is not None else 0.0
+                text = self.decode_token(idx_int)
+                # Handle empty/whitespace tokens
+                if not text or text.isspace():
+                    text = f"<{idx_int}>"
+                self.results.top_k_tokens.append((idx_int, prob, text))
 
     def probe(self, prompt: str, max_tokens: int = 1) -> ProbeResults:
-        """
-        Run probing on a prompt.
-
-        Args:
-            prompt: Input text
-            max_tokens: Tokens to generate (1 for just probing)
-
-        Returns:
-            ProbeResults with captured data
-        """
+        """Run probing on a prompt."""
         self.reset_results()
 
-        # Encode input
         if hasattr(self.tokenizer, 'encode'):
             tokens = self.tokenizer.encode(prompt)
         else:
@@ -396,22 +1601,8 @@ class ModelProber:
         self.results.input_tokens = list(tokens)
         self.results.input_text = prompt
 
-        # Convert to MLX
         x = mx.array([tokens])
-
-        # Capture activations
         self._capture_activations(x)
-
-        # Decode top tokens
-        if self.results.top_k_tokens:
-            try:
-                for idx, logit in self.results.top_k_tokens[:5]:
-                    if hasattr(self.tokenizer, 'decode'):
-                        text = self.tokenizer.decode([idx])
-                    else:
-                        text = str(idx)
-            except:
-                pass
 
         return self.results
 
@@ -426,6 +1617,626 @@ class ModelProber:
                 return f"[{token_id}]"
         except:
             return f"[{token_id}]"
+
+    def _safe_decode(self, tokens: List[int]) -> str:
+        """Safely decode a list of tokens to text."""
+        try:
+            if hasattr(self.tokenizer, 'decode'):
+                return self.tokenizer.decode(tokens)
+            else:
+                return "".join(self.decode_token(t) for t in tokens)
+        except:
+            return f"[{len(tokens)} tokens]"
+
+    def probe_with_generation(
+        self,
+        prompt: str,
+        max_tokens: int = 50,
+        temperature: float = 0.0
+    ) -> ProbeResults:
+        """
+        Run inference with generation, capturing per-token alternatives,
+        then probe layer activations.
+
+        This mirrors how AFM7 does it:
+        1. Manual token-by-token generation with alternatives capture
+        2. Separate probing pass for layer activations
+        """
+        self.reset_results()
+
+        # Tokenize input
+        if hasattr(self.tokenizer, 'encode'):
+            tokens = self.tokenizer.encode(prompt)
+        else:
+            tokens = self.tokenizer(prompt)
+
+        if isinstance(tokens, dict):
+            tokens = tokens['input_ids']
+
+        self.results.input_tokens = list(tokens)
+        self.results.input_text = prompt
+
+        # Manual generation with per-token alternatives capture
+        try:
+            x = mx.array([tokens])
+
+            # Initial forward pass
+            logits = self.model(x)
+            mx.eval(logits)
+
+            # Get vocab size from logits
+            vocab_size = logits.shape[-1]
+
+            # Capture initial top-k predictions (for the first generated token)
+            initial_logits = logits[0, -1, :]
+            probs = mx.softmax(initial_logits, axis=-1)
+            mx.eval(probs)
+
+            # Get top-k indices - convert to numpy for reliable indexing
+            top_indices = mx.argsort(probs)[-20:][::-1]
+            mx.eval(top_indices)
+
+            # Convert probs to numpy for reliable indexing
+            probs_np = np.array(probs.astype(mx.float32).tolist(), dtype=np.float32)
+
+            self.results.top_k_tokens = []
+            top_indices_list = top_indices.tolist()
+            for idx in top_indices_list:
+                idx_int = int(idx)
+                if 0 <= idx_int < vocab_size:
+                    prob_val = float(probs_np[idx_int])
+                    tok_text = self.decode_token(idx_int)
+                    # Handle empty/whitespace tokens
+                    if not tok_text or tok_text.isspace():
+                        tok_text = f"<{idx_int}>"
+                    self.results.top_k_tokens.append((idx_int, prob_val, tok_text))
+
+            # Store logits and probs - ensure float32 for numpy compatibility
+            initial_logits_f32 = initial_logits.astype(mx.float32)
+            probs_f32 = probs.astype(mx.float32)
+            mx.eval(initial_logits_f32, probs_f32)
+            self.results.logits = np.array(initial_logits_f32.tolist(), dtype=np.float32)
+            self.results.token_probs = np.array(probs_f32.tolist(), dtype=np.float32)
+
+            # Generate tokens step by step
+            generated = []
+            per_token_alts = []
+
+            # Install MoE router hooks to capture during generation
+            if self.results.is_moe:
+                self._install_router_hooks()
+
+            # Create cache for efficient generation
+            cache = None
+            if hasattr(self.model, 'make_cache'):
+                cache = self.model.make_cache()
+                # Re-run with cache
+                logits = self.model(x, cache=cache)
+                mx.eval(logits)
+
+            for gen_step in range(max_tokens):
+                # Get probabilities at current position
+                step_logits = logits[0, -1, :]
+                step_probs = mx.softmax(step_logits, axis=-1)
+                mx.eval(step_probs)
+
+                # Capture top-10 alternatives at this position
+                top_idx = mx.argsort(step_probs)[-10:][::-1]
+                mx.eval(top_idx)
+
+                alternatives = []
+                for idx in top_idx:
+                    idx_int = int(idx)
+                    if 0 <= idx_int < vocab_size:
+                        prob_val = float(step_probs[idx_int])
+                        tok_text = self.decode_token(idx_int)
+                        alternatives.append((idx_int, prob_val, tok_text))
+
+                per_token_alts.append(alternatives)
+
+                # Sample next token
+                if temperature == 0:
+                    next_token = mx.argmax(step_logits)
+                else:
+                    scaled_logits = step_logits / temperature
+                    next_token = mx.random.categorical(scaled_logits.reshape(1, -1))[0]
+
+                mx.eval(next_token)
+                next_token_int = int(next_token)
+
+                # Validate token
+                if next_token_int < 0 or next_token_int >= vocab_size:
+                    break
+
+                generated.append(next_token_int)
+
+                # Check for EOS tokens
+                eos_tokens = []
+                if hasattr(self.tokenizer, 'eos_token_id'):
+                    eos_id = self.tokenizer.eos_token_id
+                    if isinstance(eos_id, int):
+                        eos_tokens.append(eos_id)
+                    elif isinstance(eos_id, list):
+                        eos_tokens.extend(eos_id)
+
+                if next_token_int in eos_tokens:
+                    break
+
+                # Check for reasoning model stop conditions (extensible for different architectures)
+                current_text = self._safe_decode(generated)
+                reasoning_fmt = detect_reasoning_format(current_text)
+                if reasoning_fmt and reasoning_fmt.should_stop(current_text):
+                    break
+
+                # Repetition detection - break if last N tokens are repeating
+                if len(generated) >= 10:
+                    last_5 = generated[-5:]
+                    prev_5 = generated[-10:-5]
+                    if last_5 == prev_5:
+                        break  # Stuck in a loop
+
+                # Next forward pass
+                next_x = next_token.reshape(1, 1)
+                if cache is not None:
+                    logits = self.model(next_x, cache=cache)
+                else:
+                    # Append to sequence and re-run (slower but works without cache)
+                    x = mx.concatenate([x, next_x], axis=1)
+                    logits = self.model(x)
+                mx.eval(logits)
+
+                # Collect MoE router captures for this generation step
+                if self.results.is_moe:
+                    self._collect_router_captures(gen_step)
+
+            # Remove MoE router hooks
+            if self.results.is_moe:
+                self._remove_router_hooks()
+
+            # Store generation results
+            self.results.generated_tokens = generated
+            self.results.generated_text = self._safe_decode(generated)
+            self.results.per_token_alternatives = per_token_alts
+
+            # Parse reasoning vs answer
+            reasoning, answer = parse_reasoning_output(self.results.generated_text)
+            self.results.reasoning_text = reasoning
+            self.results.answer_text = answer if answer else self.results.generated_text
+
+        except Exception as e:
+            import traceback
+            # Clean up hooks on error
+            if self.results.is_moe:
+                self._remove_router_hooks()
+            self.results.generated_text = f"(Generation error: {str(e)})"
+            self.results.reasoning_text = ""
+            self.results.answer_text = ""
+            self.results.generated_tokens = []
+
+        # Now capture layer activations on the FULL sequence (input + generated)
+        # This captures MoE router outputs for ALL positions including generated tokens
+        # But preserve the logits/probs captured during generation (they're meaningful)
+        try:
+            # Save generation-time logits (these are for predicting the first generated token)
+            saved_logits = self.results.logits
+            saved_token_probs = self.results.token_probs
+            saved_top_k_tokens = self.results.top_k_tokens
+
+            full_tokens = list(tokens) + self.results.generated_tokens
+            x = mx.array([full_tokens])
+            self._capture_activations(x)
+
+            # Restore generation-time logits (not the "what comes after everything" logits)
+            self.results.logits = saved_logits
+            self.results.token_probs = saved_token_probs
+            self.results.top_k_tokens = saved_top_k_tokens
+        except Exception as e:
+            pass  # Probing failed but generation may have succeeded
+
+        return self.results
+
+
+# =============================================================================
+# AI Interpretation Functions
+# =============================================================================
+
+def generate_ai_interpretation(
+    model,
+    tokenizer,
+    context: str,
+    question: str,
+    interpreter: str = "claude",
+    max_tokens: int = 200
+) -> str:
+    """
+    Use AI to interpret probe results.
+
+    Args:
+        model: The loaded MLX model (used if interpreter="local")
+        tokenizer: The tokenizer (used if interpreter="local")
+        context: Data/statistics to interpret
+        question: What to explain
+        interpreter: "claude" for Claude Code, "local" for loaded model
+        max_tokens: Max response length
+
+    Returns:
+        The AI's interpretation as a string
+    """
+    # Use Claude Code if selected
+    if interpreter == "claude":
+        return generate_claude_interpretation(context, question, max_tokens)
+
+    # Otherwise use local model
+    try:
+        from mlx_lm import generate
+        from mlx_lm.sample_utils import make_sampler
+
+        system_msg = "You are an expert in neural network interpretability. Provide clear, concise explanations of model behavior based on probe data."
+        user_msg = f"""Based on this probe data:
+
+{context}
+
+{question}
+
+Provide a concise interpretation (2-3 sentences)."""
+
+        messages = [
+            {"role": "system", "content": system_msg},
+            {"role": "user", "content": user_msg}
+        ]
+
+        if hasattr(tokenizer, 'apply_chat_template'):
+            try:
+                prompt = tokenizer.apply_chat_template(
+                    messages,
+                    tokenize=False,
+                    add_generation_prompt=True
+                )
+            except Exception:
+                prompt = f"{system_msg}\n\nUser: {user_msg}\n\nAssistant:"
+        else:
+            prompt = f"{system_msg}\n\nUser: {user_msg}\n\nAssistant:"
+
+        sampler = make_sampler(temp=0.7)
+
+        response = generate(
+            model,
+            tokenizer,
+            prompt=prompt,
+            max_tokens=max_tokens,
+            sampler=sampler
+        )
+
+        # Clean special tokens from reasoning models
+        cleaned = clean_special_tokens(response)
+
+        # Also extract just the answer if there's reasoning
+        reasoning, answer = parse_reasoning_output(cleaned)
+        if answer and not answer.startswith("(Response"):
+            return answer.strip()
+
+        return cleaned.strip()
+
+    except Exception as e:
+        return f"(AI interpretation unavailable: {str(e)[:50]})"
+
+
+def get_layer_activation_interpretation(results: ProbeResults, model=None, tokenizer=None, use_ai: bool = False, interpreter: str = "claude") -> str:
+    """Generate interpretation for layer activation patterns."""
+    if not results.layer_outputs:
+        return "No layer data available."
+
+    norms = []
+    for idx in sorted(results.layer_outputs.keys()):
+        arr = results.layer_outputs[idx]
+        norm = float(np.linalg.norm(arr, axis=-1).mean())
+        norms.append(norm)
+
+    if len(norms) < 2:
+        return "Insufficient layer data for analysis."
+
+    trend = "increasing" if norms[-1] > norms[0] else "decreasing"
+    max_layer = np.argmax(norms)
+    min_layer = np.argmin(norms)
+    variance = np.var(norms)
+
+    # Build context for AI interpretation
+    layer_indices = sorted(results.layer_outputs.keys())
+    norm_strs = [f"L{layer_indices[i]}: {norms[i]:.2f}" for i in range(min(len(norms), 10))]
+    if len(norms) > 10:
+        norm_strs.append("...")
+
+    context = f"""Layer Activation Norms (L2):
+{', '.join(norm_strs)}
+Trend: {trend} (first: {norms[0]:.2f}, last: {norms[-1]:.2f})
+Peak: Layer {layer_indices[max_layer]} ({norms[max_layer]:.2f})
+Lowest: Layer {layer_indices[min_layer]} ({norms[min_layer]:.2f})
+Variance: {variance:.2f}"""
+
+    if use_ai:
+        return generate_ai_interpretation(
+            model, tokenizer, context,
+            "What do these activation norm patterns tell us about how the model processes this input?",
+            interpreter=interpreter
+        )
+
+    # Fallback static interpretation
+    interpretation = f"""**Layer Activation Analysis:**
+
+- **Trend:** Activation norms are {trend} through the network (first: {norms[0]:.2f}, last: {norms[-1]:.2f})
+- **Peak activity:** Layer {layer_indices[max_layer]} (norm: {norms[max_layer]:.2f})
+- **Lowest activity:** Layer {layer_indices[min_layer]} (norm: {norms[min_layer]:.2f})
+- **Variance:** {variance:.2f} - {"high variation suggests distinct processing phases" if variance > 1 else "relatively uniform processing across layers"}
+
+This pattern indicates the model {"builds up representations progressively" if trend == "increasing" else "compresses information as it processes"}."""
+
+    return interpretation
+
+
+def get_token_prob_interpretation(results: ProbeResults, model=None, tokenizer=None, use_ai: bool = False, interpreter: str = "claude") -> str:
+    """Generate interpretation for token probability distribution."""
+    if not results.top_k_tokens:
+        return "No token probabilities available."
+
+    top_token = results.top_k_tokens[0]
+    top5_mass = sum(t[1] for t in results.top_k_tokens[:5])
+
+    if results.token_probs is not None:
+        entropy = float(-np.sum(results.token_probs * np.log(results.token_probs + 1e-10)))
+    else:
+        entropy = 0
+
+    confidence = "very confident" if top_token[1] > 0.5 else "confident" if top_token[1] > 0.2 else "uncertain"
+
+    # Build context for AI
+    def safe_token_text(t):
+        return t[2] if t[2] and not t[2].isspace() else f"<{t[0]}>"
+    top_tokens_str = ", ".join([f'"{safe_token_text(t)}": {t[1]:.1%}' for t in results.top_k_tokens[:5]])
+    context = f"""Token Prediction Analysis:
+Input: "{results.input_text[:100]}..."
+Top predictions: {top_tokens_str}
+Top-5 probability mass: {top5_mass:.1%}
+Entropy: {entropy:.2f} nats
+Confidence level: {confidence}"""
+
+    if use_ai:
+        return generate_ai_interpretation(
+            model, tokenizer, context,
+            "What does this probability distribution reveal about the model's confidence and reasoning?",
+            interpreter=interpreter
+        )
+
+    # Fallback static interpretation
+    interpretation = f"""**Token Prediction Analysis:**
+
+- **Top prediction:** "{top_token[2]}" with {top_token[1]:.1%} probability
+- **Model confidence:** {confidence}
+- **Top-5 probability mass:** {top5_mass:.1%}
+- **Entropy:** {entropy:.2f} nats {"(low - focused prediction)" if entropy < 2 else "(high - multiple viable options)"}
+
+The model is {confidence} about the next token. {"The probability is concentrated on a single prediction." if top_token[1] > 0.5 else "Multiple tokens are being considered as possibilities."}"""
+
+    return interpretation
+
+
+def get_ffn_interpretation(results: ProbeResults, model=None, tokenizer=None, use_ai: bool = False, interpreter: str = "claude") -> str:
+    """Generate interpretation for FFN activation patterns."""
+    if not results.ffn_activations:
+        return "No FFN data available."
+
+    sparsities = []
+    mean_activations = []
+    for idx in sorted(results.ffn_activations.keys()):
+        arr = results.ffn_activations[idx]
+        sparsity = float((np.abs(arr) < 0.1).mean())
+        mean_act = float(np.abs(arr).mean())
+        sparsities.append(sparsity)
+        mean_activations.append(mean_act)
+
+    avg_sparsity = np.mean(sparsities)
+    sparsity_trend = "increasing" if sparsities[-1] > sparsities[0] else "decreasing"
+
+    # Build context for AI
+    context = f"""FFN (Feed-Forward Network) Analysis:
+Average gate sparsity: {avg_sparsity:.1%} (fraction of near-zero activations)
+Sparsity trend: {sparsity_trend} through layers
+Mean activation range: {min(mean_activations):.2f} to {max(mean_activations):.2f}
+Number of layers: {len(sparsities)}"""
+
+    if use_ai:
+        return generate_ai_interpretation(
+            model, tokenizer, context,
+            "What does this FFN sparsity pattern reveal about how the model routes and processes information?",
+            interpreter=interpreter
+        )
+
+    # Fallback static interpretation
+    interpretation = f"""**FFN Analysis:**
+
+- **Average gate sparsity:** {avg_sparsity:.1%} of activations near zero
+- **Sparsity trend:** {sparsity_trend} through layers
+- **Mean activation range:** {min(mean_activations):.2f} to {max(mean_activations):.2f}
+
+{"High sparsity indicates selective, efficient processing - the model has learned to activate only relevant pathways." if avg_sparsity > 0.5 else "Lower sparsity suggests more distributed processing across FFN pathways."}"""
+
+    return interpretation
+
+
+def get_embedding_interpretation(results: ProbeResults, model=None, tokenizer=None, use_ai: bool = False, interpreter: str = "claude") -> str:
+    """Generate interpretation for embedding statistics."""
+    if results.embeddings is None:
+        return "No embedding data available."
+
+    emb = results.embeddings
+    if len(emb.shape) == 3:
+        emb = emb[0]
+
+    per_token_norms = np.linalg.norm(emb, axis=-1)
+    mean_norm = float(np.mean(per_token_norms))
+    std_norm = float(np.std(per_token_norms))
+
+    # Build context for AI
+    context = f"""Token Embedding Analysis:
+Shape: {emb.shape}
+Mean token norm: {mean_norm:.2f}
+Norm std deviation: {std_norm:.2f}
+Min/Max norm: {per_token_norms.min():.2f} / {per_token_norms.max():.2f}
+Number of tokens: {len(results.input_tokens)}"""
+
+    if use_ai:
+        return generate_ai_interpretation(
+            model, tokenizer, context,
+            "What do these embedding statistics reveal about how the model represents this input?",
+            interpreter=interpreter
+        )
+
+    # Fallback static interpretation
+    interpretation = f"""**Embedding Analysis:**
+
+- **Mean token norm:** {mean_norm:.2f}
+- **Norm std deviation:** {std_norm:.2f}
+- **Embedding shape:** {emb.shape}
+
+{"Tokens have similar embedding magnitudes, suggesting uniform representation." if std_norm < 0.5 else "Significant variation in token norms - some tokens may carry more 'weight' in the representation."}"""
+
+    return interpretation
+
+
+def get_layer_similarity_interpretation(results: ProbeResults, model=None, tokenizer=None, use_ai: bool = False, interpreter: str = "claude") -> str:
+    """Generate interpretation for layer similarity patterns."""
+    if len(results.layer_outputs) < 2:
+        return "Need at least 2 layers for similarity analysis."
+
+    layer_indices = sorted(results.layer_outputs.keys())
+    adjacent_sims = []
+
+    for i in range(len(layer_indices) - 1):
+        v1 = results.layer_outputs[layer_indices[i]].flatten()
+        v2 = results.layer_outputs[layer_indices[i + 1]].flatten()
+        v1 = v1 / (np.linalg.norm(v1) + 1e-8)
+        v2 = v2 / (np.linalg.norm(v2) + 1e-8)
+        sim = float(np.dot(v1, v2))
+        adjacent_sims.append(sim)
+
+    avg_sim = np.mean(adjacent_sims)
+    min_sim_idx = np.argmin(adjacent_sims)
+
+    # Build context for AI
+    context = f"""Layer Similarity Analysis (Cosine Similarity):
+Average adjacent layer similarity: {avg_sim:.3f}
+Biggest transformation: Between layers {layer_indices[min_sim_idx]} and {layer_indices[min_sim_idx + 1]} (similarity: {adjacent_sims[min_sim_idx]:.3f})
+Number of layers compared: {len(adjacent_sims)}
+Similarity range: {min(adjacent_sims):.3f} to {max(adjacent_sims):.3f}"""
+
+    if use_ai:
+        return generate_ai_interpretation(
+            model, tokenizer, context,
+            "What do these layer similarity patterns reveal about how the model transforms representations through its layers?",
+            interpreter=interpreter
+        )
+
+    # Fallback static interpretation
+    interpretation = f"""**Layer Similarity Analysis:**
+
+- **Average adjacent layer similarity:** {avg_sim:.3f}
+- **Biggest transformation:** Between layers {layer_indices[min_sim_idx]} and {layer_indices[min_sim_idx + 1]} (similarity: {adjacent_sims[min_sim_idx]:.3f})
+
+{"High similarity between adjacent layers suggests incremental refinement." if avg_sim > 0.9 else "Moderate similarity indicates meaningful transformations at each layer." if avg_sim > 0.7 else "Low similarity suggests significant changes in representation at each layer."}"""
+
+    return interpretation
+
+
+def get_residual_stream_interpretation(results: ProbeResults, model=None, tokenizer=None, use_ai: bool = False, interpreter: str = "claude") -> str:
+    """Generate interpretation for residual stream patterns."""
+    if not results.residual_stream_norms:
+        return "No residual stream data available."
+
+    norms = [x[1] for x in results.residual_stream_norms]
+    deltas = [x[1] for x in results.residual_stream_deltas] if results.residual_stream_deltas else []
+
+    norm_trend = "growing" if norms[-1] > norms[0] else "shrinking"
+
+    if deltas:
+        max_delta_idx = np.argmax(deltas)
+        max_delta_layer = results.residual_stream_deltas[max_delta_idx][0]
+        max_delta_val = deltas[max_delta_idx]
+    else:
+        max_delta_layer = "N/A"
+        max_delta_val = 0
+
+    # Build context for AI
+    context = f"""Residual Stream Analysis:
+Stream magnitude trend: {norm_trend} from {norms[0]:.2f} to {norms[-1]:.2f}
+Largest layer contribution: {max_delta_layer} (delta: {max_delta_val:.2f})
+Total positions tracked: {len(norms)}
+Average norm: {np.mean(norms):.2f}"""
+
+    if use_ai:
+        return generate_ai_interpretation(
+            model, tokenizer, context,
+            "What does this residual stream pattern reveal about how information flows and transforms through the model?",
+            interpreter=interpreter
+        )
+
+    # Fallback static interpretation
+    interpretation = f"""**Residual Stream Analysis:**
+
+- **Stream magnitude:** {norm_trend} from {norms[0]:.2f} to {norms[-1]:.2f}
+- **Largest contribution:** {max_delta_layer} (delta: {max_delta_val:.2f})
+- **Total layers tracked:** {len(norms)}
+
+The residual stream is {norm_trend}, indicating {"information accumulation" if norm_trend == "growing" else "compression/filtering"}. Layer {max_delta_layer} makes the largest modification to the stream."""
+
+    return interpretation
+
+
+def get_logits_interpretation(results: ProbeResults, model=None, tokenizer=None, use_ai: bool = False, interpreter: str = "claude") -> str:
+    """Generate interpretation for logits distribution."""
+    if results.logits is None:
+        return "No logits data available."
+
+    logits = np.array(results.logits)
+    mean_logit = float(logits.mean())
+    std_logit = float(logits.std())
+    max_logit = float(logits.max())
+    min_logit = float(logits.min())
+
+    # Get softmax distribution info
+    probs = np.exp(logits - logits.max())
+    probs = probs / probs.sum()
+    entropy = -np.sum(probs * np.log(probs + 1e-10))
+    top_prob = float(probs.max())
+
+    # Build context for AI
+    context = f"""Logits Distribution Analysis:
+Mean logit: {mean_logit:.4f}
+Std deviation: {std_logit:.4f}
+Range: [{min_logit:.4f}, {max_logit:.4f}]
+Vocabulary size: {len(logits)}
+Entropy (after softmax): {entropy:.4f}
+Top token probability: {top_prob:.2%}"""
+
+    if use_ai:
+        return generate_ai_interpretation(
+            model, tokenizer, context,
+            "What does this logits distribution reveal about model confidence and the sharpness of the output distribution?",
+            interpreter=interpreter
+        )
+
+    # Fallback static interpretation
+    confidence = "high" if top_prob > 0.5 else "medium" if top_prob > 0.1 else "low"
+    distribution = "sharp/confident" if std_logit > 5 else "diffuse/uncertain"
+
+    interpretation = f"""**Logits Distribution Analysis:**
+
+- **Statistics:** Mean={mean_logit:.2f}, Std={std_logit:.2f}
+- **Range:** [{min_logit:.2f}, {max_logit:.2f}]
+- **Entropy:** {entropy:.2f} ({"low uncertainty" if entropy < 2 else "high uncertainty"})
+- **Top probability:** {top_prob:.1%} ({confidence} confidence)
+
+The distribution is {distribution}, suggesting the model is {"confident in its prediction" if confidence == "high" else "considering multiple possibilities"}."""
+
+    return interpretation
 
 
 # =============================================================================
@@ -484,12 +2295,14 @@ def plot_ffn_analysis(results: ProbeResults) -> go.Figure:
         mean_acts.append(mean_act)
 
     fig.add_trace(
-        go.Scatter(x=layers, y=sparsities, mode='lines+markers', name='Sparsity'),
+        go.Scatter(x=layers, y=sparsities, mode='lines+markers', name='Sparsity',
+                   line=dict(color='#636EFA')),
         row=1, col=1
     )
 
     fig.add_trace(
-        go.Scatter(x=layers, y=mean_acts, mode='lines+markers', name='Mean |Act|'),
+        go.Scatter(x=layers, y=mean_acts, mode='lines+markers', name='Mean |Act|',
+                   line=dict(color='#EF553B')),
         row=1, col=2
     )
 
@@ -503,44 +2316,89 @@ def plot_ffn_analysis(results: ProbeResults) -> go.Figure:
 
 
 def plot_embeddings_pca(results: ProbeResults, tokenizer) -> go.Figure:
-    """Plot PCA of token embeddings."""
+    """Plot PCA of token embeddings with section-based coloring."""
     if results.embeddings is None:
         return go.Figure()
 
-    # Get embeddings for each token position
-    emb = results.embeddings[0]  # Remove batch dim
+    emb = results.embeddings[0]
 
     if emb.shape[0] < 2:
         return go.Figure()
 
-    # PCA
     pca = PCA(n_components=2)
     emb_2d = pca.fit_transform(emb)
 
-    # Get token labels
+    # Combine input and generated tokens
+    all_tokens = list(results.input_tokens) if results.input_tokens else []
+    if hasattr(results, 'generated_tokens') and results.generated_tokens:
+        all_tokens = all_tokens + list(results.generated_tokens)
+
+    # Detect sections for coloring
+    sections = detect_prompt_sections(results, tokenizer)
+
+    # Build labels and section assignments
     labels = []
-    for i, tok_id in enumerate(results.input_tokens[:emb.shape[0]]):
-        try:
-            text = tokenizer.decode([tok_id]) if hasattr(tokenizer, 'decode') else str(tok_id)
-            labels.append(f"{i}: {text[:10]}")
-        except:
-            labels.append(f"{i}: [{tok_id}]")
+    section_ids = []
+    section_names = []
+
+    # Define section colors (all possible section names from detect_prompt_sections)
+    section_colors = {
+        "📋 System Prompt": "#636EFA",      # Blue
+        "👤 User Prompt": "#00CC96",         # Green
+        "📥 Input Sequence": "#00CC96",      # Green (fallback)
+        "📥 Input": "#00CC96",               # Green (fallback)
+        "🤖 Response": "#AB63FA",            # Purple
+        "🤖 Response (Pre-Reasoning)": "#AB63FA",  # Purple
+        "🧠 Reasoning": "#FFA15A",           # Orange
+        "🧠 Reasoning (In Progress)": "#FFA15A",   # Orange
+        "✅ Final Response": "#EF553B",      # Red
+        "📄 All Tokens": "#888888",          # Gray
+        "Unknown": "#888888"                 # Gray
+    }
+
+    for i in range(emb.shape[0]):
+        # Get token text
+        if i < len(all_tokens):
+            try:
+                text = tokenizer.decode([all_tokens[i]]) if hasattr(tokenizer, 'decode') else str(all_tokens[i])
+                text = text.replace('\n', '\\n')[:15]
+                labels.append(f"{i}: {text}")
+            except:
+                labels.append(f"{i}: [{all_tokens[i]}]")
+        else:
+            labels.append(f"{i}")
+
+        # Determine section
+        section_name = "Unknown"
+        for sec_name, (start, end) in sections.items():
+            if start <= i < end:
+                section_name = sec_name
+                break
+        section_ids.append(section_name)
+        if section_name not in section_names:
+            section_names.append(section_name)
 
     fig = go.Figure()
-    fig.add_trace(go.Scatter(
-        x=emb_2d[:, 0],
-        y=emb_2d[:, 1],
-        mode='markers+text',
-        text=labels,
-        textposition='top center',
-        marker=dict(size=10, color=list(range(len(labels))), colorscale='Viridis'),
-        hoverinfo='text'
-    ))
+
+    # Add traces by section for legend
+    for sec_name in section_names:
+        indices = [i for i, s in enumerate(section_ids) if s == sec_name]
+        if indices:
+            fig.add_trace(go.Scatter(
+                x=[emb_2d[i, 0] for i in indices],
+                y=[emb_2d[i, 1] for i in indices],
+                mode='markers',
+                name=sec_name,
+                text=[labels[i] for i in indices],
+                hovertemplate='%{text}<extra></extra>',
+                marker=dict(size=10, color=section_colors.get(sec_name, "#888888"))
+            ))
 
     fig.update_layout(
         title=f"Token Embeddings PCA (explained var: {pca.explained_variance_ratio_.sum():.1%})",
         xaxis_title=f"PC1 ({pca.explained_variance_ratio_[0]:.1%})",
-        yaxis_title=f"PC2 ({pca.explained_variance_ratio_[1]:.1%})"
+        yaxis_title=f"PC2 ({pca.explained_variance_ratio_[1]:.1%})",
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
     )
 
     return fig
@@ -553,56 +2411,119 @@ def plot_logits_distribution(results: ProbeResults, tokenizer=None) -> go.Figure
 
     fig = make_subplots(
         rows=1, cols=3,
-        subplot_titles=("Logits Histogram", "Log Probability", "Top Tokens")
+        subplot_titles=("Logits Histogram", "Log Probability", "Top Token Logits")
     )
 
     logits = results.logits
 
     # 1. Raw logits histogram
     fig.add_trace(
-        go.Histogram(x=logits, nbinsx=100, name='Logits'),
+        go.Histogram(x=logits, nbinsx=100, name='Logits', marker_color='#636EFA'),
         row=1, col=1
     )
 
     # 2. Log probability histogram
-    probs = np.exp(logits - np.max(logits))  # Softmax numerator
-    probs = probs / probs.sum()
-    log_probs = np.log10(probs + 1e-15)
+    if results.token_probs is not None:
+        log_probs = np.log10(results.token_probs + 1e-15)
+        fig.add_trace(
+            go.Histogram(x=log_probs, nbinsx=100, name='Log Prob', marker_color='#00CC96'),
+            row=1, col=2
+        )
 
-    fig.add_trace(
-        go.Histogram(x=log_probs, nbinsx=100, name='Log Prob'),
-        row=1, col=2
-    )
+    # 3. Top tokens bar chart - show LOGIT VALUES (not probabilities) for better visibility
+    if results.top_k_tokens and results.logits is not None:
+        top_k = results.top_k_tokens[:10]
+        # Handle empty/whitespace tokens - show token ID as fallback
+        labels = []
+        token_logits = []
+        for t in top_k:
+            token_text = t[2][:15] if t[2] and not t[2].isspace() else f"<{t[0]}>"
+            labels.append(token_text)
+            # Get the actual logit value for this token
+            token_id = t[0]
+            if 0 <= token_id < len(results.logits):
+                token_logits.append(float(results.logits[token_id]))
+            else:
+                token_logits.append(0.0)
 
-    # 3. Top tokens bar chart
-    top_k = 10
-    top_indices = np.argsort(logits)[-top_k:][::-1]
-    top_logits = logits[top_indices]
-
-    labels = []
-    for idx in top_indices:
-        idx_int = int(idx)
-        if tokenizer is not None:
-            try:
-                text = tokenizer.decode([idx_int]) if hasattr(tokenizer, 'decode') else str(idx_int)
-                labels.append(text[:15])
-            except:
-                labels.append(f"[{idx_int}]")
-        else:
-            labels.append(f"[{idx_int}]")
-
-    fig.add_trace(
-        go.Bar(x=labels, y=top_logits, name='Top Tokens'),
-        row=1, col=3
-    )
+        fig.add_trace(
+            go.Bar(x=labels, y=token_logits, name='Top Logits', marker_color='#EF553B'),
+            row=1, col=3
+        )
 
     fig.update_layout(height=400, showlegend=False)
     fig.update_xaxes(title_text="Logit Value", row=1, col=1)
     fig.update_xaxes(title_text="Log₁₀(Probability)", row=1, col=2)
-    fig.update_xaxes(title_text="Token", row=1, col=3)
+    fig.update_xaxes(title_text="Token", tickangle=45, row=1, col=3)
     fig.update_yaxes(title_text="Count", row=1, col=1)
     fig.update_yaxes(title_text="Count", row=1, col=2)
-    fig.update_yaxes(title_text="Logit", row=1, col=3)
+    fig.update_yaxes(title_text="Logit Value", row=1, col=3)
+
+    return fig
+
+
+def plot_token_probabilities(results: ProbeResults) -> go.Figure:
+    """Plot horizontal bar chart of top token probabilities."""
+    if not results.top_k_tokens:
+        return go.Figure()
+
+    top_k = results.top_k_tokens[:15]
+
+    # Check if distribution is extremely peaked (top prob > 99%)
+    top_prob = top_k[0][1] if top_k else 0
+    is_peaked = top_prob > 0.99
+
+    # Handle empty/whitespace tokens - show token ID as fallback
+    labels = []
+    for t in reversed(top_k):
+        token_text = t[2][:20] if t[2] and not t[2].isspace() else f"<{t[0]}>"
+        labels.append(token_text)
+
+    if is_peaked and results.logits is not None:
+        # When distribution is peaked, show logit differences from max (more informative)
+        max_logit = float(results.logits.max())
+        logit_diffs = []
+        for t in reversed(top_k):
+            token_id = t[0]
+            if 0 <= token_id < len(results.logits):
+                logit_diffs.append(float(results.logits[token_id]) - max_logit)
+            else:
+                logit_diffs.append(-100.0)
+
+        fig = go.Figure(go.Bar(
+            x=logit_diffs,
+            y=labels,
+            orientation='h',
+            marker_color='#636EFA',
+            text=[f"{d:.1f}" for d in logit_diffs],
+            textposition='auto'
+        ))
+
+        fig.update_layout(
+            title="Top Token Predictions (Logit Difference from Max)",
+            xaxis_title="Logit Difference (0 = highest)",
+            yaxis_title="Token",
+            height=max(400, len(labels) * 25)
+        )
+    else:
+        # Normal distribution - show probabilities
+        probs = [t[1] * 100 for t in reversed(top_k)]
+
+        fig = go.Figure(go.Bar(
+            x=probs,
+            y=labels,
+            orientation='h',
+            marker_color='#636EFA',
+            text=[f"{p:.1f}%" for p in probs],
+            textposition='auto'
+        ))
+
+        fig.update_layout(
+            title="Top Token Predictions",
+            xaxis_title="Probability (%)",
+            yaxis_title="Token",
+            height=max(400, len(labels) * 25)
+        )
 
     return fig
 
@@ -615,7 +2536,6 @@ def plot_layer_similarity(results: ProbeResults) -> go.Figure:
     if n < 2:
         return go.Figure()
 
-    # Compute similarity matrix
     similarity = np.zeros((n, n))
 
     vectors = []
@@ -661,22 +2581,21 @@ def plot_residual_stream(results: ProbeResults) -> go.Figure:
         subplot_titles=("Stream Magnitude (L2 Norm)", "Layer Delta (Change)")
     )
 
-    # Norms
     labels = [x[0] for x in results.residual_stream_norms]
     norms = [x[1] for x in results.residual_stream_norms]
 
     fig.add_trace(
-        go.Scatter(x=labels, y=norms, mode='lines+markers', name='Norm'),
+        go.Scatter(x=labels, y=norms, mode='lines+markers', name='Norm',
+                   line=dict(color='#636EFA')),
         row=1, col=1
     )
 
-    # Deltas
     if results.residual_stream_deltas:
         delta_labels = [x[0] for x in results.residual_stream_deltas]
         deltas = [x[1] for x in results.residual_stream_deltas]
 
         fig.add_trace(
-            go.Bar(x=delta_labels, y=deltas, name='Delta'),
+            go.Bar(x=delta_labels, y=deltas, name='Delta', marker_color='#EF553B'),
             row=2, col=1
         )
 
@@ -689,6 +2608,1590 @@ def plot_residual_stream(results: ProbeResults) -> go.Figure:
     return fig
 
 
+def plot_moe_expert_load(results: ProbeResults, layer_idx: Optional[int] = None) -> go.Figure:
+    """Plot MoE expert load distribution."""
+    if not results.moe_expert_load:
+        return go.Figure().add_annotation(text="No MoE data available", showarrow=False)
+
+    if layer_idx is not None and layer_idx in results.moe_expert_load:
+        # Single layer view
+        load = results.moe_expert_load[layer_idx]
+        experts = list(range(len(load)))
+        counts = [load.get(e, 0) for e in experts]
+
+        fig = go.Figure(data=[
+            go.Bar(x=[f"E{e}" for e in experts], y=counts, marker_color='#636EFA')
+        ])
+        fig.update_layout(
+            title=f"Expert Load - Layer {layer_idx}",
+            xaxis_title="Expert",
+            yaxis_title="Token Count",
+            height=400
+        )
+    else:
+        # All layers heatmap
+        layers = sorted(results.moe_expert_load.keys())
+        if not layers:
+            return go.Figure()
+
+        # Safely get num_experts
+        num_experts = results.num_experts
+        if not num_experts and results.moe_expert_load:
+            # Try to infer from the data
+            try:
+                num_experts = max(
+                    max(load.keys()) + 1 for load in results.moe_expert_load.values() if load
+                )
+            except ValueError:
+                num_experts = 0
+        if not num_experts:
+            return go.Figure()
+
+        # Build heatmap data
+        z = []
+        for layer in layers:
+            load = results.moe_expert_load[layer]
+            row = [load.get(e, 0) for e in range(num_experts)]
+            z.append(row)
+
+        fig = go.Figure(data=go.Heatmap(
+            z=z,
+            x=[f"E{e}" for e in range(num_experts)],
+            y=[f"L{l}" for l in layers],
+            colorscale='Blues',
+            colorbar=dict(title="Tokens")
+        ))
+        fig.update_layout(
+            title="Expert Load Across Layers",
+            xaxis_title="Expert",
+            yaxis_title="Layer",
+            height=max(400, len(layers) * 25)
+        )
+
+    return fig
+
+
+def plot_moe_router_probs(results: ProbeResults, layer_idx: int, tokenizer=None) -> go.Figure:
+    """Plot MoE router probabilities for a specific layer."""
+    if layer_idx not in results.moe_router_outputs:
+        return go.Figure().add_annotation(text="No router data for this layer", showarrow=False)
+
+    router_data = results.moe_router_outputs[layer_idx]
+    probs = router_data["probs"]  # Shape: (batch, seq, num_experts)
+    selected = router_data["selected"]  # Shape: (batch, seq, top_k)
+
+    # Take first batch item
+    probs = probs[0]  # (seq, num_experts)
+    selected = selected[0]  # (seq, top_k)
+
+    seq_len, num_experts = probs.shape
+
+    # Token labels - include both input and generated tokens
+    all_tokens = list(results.input_tokens) if results.input_tokens else []
+    if hasattr(results, 'generated_tokens') and results.generated_tokens:
+        all_tokens = all_tokens + list(results.generated_tokens)
+
+    if tokenizer and all_tokens:
+        token_labels = []
+        for i in range(seq_len):
+            if i < len(all_tokens):
+                try:
+                    text = tokenizer.decode([all_tokens[i]])[:10]
+                    token_labels.append(f"{i}: {text}")
+                except:
+                    token_labels.append(f"{i}")
+            else:
+                token_labels.append(f"{i}")
+    else:
+        token_labels = [f"Pos {i}" for i in range(seq_len)]
+
+    fig = go.Figure(data=go.Heatmap(
+        z=probs,
+        x=[f"E{e}" for e in range(num_experts)],
+        y=token_labels,
+        colorscale='Viridis',
+        colorbar=dict(title="Probability")
+    ))
+
+    fig.update_layout(
+        title=f"Router Probabilities - Layer {layer_idx}",
+        xaxis_title="Expert",
+        yaxis_title="Token",
+        height=max(400, seq_len * 20)
+    )
+
+    return fig
+
+
+def plot_moe_expert_selection(results: ProbeResults, layer_idx: int, tokenizer=None) -> go.Figure:
+    """Plot which experts were selected for each token."""
+    if layer_idx not in results.moe_router_outputs:
+        return go.Figure().add_annotation(text="No router data for this layer", showarrow=False)
+
+    router_data = results.moe_router_outputs[layer_idx]
+    selected = router_data["selected"][0]  # (seq, top_k)
+    probs = router_data["probs"][0]  # (seq, num_experts)
+
+    seq_len, top_k = selected.shape
+
+    # Token labels - include both input and generated tokens
+    all_tokens = list(results.input_tokens) if results.input_tokens else []
+    if hasattr(results, 'generated_tokens') and results.generated_tokens:
+        all_tokens = all_tokens + list(results.generated_tokens)
+
+    if tokenizer and all_tokens:
+        token_labels = []
+        for i in range(seq_len):
+            if i < len(all_tokens):
+                try:
+                    text = tokenizer.decode([all_tokens[i]])[:10]
+                    token_labels.append(f"{i}: {text}")
+                except:
+                    token_labels.append(f"{i}")
+            else:
+                token_labels.append(f"{i}")
+    else:
+        token_labels = [f"Pos {i}" for i in range(seq_len)]
+
+    # Create traces for each top-k position
+    fig = go.Figure()
+
+    colors = ['#636EFA', '#EF553B', '#00CC96', '#AB63FA']
+    for k in range(top_k):
+        expert_ids = selected[:, k]
+        # Get the probability for each selected expert
+        expert_probs = [probs[i, expert_ids[i]] for i in range(seq_len)]
+
+        fig.add_trace(go.Scatter(
+            x=list(range(seq_len)),
+            y=expert_ids,
+            mode='markers',
+            marker=dict(
+                size=[p * 30 + 5 for p in expert_probs],  # Size by probability
+                color=colors[k % len(colors)],
+                opacity=0.7
+            ),
+            name=f"Top-{k+1}",
+            text=[f"Token: {token_labels[i]}<br>Expert: E{expert_ids[i]}<br>Prob: {expert_probs[i]:.2%}"
+                  for i in range(seq_len)],
+            hoverinfo='text'
+        ))
+
+    fig.update_layout(
+        title=f"Expert Selection Pattern - Layer {layer_idx}",
+        xaxis_title="Token Position",
+        yaxis_title="Expert ID",
+        yaxis=dict(dtick=1),
+        height=400,
+        showlegend=True
+    )
+
+    return fig
+
+
+def plot_moe_topk_weights(results: ProbeResults, layer_idx: int, tokenizer=None, max_tokens: int = 30) -> go.Figure:
+    """
+    Plot top-k expert weights per token as a stacked horizontal bar chart.
+    Shows exactly which experts were selected and their router probabilities.
+    """
+    if layer_idx not in results.moe_router_outputs:
+        return go.Figure().add_annotation(text="No router data for this layer", showarrow=False)
+
+    router_data = results.moe_router_outputs[layer_idx]
+    selected = router_data["selected"][0]  # (seq, top_k)
+    probs = router_data["probs"][0]  # (seq, num_experts)
+
+    seq_len, top_k = selected.shape
+    num_experts = probs.shape[1]
+
+    # Limit tokens displayed for readability
+    display_len = min(seq_len, max_tokens)
+
+    # Combine input and generated tokens
+    all_tokens = list(results.input_tokens) if results.input_tokens else []
+    if hasattr(results, 'generated_tokens') and results.generated_tokens:
+        all_tokens = all_tokens + list(results.generated_tokens)
+
+    # Token labels
+    token_labels = []
+    for i in range(display_len):
+        if tokenizer and i < len(all_tokens):
+            try:
+                text = tokenizer.decode([all_tokens[i]])
+                # Clean up the text
+                text = text.replace('\n', '\\n').replace('\t', '\\t')[:12]
+                if not text or text.isspace():
+                    text = f"<{all_tokens[i]}>"
+                token_labels.append(f"{i}: {text}")
+            except:
+                token_labels.append(f"Pos {i}")
+        else:
+            token_labels.append(f"Pos {i}")
+
+    # Create stacked bar chart - each selection rank gets a distinct color
+    fig = go.Figure()
+
+    # Distinct colors for selection rank (Top-1 through Top-8)
+    # Using very distinct colors: Gold, Magenta, Cyan, Orange, Lime, Purple, Red, Teal
+    rank_colors = [
+        '#FFD700',  # Top-1: Gold/Yellow
+        '#FF00FF',  # Top-2: Magenta/Pink
+        '#00FFFF',  # Top-3: Cyan
+        '#FF6600',  # Top-4: Orange
+        '#00FF00',  # Top-5: Lime Green
+        '#9900FF',  # Top-6: Purple
+        '#FF3333',  # Top-7: Red
+        '#00CC99',  # Top-8: Teal
+    ]
+
+    # Build data for each selection rank
+    # Note: argsort returns indices in ascending order, so selected[i, -1] is highest prob (Top-1)
+    # We iterate from Top-k to Top-1 so Top-1 appears on top of the stack (rightmost)
+    for rank in range(top_k, 0, -1):  # rank 4, 3, 2, 1
+        x_vals = []
+        y_vals = []
+        hover_texts = []
+
+        # selected array index: rank 1 (Top-1) → index top_k-1, rank 4 (Top-4) → index 0
+        sel_idx = top_k - rank
+
+        for i in range(display_len):
+            expert_id = int(selected[i, sel_idx])
+            expert_prob = float(probs[i, expert_id])
+
+            x_vals.append(expert_prob * 100)  # Convert to percentage
+            y_vals.append(token_labels[i])
+            hover_texts.append(f"Token: {token_labels[i]}<br>Expert E{expert_id}<br>Weight: {expert_prob:.2%}<br>Rank: Top-{rank}")
+
+        # Use rank-based color (rank 1 = index 0 = Gold, rank 4 = index 3 = Orange)
+        rank_color = rank_colors[(rank - 1) % len(rank_colors)]
+
+        fig.add_trace(go.Bar(
+            x=x_vals,
+            y=y_vals,
+            orientation='h',
+            name=f"Top-{rank}",
+            marker_color=rank_color,
+            text=[f"E{int(selected[i, sel_idx])}" for i in range(display_len)],
+            textposition='inside',
+            textfont=dict(size=10, color='black' if rank == 1 else 'white'),
+            hovertext=hover_texts,
+            hoverinfo='text'
+        ))
+
+    fig.update_layout(
+        title=f"Top-{top_k} Expert Selection per Token - Layer {layer_idx}",
+        xaxis_title="Router Weight (%)",
+        yaxis_title="Token",
+        barmode='stack',
+        height=max(400, display_len * 25),
+        showlegend=True,
+        legend_title="Selection Rank",
+        yaxis=dict(autorange="reversed")  # First token at top
+    )
+
+    # Add explanation annotation at bottom
+    fig.add_annotation(
+        text=f"Each bar shows which {top_k} experts the router selected. Bar length = weight assigned. Labels show expert ID (E0-E{num_experts-1}).",
+        xref="paper", yref="paper",
+        x=0.5, y=-0.12,
+        showarrow=False,
+        font=dict(size=11, color="gray"),
+        align="center"
+    )
+
+    # Add annotation if truncated
+    if seq_len > max_tokens:
+        fig.add_annotation(
+            text=f"Showing first {max_tokens} of {seq_len} tokens",
+            xref="paper", yref="paper",
+            x=1, y=1.02,
+            showarrow=False,
+            font=dict(size=10, color="gray")
+        )
+
+    return fig
+
+
+def plot_moe_expert_weights_table(results: ProbeResults, layer_idx: int, tokenizer=None) -> pd.DataFrame:
+    """
+    Create a DataFrame showing the top-k expert selections and weights per token.
+    """
+    if layer_idx not in results.moe_router_outputs:
+        return pd.DataFrame()
+
+    router_data = results.moe_router_outputs[layer_idx]
+    selected = router_data["selected"][0]  # (seq, top_k)
+    probs = router_data["probs"][0]  # (seq, num_experts)
+
+    seq_len, top_k = selected.shape
+
+    # Combine input and generated tokens
+    all_tokens = list(results.input_tokens) if results.input_tokens else []
+    if hasattr(results, 'generated_tokens') and results.generated_tokens:
+        all_tokens = all_tokens + list(results.generated_tokens)
+
+    rows = []
+    for i in range(seq_len):
+        # Get token text
+        if tokenizer and i < len(all_tokens):
+            try:
+                text = tokenizer.decode([all_tokens[i]])
+                text = text.replace('\n', '\\n').replace('\t', '\\t')[:15]
+                if not text or text.isspace():
+                    text = f"<{all_tokens[i]}>"
+            except:
+                text = f"<pos {i}>"
+        else:
+            text = f"<pos {i}>"
+
+        row = {"Position": i, "Token": text}
+
+        # Add each top-k expert and its weight
+        for k in range(top_k):
+            expert_id = int(selected[i, k])
+            expert_prob = float(probs[i, expert_id])
+            row[f"Expert #{k+1}"] = f"E{expert_id} ({expert_prob:.1%})"
+
+        rows.append(row)
+
+    return pd.DataFrame(rows)
+
+
+def detect_prompt_sections(results: ProbeResults, tokenizer) -> Dict[str, Tuple[int, int]]:
+    """
+    Detect the boundaries of system prompt, user prompt, reasoning, and response sections.
+    Returns dict with section names and (start_idx, end_idx) tuples.
+
+    Supports common chat templates:
+    - ChatML: <|im_start|>system, <|im_start|>user, <|im_start|>assistant
+    - Llama: <|begin_of_text|>, <|start_header_id|>, [INST], [/INST]
+    - Generic: system, user, assistant markers
+    - Reasoning: <think>, </think>, <|thinking|>, <|/thinking|>, etc.
+    """
+    # Combine input and generated tokens for full sequence analysis
+    all_tokens = list(results.input_tokens) if results.input_tokens else []
+    input_len = len(all_tokens)
+    if hasattr(results, 'generated_tokens') and results.generated_tokens:
+        all_tokens = all_tokens + list(results.generated_tokens)
+
+    total_tokens = len(all_tokens)
+
+    if not tokenizer or total_tokens == 0:
+        return {"📄 All Tokens": (0, total_tokens)}
+
+    # Decode all tokens to find markers
+    token_texts = []
+    for tok_id in all_tokens:
+        try:
+            text = tokenizer.decode([tok_id])
+            token_texts.append(text)
+        except:
+            token_texts.append("")
+
+    # Scan through tokens to find section boundaries
+    combined_text = ""
+    token_positions = []  # Maps character position to token index
+
+    for i, text in enumerate(token_texts):
+        token_positions.append(len(combined_text))
+        combined_text += text
+
+    combined_lower = combined_text.lower()
+
+    def find_token_at_position(char_pos: int) -> int:
+        """Find which token index corresponds to a character position."""
+        for i, pos in enumerate(token_positions):
+            if pos >= char_pos:
+                return max(0, i - 1)
+        return len(token_positions) - 1
+
+    # Common patterns to look for
+    system_patterns = ['<|im_start|>system', '<|system|>', '<|start_header_id|>system', '[system]', '<|begin_of_text|>']
+    user_patterns = ['<|im_start|>user', '<|user|>', '<|start_header_id|>user', '[inst]', '[user]', '<|eot_id|>']
+    assistant_patterns = ['<|im_start|>assistant', '<|assistant|>', '<|start_header_id|>assistant', '[/inst]']
+
+    # Reasoning patterns (start and end) - expanded list for various models
+    reasoning_start_patterns = [
+        # Standard reasoning tags
+        '<think>', '<|thinking|>', '<|think|>', '<reasoning>', '<|reason|>',
+        '<|startofthought|>', '<thought>', '<|thought|>', '\n<think>',
+        # DeepSeek R1 style
+        '```thinking', '<|begin_of_thought|>',
+        # Other formats
+        '**thinking**', '**thought**', '<internal_thought>',
+        # QwQ style
+        '<|box_start|>reasoning'
+    ]
+    reasoning_end_patterns = [
+        # Standard reasoning tags
+        '</think>', '<|/thinking|>', '<|/think|>', '</reasoning>', '<|/reason|>',
+        '<|endofthought|>', '</thought>', '<|/thought|>',
+        # DeepSeek R1 style
+        '```\n', '<|end_of_thought|>',
+        # Other formats
+        '**end_thinking**', '</internal_thought>',
+        # QwQ style
+        '<|box_end|>'
+    ]
+
+    # Find section positions
+    system_start = None
+    user_start = None
+    assistant_start = None
+    reasoning_start = None
+    reasoning_end = None
+
+    # Find system section
+    for pattern in system_patterns:
+        pos = combined_lower.find(pattern.lower())
+        if pos != -1:
+            system_start = find_token_at_position(pos)
+            break
+
+    # Find user section
+    for pattern in user_patterns:
+        pos = combined_lower.find(pattern.lower())
+        if pos != -1:
+            user_start = find_token_at_position(pos)
+            break
+
+    # Find assistant section
+    for pattern in assistant_patterns:
+        pos = combined_lower.find(pattern.lower())
+        if pos != -1:
+            assistant_start = find_token_at_position(pos)
+            break
+
+    # Find reasoning section (within response)
+    for pattern in reasoning_start_patterns:
+        pos = combined_lower.find(pattern.lower())
+        if pos != -1:
+            reasoning_start = find_token_at_position(pos)
+            break
+
+    for pattern in reasoning_end_patterns:
+        pos = combined_lower.find(pattern.lower())
+        if pos != -1:
+            # Find the end of the closing tag
+            reasoning_end = find_token_at_position(pos + len(pattern))
+            break
+
+    # Build sections based on what we found
+    sections = {}
+    # total_tokens already calculated at top
+
+    # Determine section boundaries
+    if system_start is not None and user_start is not None and assistant_start is not None:
+        # All three main sections found
+        sections["📋 System Prompt"] = (system_start, user_start)
+        sections["👤 User Prompt"] = (user_start, assistant_start)
+
+        # Check for reasoning within response
+        if reasoning_start is not None and reasoning_end is not None and reasoning_start >= assistant_start:
+            if reasoning_start > assistant_start:
+                sections["🤖 Response (Pre-Reasoning)"] = (assistant_start, reasoning_start)
+            sections["🧠 Reasoning"] = (reasoning_start, reasoning_end)
+            if reasoning_end < total_tokens:
+                sections["✅ Final Response"] = (reasoning_end, total_tokens)
+        elif reasoning_start is not None and reasoning_start >= assistant_start:
+            # Reasoning started but didn't end (still thinking)
+            if reasoning_start > assistant_start:
+                sections["🤖 Response (Pre-Reasoning)"] = (assistant_start, reasoning_start)
+            sections["🧠 Reasoning (In Progress)"] = (reasoning_start, total_tokens)
+        else:
+            sections["🤖 Response"] = (assistant_start, total_tokens)
+
+    elif user_start is not None and assistant_start is not None:
+        # No system prompt
+        sections["👤 User Prompt"] = (0, assistant_start)
+
+        # Check for reasoning within response
+        if reasoning_start is not None and reasoning_end is not None and reasoning_start >= assistant_start:
+            if reasoning_start > assistant_start:
+                sections["🤖 Response (Pre-Reasoning)"] = (assistant_start, reasoning_start)
+            sections["🧠 Reasoning"] = (reasoning_start, reasoning_end)
+            if reasoning_end < total_tokens:
+                sections["✅ Final Response"] = (reasoning_end, total_tokens)
+        elif reasoning_start is not None and reasoning_start >= assistant_start:
+            if reasoning_start > assistant_start:
+                sections["🤖 Response (Pre-Reasoning)"] = (assistant_start, reasoning_start)
+            sections["🧠 Reasoning (In Progress)"] = (reasoning_start, total_tokens)
+        else:
+            sections["🤖 Response"] = (assistant_start, total_tokens)
+
+    elif assistant_start is not None:
+        # Just input and response
+        sections["📥 Input"] = (0, assistant_start)
+
+        # Check for reasoning
+        if reasoning_start is not None and reasoning_end is not None and reasoning_start >= assistant_start:
+            if reasoning_start > assistant_start:
+                sections["🤖 Response (Pre-Reasoning)"] = (assistant_start, reasoning_start)
+            sections["🧠 Reasoning"] = (reasoning_start, reasoning_end)
+            if reasoning_end < total_tokens:
+                sections["✅ Final Response"] = (reasoning_end, total_tokens)
+        elif reasoning_start is not None and reasoning_start >= assistant_start:
+            if reasoning_start > assistant_start:
+                sections["🤖 Response (Pre-Reasoning)"] = (assistant_start, reasoning_start)
+            sections["🧠 Reasoning (In Progress)"] = (reasoning_start, total_tokens)
+        else:
+            sections["🤖 Response"] = (assistant_start, total_tokens)
+
+    else:
+        # Can't detect sections by chat template markers
+        # Use input_len (calculated at top) to split input from generated
+        gen_start = input_len  # Where generated tokens begin
+
+        if hasattr(results, 'generated_tokens') and results.generated_tokens and gen_start < total_tokens:
+            # We have generated tokens - create hierarchical sections
+
+            # Try to split Input into System/User by looking for common patterns
+            # Look for "You are" or system-like content at the start
+            system_end = None
+            you_are_pos = combined_lower.find("you are")
+            if you_are_pos != -1 and you_are_pos < len(combined_text) // 3:
+                # Found "you are" in first third - likely system prompt
+                # Find where user content likely starts (after system message)
+                newline_after = combined_lower.find("\n\n", you_are_pos)
+                if newline_after != -1 and newline_after < gen_start:
+                    system_end = find_token_at_position(newline_after)
+
+            if system_end is not None and system_end > 0 and system_end < gen_start:
+                sections["📋 System Prompt"] = (0, system_end)
+                sections["👤 User Prompt"] = (system_end, gen_start)
+            else:
+                # Can't split input - show as single section
+                sections["📥 Input Sequence"] = (0, gen_start)
+
+            # Check for reasoning in generated portion
+            if reasoning_start is not None and reasoning_end is not None and reasoning_start >= gen_start:
+                if reasoning_start > gen_start:
+                    sections["🤖 Response (Pre-Reasoning)"] = (gen_start, reasoning_start)
+                sections["🧠 Reasoning"] = (reasoning_start, reasoning_end)
+                if reasoning_end < total_tokens:
+                    sections["✅ Final Response"] = (reasoning_end, total_tokens)
+            elif reasoning_start is not None and reasoning_start >= gen_start:
+                if reasoning_start > gen_start:
+                    sections["🤖 Response (Pre-Reasoning)"] = (gen_start, reasoning_start)
+                sections["🧠 Reasoning (In Progress)"] = (reasoning_start, total_tokens)
+            else:
+                # No reasoning detected - show as single Response section
+                sections["🤖 Response"] = (gen_start, total_tokens)
+        else:
+            # No generated tokens - check for reasoning markers at all
+            if reasoning_start is not None and reasoning_end is not None:
+                if reasoning_start > 0:
+                    sections["📥 Input"] = (0, reasoning_start)
+                sections["🧠 Reasoning"] = (reasoning_start, reasoning_end)
+                if reasoning_end < total_tokens:
+                    sections["✅ Final Response"] = (reasoning_end, total_tokens)
+            elif reasoning_start is not None:
+                if reasoning_start > 0:
+                    sections["📥 Input"] = (0, reasoning_start)
+                sections["🧠 Reasoning (In Progress)"] = (reasoning_start, total_tokens)
+            else:
+                sections["📄 All Tokens"] = (0, total_tokens)
+
+    # Remove any empty sections
+    sections = {k: v for k, v in sections.items() if v[1] > v[0]}
+
+    return sections
+
+
+def render_moe_topk_by_section(results: ProbeResults, layer_idx: int, tokenizer, section_key: str):
+    """
+    Render the top-k expert weights for a specific section with show more functionality.
+    Uses Streamlit widgets directly.
+    """
+    if layer_idx not in results.moe_router_outputs:
+        st.info("No router data for this layer")
+        return
+
+    sections = detect_prompt_sections(results, tokenizer)
+    if section_key not in sections:
+        st.info(f"Section '{section_key}' not found")
+        return
+
+    start_idx, end_idx = sections[section_key]
+    section_len = end_idx - start_idx
+
+    if section_len == 0:
+        st.info(f"No tokens in {section_key}")
+        return
+
+    router_data = results.moe_router_outputs[layer_idx]
+    selected = router_data["selected"][0]  # (seq, top_k)
+    probs = router_data["probs"][0]  # (seq, num_experts)
+
+    seq_len, top_k = selected.shape
+    num_experts = probs.shape[1]
+
+    # Determine display range
+    max_initial = 30
+    show_all_key = f"show_all_{section_key}_{layer_idx}"
+
+    if show_all_key not in st.session_state:
+        st.session_state[show_all_key] = False
+
+    if section_len > max_initial and not st.session_state[show_all_key]:
+        display_end = start_idx + max_initial
+        show_more = True
+    else:
+        display_end = end_idx
+        show_more = False
+
+    display_range = range(start_idx, min(display_end, seq_len))
+    display_len = len(display_range)
+
+    if display_len == 0:
+        st.info(f"No tokens to display in {section_key}")
+        return
+
+    # Combine input and generated tokens for labels
+    all_tokens = list(results.input_tokens) if results.input_tokens else []
+    if hasattr(results, 'generated_tokens') and results.generated_tokens:
+        all_tokens = all_tokens + list(results.generated_tokens)
+
+    # Token labels
+    token_labels = []
+    for i in display_range:
+        if tokenizer and i < len(all_tokens):
+            try:
+                text = tokenizer.decode([all_tokens[i]])
+                text = text.replace('\n', '\\n').replace('\t', '\\t')[:12]
+                if not text or text.isspace():
+                    text = f"<{all_tokens[i]}>"
+                token_labels.append(f"{i}: {text}")
+            except:
+                token_labels.append(f"Pos {i}")
+        else:
+            token_labels.append(f"Pos {i}")
+
+    # Distinct colors for selection rank (Top-1 through Top-8)
+    rank_colors = [
+        '#FFD700',  # Top-1: Gold/Yellow
+        '#FF00FF',  # Top-2: Magenta/Pink
+        '#00FFFF',  # Top-3: Cyan
+        '#FF6600',  # Top-4: Orange
+        '#00FF00',  # Top-5: Lime Green
+        '#9900FF',  # Top-6: Purple
+        '#FF3333',  # Top-7: Red
+        '#00CC99',  # Top-8: Teal
+    ]
+
+    # Create figure
+    fig = go.Figure()
+
+    # Note: argsort returns indices in ascending order, so selected[i, -1] is highest prob (Top-1)
+    # We iterate from Top-k to Top-1 so Top-1 appears on top of the stack (rightmost)
+    for rank in range(top_k, 0, -1):  # rank 4, 3, 2, 1
+        x_vals = []
+        y_vals = []
+        hover_texts = []
+        text_labels = []
+
+        # selected array index: rank 1 (Top-1) → index top_k-1, rank 4 (Top-4) → index 0
+        sel_idx = top_k - rank
+
+        for idx, i in enumerate(display_range):
+            if i < seq_len:
+                expert_id = int(selected[i, sel_idx])
+                expert_prob = float(probs[i, expert_id])
+
+                x_vals.append(expert_prob * 100)
+                y_vals.append(token_labels[idx])
+                hover_texts.append(f"Token: {token_labels[idx]}<br>Expert E{expert_id}<br>Weight: {expert_prob:.2%}<br>Rank: Top-{rank}")
+                text_labels.append(f"E{expert_id}")
+
+        if x_vals:
+            rank_color = rank_colors[(rank - 1) % len(rank_colors)]
+            fig.add_trace(go.Bar(
+                x=x_vals,
+                y=y_vals,
+                orientation='h',
+                name=f"Top-{rank}",
+                marker_color=rank_color,
+                text=text_labels,
+                textposition='inside',
+                textfont=dict(size=10, color='black' if rank == 1 else 'white'),
+                hovertext=hover_texts,
+                hoverinfo='text'
+            ))
+
+    fig.update_layout(
+        xaxis_title="Router Weight (%)",
+        yaxis_title="Token",
+        barmode='stack',
+        height=max(300, display_len * 22),
+        showlegend=True,
+        legend_title="Selection Rank",
+        yaxis=dict(autorange="reversed"),
+        margin=dict(l=10, r=10, t=10, b=50)
+    )
+
+    # Add brief explanation
+    fig.add_annotation(
+        text="Longer bars = higher router confidence. Labels show expert ID.",
+        xref="paper", yref="paper",
+        x=0.5, y=-0.15,
+        showarrow=False,
+        font=dict(size=10, color="gray"),
+        align="center"
+    )
+
+    st.plotly_chart(fig, use_container_width=True)
+
+    # Show more button
+    if show_more:
+        remaining = section_len - max_initial
+        if st.button(f"📋 Show {remaining} more tokens...", key=f"more_{section_key}_{layer_idx}"):
+            st.session_state[show_all_key] = True
+            st.rerun()
+    elif section_len > max_initial:
+        if st.button(f"📋 Show less", key=f"less_{section_key}_{layer_idx}"):
+            st.session_state[show_all_key] = False
+            st.rerun()
+
+
+def render_moe_topk_sections(results: ProbeResults, layer_idx: int, tokenizer):
+    """
+    Render the top-k expert weights in hierarchical groups:
+    - Input Sequence: System Prompt, User Prompt
+    - Response: Reasoning Loop, Final Response
+    """
+    sections = detect_prompt_sections(results, tokenizer)
+
+    # Group sections into Input and Response categories
+    input_sections = {}
+    response_sections = {}
+
+    for name, bounds in sections.items():
+        if any(k in name for k in ["System", "User", "Input"]):
+            input_sections[name] = bounds
+        elif any(k in name for k in ["Response", "Reasoning", "Final", "🤖", "🧠", "✅"]):
+            response_sections[name] = bounds
+        else:
+            # Fallback - put in response if after input
+            input_len = len(results.input_tokens) if results.input_tokens else 0
+            if bounds[0] >= input_len:
+                response_sections[name] = bounds
+            else:
+                input_sections[name] = bounds
+
+    # Calculate totals
+    input_total = sum(e - s for s, e in [b for b in input_sections.values()]) if input_sections else 0
+    response_total = sum(e - s for s, e in [b for b in response_sections.values()]) if response_sections else 0
+
+    # Display summary
+    has_system = any("System" in s for s in input_sections.keys())
+    has_user = any("User" in s for s in input_sections.keys())
+    has_reasoning = any("Reasoning" in s for s in response_sections.keys())
+    has_final = any("Final" in s for s in response_sections.keys())
+
+    input_desc = []
+    if has_system:
+        input_desc.append("System")
+    if has_user:
+        input_desc.append("User")
+    if not input_desc and input_sections:
+        input_desc.append("Input")
+
+    response_desc = []
+    if has_reasoning:
+        response_desc.append("Reasoning")
+    if has_final:
+        response_desc.append("Final")
+    if not response_desc and response_sections:
+        response_desc.append("Response")
+
+    all_desc = input_desc + response_desc
+    st.caption(f"Tokens grouped by: {', '.join(all_desc) if all_desc else 'sequence position'}.")
+
+    # Render Input Sequence group
+    if input_sections:
+        with st.expander(f"📥 **Input Sequence** ({input_total} tokens)", expanded=False):
+            if len(input_sections) > 1:
+                # Multiple sub-sections - show each
+                for sub_name, (start, end) in input_sections.items():
+                    token_count = end - start
+                    st.markdown(f"**{sub_name}** ({token_count} tokens)")
+                    render_moe_topk_by_section(results, layer_idx, tokenizer, sub_name)
+                    st.markdown("---")
+            else:
+                # Single section - render directly
+                for sub_name in input_sections.keys():
+                    render_moe_topk_by_section(results, layer_idx, tokenizer, sub_name)
+
+    # Render Response group
+    if response_sections:
+        with st.expander(f"🤖 **Response** ({response_total} tokens)", expanded=True):
+            if len(response_sections) > 1:
+                # Multiple sub-sections - show each with headers
+                for sub_name, (start, end) in response_sections.items():
+                    token_count = end - start
+                    # Use appropriate emoji based on sub-section type
+                    if "Reasoning" in sub_name:
+                        st.markdown(f"🧠 **Reasoning Loop** ({token_count} tokens)")
+                    elif "Final" in sub_name:
+                        st.markdown(f"✅ **Final Response** ({token_count} tokens)")
+                    else:
+                        st.markdown(f"**{sub_name}** ({token_count} tokens)")
+                    render_moe_topk_by_section(results, layer_idx, tokenizer, sub_name)
+                    st.markdown("---")
+            else:
+                # Single section - render directly
+                for sub_name in response_sections.keys():
+                    render_moe_topk_by_section(results, layer_idx, tokenizer, sub_name)
+
+
+@cache_with_hash
+def compute_moe_influence_stats(results: ProbeResults) -> Dict[str, Any]:
+    """
+    Compute comprehensive MoE expert influence statistics using AI domain metrics.
+    Results are cached based on probe results hash.
+
+    Returns dict with:
+    - expert_activation_frequency: How often each expert is selected (normalized)
+    - expert_influence_ranking: Experts ranked by total activation count
+    - router_entropy: Shannon entropy of routing distribution (diversity measure)
+    - load_balance_score: 1 - normalized std dev (higher = more balanced)
+    - gini_coefficient: Inequality measure (0 = perfect equality, 1 = max inequality)
+    - auxiliary_loss_proxy: Approximation of load balancing auxiliary loss
+    - dead_experts: Experts with zero activations
+    - dominant_experts: Experts handling >2x average load
+    - expert_specialization: Per-expert metrics
+    """
+    stats = {
+        "expert_activation_frequency": {},
+        "expert_influence_ranking": [],
+        "router_entropy": 0.0,
+        "load_balance_score": 0.0,
+        "gini_coefficient": 0.0,
+        "auxiliary_loss_proxy": 0.0,
+        "dead_experts": [],
+        "dominant_experts": [],
+        "underutilized_experts": [],
+        "expert_specialization": {},
+        "total_routing_decisions": 0,
+        "effective_expert_count": 0.0,
+    }
+
+    if not results.moe_expert_load:
+        return stats
+
+    num_experts = results.num_experts or 0
+    if num_experts == 0:
+        return stats
+
+    # Aggregate expert load across all layers
+    global_expert_counts = {e: 0 for e in range(num_experts)}
+    layer_expert_counts = {}  # For per-layer analysis
+
+    for layer_idx, load in results.moe_expert_load.items():
+        layer_expert_counts[layer_idx] = load
+        for expert_id, count in load.items():
+            if expert_id in global_expert_counts:
+                global_expert_counts[expert_id] += count
+
+    total_activations = sum(global_expert_counts.values())
+    stats["total_routing_decisions"] = total_activations
+
+    if total_activations == 0:
+        return stats
+
+    # Expert Activation Frequency (normalized)
+    activation_freq = {e: c / total_activations for e, c in global_expert_counts.items()}
+    stats["expert_activation_frequency"] = activation_freq
+
+    # Expert Influence Ranking (sorted by activation count, descending)
+    ranking = sorted(global_expert_counts.items(), key=lambda x: x[1], reverse=True)
+    stats["expert_influence_ranking"] = [
+        {
+            "rank": i + 1,
+            "expert_id": expert_id,
+            "activations": count,
+            "frequency": count / total_activations,
+            "percentile": (num_experts - i) / num_experts * 100
+        }
+        for i, (expert_id, count) in enumerate(ranking)
+    ]
+
+    # Router Entropy (Shannon entropy - measures routing diversity)
+    # Higher entropy = more uniform distribution = better load balance
+    probs = np.array(list(activation_freq.values()))
+    probs = probs[probs > 0]  # Avoid log(0)
+    if len(probs) > 0:
+        entropy = -np.sum(probs * np.log2(probs))
+        max_entropy = np.log2(num_experts)  # Maximum possible entropy
+        stats["router_entropy"] = float(entropy)
+        stats["normalized_entropy"] = float(entropy / max_entropy) if max_entropy > 0 else 0.0
+
+    # Effective Expert Count (exponential of entropy)
+    # Represents the "equivalent number of equally-used experts"
+    if stats["router_entropy"] > 0:
+        stats["effective_expert_count"] = float(2 ** stats["router_entropy"])
+
+    # Load Balance Score (1 - coefficient of variation)
+    counts = np.array(list(global_expert_counts.values()))
+    mean_load = np.mean(counts)
+    std_load = np.std(counts)
+    if mean_load > 0:
+        cv = std_load / mean_load
+        stats["load_balance_score"] = float(max(0, 1 - cv))
+        stats["coefficient_of_variation"] = float(cv)
+
+    # Gini Coefficient (measure of inequality)
+    sorted_counts = np.sort(counts)
+    n = len(sorted_counts)
+    cumulative = np.cumsum(sorted_counts)
+    gini = (2 * np.sum((np.arange(1, n + 1) * sorted_counts))) / (n * np.sum(sorted_counts)) - (n + 1) / n
+    stats["gini_coefficient"] = float(max(0, gini))
+
+    # Auxiliary Loss Proxy (approximates load balancing loss used in training)
+    # Based on Switch Transformer's auxiliary loss: sum(f_i * P_i)
+    # Where f_i is fraction of tokens to expert i, P_i is avg router prob for expert i
+    if results.moe_router_outputs:
+        total_router_prob = {e: 0.0 for e in range(num_experts)}
+        prob_count = 0
+        for layer_data in results.moe_router_outputs.values():
+            probs_arr = layer_data.get("probs", None)
+            if probs_arr is not None:
+                # Average router probability across all tokens
+                avg_probs = np.mean(probs_arr, axis=(0, 1))
+                for e in range(min(len(avg_probs), num_experts)):
+                    total_router_prob[e] += avg_probs[e]
+                prob_count += 1
+
+        if prob_count > 0:
+            avg_router_probs = {e: p / prob_count for e, p in total_router_prob.items()}
+            # Auxiliary loss = num_experts * sum(f_i * P_i)
+            aux_loss = num_experts * sum(
+                activation_freq.get(e, 0) * avg_router_probs.get(e, 0)
+                for e in range(num_experts)
+            )
+            stats["auxiliary_loss_proxy"] = float(aux_loss)
+
+    # Identify problematic experts
+    avg_activations = total_activations / num_experts
+
+    # Dead experts (0 activations)
+    stats["dead_experts"] = [e for e, c in global_expert_counts.items() if c == 0]
+
+    # Dominant experts (>2x average load) - potential capacity bottleneck
+    stats["dominant_experts"] = [
+        {"expert_id": e, "activations": c, "ratio": c / avg_activations}
+        for e, c in global_expert_counts.items()
+        if c > 2 * avg_activations
+    ]
+
+    # Underutilized experts (<0.25x average load, but not dead)
+    stats["underutilized_experts"] = [
+        {"expert_id": e, "activations": c, "ratio": c / avg_activations}
+        for e, c in global_expert_counts.items()
+        if 0 < c < 0.25 * avg_activations
+    ]
+
+    # Per-expert specialization metrics
+    for expert_id in range(num_experts):
+        layer_presence = []
+        for layer_idx, load in layer_expert_counts.items():
+            layer_total = sum(load.values())
+            if layer_total > 0:
+                expert_share = load.get(expert_id, 0) / layer_total
+                layer_presence.append(expert_share)
+
+        if layer_presence:
+            stats["expert_specialization"][expert_id] = {
+                "mean_layer_share": float(np.mean(layer_presence)),
+                "std_layer_share": float(np.std(layer_presence)),
+                "consistency": float(1 - np.std(layer_presence)) if np.std(layer_presence) < 1 else 0.0,
+                "layer_variance": float(np.var(layer_presence)),
+            }
+
+    return stats
+
+
+def format_moe_influence_report(stats: Dict[str, Any], num_experts: int) -> str:
+    """Format MoE influence stats as a readable markdown report."""
+    lines = []
+
+    if stats["total_routing_decisions"] == 0:
+        return "No routing data available for analysis."
+
+    # Header metrics
+    lines.append("### Global Expert Influence Metrics\n")
+
+    # Key metrics table
+    lines.append("| Metric | Value | Interpretation |")
+    lines.append("|--------|-------|----------------|")
+
+    # Router Entropy
+    entropy = stats.get("router_entropy", 0)
+    norm_entropy = stats.get("normalized_entropy", 0)
+    entropy_interp = "Excellent diversity" if norm_entropy > 0.9 else "Good diversity" if norm_entropy > 0.7 else "Moderate concentration" if norm_entropy > 0.5 else "High concentration"
+    lines.append(f"| **Router Entropy** | {entropy:.3f} ({norm_entropy*100:.1f}% of max) | {entropy_interp} |")
+
+    # Effective Expert Count
+    eff_count = stats.get("effective_expert_count", 0)
+    eff_pct = (eff_count / num_experts * 100) if num_experts > 0 else 0
+    lines.append(f"| **Effective Expert Count** | {eff_count:.1f} / {num_experts} ({eff_pct:.1f}%) | Equivalent uniform experts |")
+
+    # Load Balance Score
+    lb_score = stats.get("load_balance_score", 0)
+    lb_interp = "Well balanced" if lb_score > 0.8 else "Moderately balanced" if lb_score > 0.5 else "Imbalanced"
+    lines.append(f"| **Load Balance Score** | {lb_score:.3f} | {lb_interp} |")
+
+    # Gini Coefficient
+    gini = stats.get("gini_coefficient", 0)
+    gini_interp = "Very equal" if gini < 0.2 else "Moderately equal" if gini < 0.4 else "Unequal" if gini < 0.6 else "Highly unequal"
+    lines.append(f"| **Gini Coefficient** | {gini:.3f} | {gini_interp} |")
+
+    # Auxiliary Loss Proxy
+    aux_loss = stats.get("auxiliary_loss_proxy", 0)
+    # Ideal aux loss is ~1.0 (uniform), higher means imbalance
+    aux_interp = "Optimal range" if aux_loss < 1.5 else "Acceptable" if aux_loss < 2.0 else "High - consider rebalancing"
+    lines.append(f"| **Aux Loss Proxy** | {aux_loss:.3f} | {aux_interp} |")
+
+    lines.append("")
+
+    # Expert Influence Ranking
+    lines.append("### Expert Influence Ranking\n")
+    lines.append("*Ranked by total activation count across all MoE layers*\n")
+
+    ranking = stats.get("expert_influence_ranking", [])
+    if ranking:
+        # Show top 10 and bottom 5
+        lines.append("**Top Influential Experts:**")
+        lines.append("| Rank | Expert | Activations | Share | Status |")
+        lines.append("|------|--------|-------------|-------|--------|")
+
+        avg_share = 1.0 / num_experts if num_experts > 0 else 0
+
+        for item in ranking[:min(10, len(ranking))]:
+            status = ""
+            if item["frequency"] > 2 * avg_share:
+                status = "🔥 Dominant"
+            elif item["frequency"] > 1.5 * avg_share:
+                status = "⬆️ High"
+            elif item["frequency"] < 0.25 * avg_share:
+                status = "⬇️ Underutilized"
+            elif item["frequency"] < 0.5 * avg_share:
+                status = "📉 Low"
+            else:
+                status = "✓ Normal"
+
+            lines.append(f"| #{item['rank']} | Expert {item['expert_id']} | {item['activations']:,} | {item['frequency']*100:.2f}% | {status} |")
+
+        # Show bottom experts if there are many
+        if len(ranking) > 15:
+            lines.append("")
+            lines.append("**Least Active Experts:**")
+            lines.append("| Rank | Expert | Activations | Share | Status |")
+            lines.append("|------|--------|-------------|-------|--------|")
+            for item in ranking[-5:]:
+                status = "💀 Dead" if item["activations"] == 0 else "⬇️ Underutilized" if item["frequency"] < 0.25 * avg_share else "📉 Low"
+                lines.append(f"| #{item['rank']} | Expert {item['expert_id']} | {item['activations']:,} | {item['frequency']*100:.2f}% | {status} |")
+
+    lines.append("")
+
+    # Warnings and insights
+    dead = stats.get("dead_experts", [])
+    dominant = stats.get("dominant_experts", [])
+    underutil = stats.get("underutilized_experts", [])
+
+    if dead or dominant or underutil:
+        lines.append("### Routing Health Diagnostics\n")
+
+        if dead:
+            lines.append(f"⚠️ **Dead Experts ({len(dead)})**: Experts {dead[:10]}{'...' if len(dead) > 10 else ''} received no tokens.")
+            lines.append("   - *Possible causes*: Router collapse, poor initialization, or training instability")
+            lines.append("   - *Impact*: Reduced model capacity, wasted parameters")
+            lines.append("")
+
+        if dominant:
+            dom_ids = [d["expert_id"] for d in dominant[:5]]
+            lines.append(f"🔥 **Dominant Experts ({len(dominant)})**: Experts {dom_ids} handling >2x average load.")
+            lines.append("   - *Possible causes*: Expert specialization or router bias")
+            lines.append("   - *Impact*: Potential capacity bottleneck, reduced diversity")
+            lines.append("")
+
+        if underutil:
+            under_ids = [u["expert_id"] for u in underutil[:5]]
+            lines.append(f"📉 **Underutilized Experts ({len(underutil)})**: Experts {under_ids} handling <25% of average load.")
+            lines.append("   - *Possible causes*: Weak expert representations or router preference bias")
+            lines.append("   - *Impact*: Inefficient parameter usage")
+            lines.append("")
+
+    return "\n".join(lines)
+
+
+@cache_with_hash
+def get_expert_token_specialization(results: ProbeResults, tokenizer, top_n: int = 10) -> Dict[int, Dict]:
+    """
+    Analyze which tokens each expert specializes in processing.
+    Results are cached based on probe results hash.
+
+    Returns: {expert_id: {
+        "tokens": [(token_text, token_id, count, avg_prob), ...],  # Most common tokens
+        "total_activations": int,
+        "unique_tokens": int,
+        "specialization_score": float  # How focused vs diverse the expert is
+    }}
+    """
+    expert_analysis = {}
+
+    if not results.moe_expert_tokens:
+        return expert_analysis
+
+    for expert_id, token_data in results.moe_expert_tokens.items():
+        if not token_data:
+            expert_analysis[expert_id] = {
+                "tokens": [],
+                "total_activations": 0,
+                "unique_tokens": 0,
+                "specialization_score": 0.0
+            }
+            continue
+
+        # Count token occurrences and average probabilities
+        token_counts = {}  # token_id -> [count, sum_prob]
+        for token_id, pos, layer_idx, prob in token_data:
+            if token_id not in token_counts:
+                token_counts[token_id] = [0, 0.0]
+            token_counts[token_id][0] += 1
+            token_counts[token_id][1] += prob
+
+        # Sort by count (most frequent first)
+        sorted_tokens = sorted(token_counts.items(), key=lambda x: x[1][0], reverse=True)
+
+        # Decode tokens and build result
+        token_list = []
+        for token_id, (count, sum_prob) in sorted_tokens[:top_n]:
+            try:
+                if tokenizer and token_id >= 0:
+                    token_text = tokenizer.decode([token_id])
+                    # Clean up for display
+                    token_text = repr(token_text)[1:-1]  # Show escape sequences
+                    if len(token_text) > 20:
+                        token_text = token_text[:17] + "..."
+                else:
+                    token_text = f"<id:{token_id}>"
+            except:
+                token_text = f"<id:{token_id}>"
+
+            avg_prob = sum_prob / count if count > 0 else 0
+            token_list.append((token_text, token_id, count, avg_prob))
+
+        total_activations = len(token_data)
+        unique_tokens = len(token_counts)
+
+        # Specialization score: how concentrated the expert's focus is
+        # High score = expert focuses on few token types; Low = diverse
+        if total_activations > 0 and unique_tokens > 0:
+            # Use normalized entropy (inverse) as specialization score
+            counts = np.array([c[0] for c in token_counts.values()])
+            probs = counts / counts.sum()
+            entropy = -np.sum(probs * np.log2(probs + 1e-10))
+            max_entropy = np.log2(unique_tokens) if unique_tokens > 1 else 1
+            specialization = 1 - (entropy / max_entropy) if max_entropy > 0 else 0
+        else:
+            specialization = 0.0
+
+        expert_analysis[expert_id] = {
+            "tokens": token_list,
+            "total_activations": total_activations,
+            "unique_tokens": unique_tokens,
+            "specialization_score": float(specialization)
+        }
+
+    return expert_analysis
+
+
+# =============================================================================
+# PDF Report Generation
+# =============================================================================
+
+def sanitize_text(text: str) -> str:
+    """Sanitize text for PDF output."""
+    replacements = {
+        '\u2014': '--', '\u2013': '-', '\u2018': "'", '\u2019': "'",
+        '\u201c': '"', '\u201d': '"', '\u2026': '...', '\u2022': '*',
+        '\u2192': '->', '\u2190': '<-', '\u2248': '~=', '\u2260': '!=',
+        '\u2264': '<=', '\u2265': '>=', '\u00d7': 'x', '\u00f7': '/',
+    }
+    for unicode_char, ascii_equiv in replacements.items():
+        text = text.replace(unicode_char, ascii_equiv)
+    text = text.encode('ascii', 'replace').decode('ascii')
+    return text
+
+
+def generate_pdf_report(
+    results: ProbeResults,
+    model_path: str,
+    probe_config: ProbeConfig,
+    interpretations: Optional[Dict[str, str]] = None
+) -> bytes:
+    """Generate a PDF report of the probe analysis."""
+    if not PDF_AVAILABLE:
+        raise ImportError("fpdf2 not installed. Run: pip install fpdf2")
+
+    class ProbeReportPDF(FPDF):
+        def header(self):
+            self.set_font('Helvetica', 'B', 10)
+            self.set_text_color(100, 100, 100)
+            self.cell(0, 10, 'MLXLMProbe Analysis Report', align='C')
+            self.ln(15)
+
+        def footer(self):
+            self.set_y(-15)
+            self.set_font('Helvetica', 'I', 8)
+            self.set_text_color(128, 128, 128)
+            self.cell(0, 10, f'Page {self.page_no()}', align='C')
+
+        def section_title(self, title: str):
+            self.set_font('Helvetica', 'B', 14)
+            self.set_text_color(31, 73, 125)
+            self.cell(0, 10, sanitize_text(title), ln=True)
+            self.ln(2)
+
+        def subsection_title(self, title: str):
+            self.set_font('Helvetica', 'B', 11)
+            self.set_text_color(60, 60, 60)
+            self.cell(0, 8, sanitize_text(title), ln=True)
+
+        def body_text(self, text: str):
+            self.set_font('Helvetica', '', 10)
+            self.set_text_color(0, 0, 0)
+            self.multi_cell(0, 5, sanitize_text(text))
+            self.ln(2)
+
+        def stat_line(self, label: str, value: str):
+            self.set_font('Helvetica', 'B', 10)
+            self.cell(60, 6, f"{sanitize_text(label)}:", ln=False)
+            self.set_font('Helvetica', '', 10)
+            self.cell(0, 6, sanitize_text(value), ln=True)
+
+    pdf = ProbeReportPDF()
+    pdf.set_auto_page_break(auto=True, margin=15)
+
+    # Title page
+    pdf.add_page()
+    pdf.set_font('Helvetica', 'B', 24)
+    pdf.set_text_color(31, 73, 125)
+    pdf.cell(0, 40, '', ln=True)
+    pdf.cell(0, 15, 'MLXLMProbe Report', align='C', ln=True)
+    pdf.set_font('Helvetica', '', 12)
+    pdf.set_text_color(100, 100, 100)
+    pdf.cell(0, 10, f'Generated: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}', align='C', ln=True)
+    pdf.cell(0, 8, sanitize_text(f'Model: {model_path}'), align='C', ln=True)
+    pdf.ln(20)
+
+    # Summary box
+    pdf.set_fill_color(240, 248, 255)
+    pdf.set_draw_color(31, 73, 125)
+    pdf.rect(20, pdf.get_y(), 170, 40, style='DF')
+    pdf.set_xy(25, pdf.get_y() + 5)
+    pdf.set_font('Helvetica', 'B', 11)
+    pdf.cell(0, 8, 'Summary', ln=True)
+    pdf.set_x(25)
+    pdf.set_font('Helvetica', '', 10)
+    summary = f"Input: {len(results.input_tokens)} tokens | Output: {len(results.generated_tokens)} tokens | Layers: {results.num_layers}"
+    if results.top_k_tokens:
+        top = results.top_k_tokens[0]
+        top_text = top[2] if top[2] and not top[2].isspace() else f"<{top[0]}>"
+        summary += f" | Top: '{top_text[:15]}' ({top[1]:.1%})"
+    pdf.multi_cell(160, 5, sanitize_text(summary))
+
+    # Input/Output
+    pdf.add_page()
+    pdf.section_title('1. Input & Output')
+    pdf.subsection_title('Input Text')
+    pdf.body_text(results.input_text[:500] + ('...' if len(results.input_text) > 500 else ''))
+    pdf.stat_line("Input Tokens", str(len(results.input_tokens)))
+
+    pdf.ln(5)
+    pdf.subsection_title('Generated Output')
+    if results.reasoning_text:
+        pdf.body_text("Reasoning/Analysis:")
+        pdf.body_text(results.reasoning_text[:500] + ('...' if len(results.reasoning_text) > 500 else ''))
+        pdf.ln(3)
+        pdf.body_text("Response:")
+        pdf.body_text(results.answer_text if results.answer_text else "(No response)")
+    else:
+        pdf.body_text(results.generated_text if results.generated_text else "(No output generated)")
+    pdf.stat_line("Output Tokens", str(len(results.generated_tokens)))
+
+    # Token Predictions
+    pdf.section_title('2. Token Predictions')
+    if results.top_k_tokens:
+        for i, (tok_id, prob, text) in enumerate(results.top_k_tokens[:10]):
+            display_text = text if text and not text.isspace() else f"<{tok_id}>"
+            pdf.stat_line(f"#{i+1}", f"'{display_text[:30]}' - {prob:.2%}")
+
+    if interpretations and 'token_prob' in interpretations:
+        pdf.ln(5)
+        pdf.subsection_title('AI Interpretation')
+        pdf.body_text(interpretations['token_prob'])
+
+    # Layer Analysis
+    pdf.add_page()
+    pdf.section_title('3. Layer Analysis')
+    if results.layer_outputs:
+        pdf.subsection_title('Activation Norms')
+        stats = []
+        for idx in sorted(results.layer_outputs.keys())[:15]:
+            arr = results.layer_outputs[idx]
+            norm = float(np.linalg.norm(arr, axis=-1).mean())
+            stats.append(f"L{idx}: {norm:.2f}")
+        pdf.body_text("Norms: " + ", ".join(stats))
+
+    if interpretations and 'layers' in interpretations:
+        pdf.ln(5)
+        pdf.subsection_title('AI Interpretation')
+        pdf.body_text(interpretations['layers'])
+
+    # FFN Analysis
+    pdf.section_title('4. FFN Analysis')
+    if results.ffn_activations:
+        stats = []
+        for idx in sorted(results.ffn_activations.keys())[:10]:
+            arr = results.ffn_activations[idx]
+            sparsity = float((np.abs(arr) < 0.1).mean())
+            stats.append(f"L{idx}: {sparsity:.1%}")
+        pdf.body_text("Sparsity: " + ", ".join(stats))
+
+    if interpretations and 'ffn' in interpretations:
+        pdf.ln(5)
+        pdf.subsection_title('AI Interpretation')
+        pdf.body_text(interpretations['ffn'])
+
+    # Embeddings
+    pdf.add_page()
+    pdf.section_title('5. Embeddings')
+    if results.embeddings is not None:
+        emb = results.embeddings[0] if len(results.embeddings.shape) == 3 else results.embeddings
+        pdf.stat_line("Shape", str(emb.shape))
+        pdf.stat_line("Mean", f"{emb.mean():.4f}")
+        pdf.stat_line("Std", f"{emb.std():.4f}")
+
+    # Configuration
+    pdf.add_page()
+    pdf.section_title('6. Configuration')
+    pdf.stat_line("Model", model_path)
+    pdf.stat_line("Layers Probed", str(len(results.layer_outputs)))
+    pdf.stat_line("Capture Embeddings", str(probe_config.capture_embeddings))
+    pdf.stat_line("Capture Residual Stream", str(probe_config.capture_residual_stream))
+
+    return bytes(pdf.output())
+
+
+# =============================================================================
+# HTML Report Generation
+# =============================================================================
+
+def generate_html_report(
+    results: ProbeResults,
+    model_path: str,
+    probe_config: ProbeConfig,
+    tokenizer=None,
+    interpretations: Optional[Dict[str, str]] = None
+) -> str:
+    """Generate a standalone HTML report with interactive charts."""
+
+    # Generate chart JSONs
+    charts = {}
+
+    if results.layer_outputs:
+        charts['layers'] = plot_layer_norms(results).to_json()
+
+    if results.ffn_activations:
+        charts['ffn'] = plot_ffn_analysis(results).to_json()
+
+    if results.logits is not None:
+        charts['logits'] = plot_logits_distribution(results, tokenizer).to_json()
+
+    if results.top_k_tokens:
+        charts['token_probs'] = plot_token_probabilities(results).to_json()
+
+    if results.embeddings is not None and tokenizer:
+        charts['embeddings'] = plot_embeddings_pca(results, tokenizer).to_json()
+
+    if len(results.layer_outputs) >= 2:
+        charts['similarity'] = plot_layer_similarity(results).to_json()
+
+    if results.residual_stream_norms:
+        charts['residual'] = plot_residual_stream(results).to_json()
+
+    # Prepare display values (handle empty tokens)
+    if results.top_k_tokens:
+        top_pred_text = results.top_k_tokens[0][2]
+        if not top_pred_text or top_pred_text.isspace():
+            top_pred_text = f"<{results.top_k_tokens[0][0]}>"
+        top_pred_text = top_pred_text[:15]
+    else:
+        top_pred_text = "N/A"
+
+    # Build HTML
+    html = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>MLXLMProbe Report</title>
+    <script src="https://cdn.plot.ly/plotly-latest.min.js"></script>
+    <style>
+        * {{ margin: 0; padding: 0; box-sizing: border-box; }}
+        body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #0e1117; color: #fafafa; }}
+        .header {{ background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); padding: 40px 20px; text-align: center; }}
+        .header h1 {{ font-size: 2.5em; margin-bottom: 10px; }}
+        .header p {{ opacity: 0.9; }}
+        .container {{ max-width: 1200px; margin: 0 auto; padding: 20px; }}
+        .tabs {{ display: flex; flex-wrap: wrap; gap: 5px; margin: 20px 0; border-bottom: 2px solid #333; padding-bottom: 10px; }}
+        .tab-btn {{ background: #1e1e1e; border: none; color: #fafafa; padding: 10px 20px; cursor: pointer; border-radius: 5px 5px 0 0; }}
+        .tab-btn:hover {{ background: #333; }}
+        .tab-btn.active {{ background: #667eea; }}
+        .tab-content {{ display: none; padding: 20px 0; }}
+        .tab-content.active {{ display: block; }}
+        .card {{ background: #1e1e1e; border-radius: 10px; padding: 20px; margin: 20px 0; }}
+        .card h3 {{ color: #667eea; margin-bottom: 15px; }}
+        .stat {{ display: inline-block; background: #2d2d2d; padding: 10px 20px; border-radius: 5px; margin: 5px; }}
+        .stat-label {{ font-size: 0.8em; color: #888; }}
+        .stat-value {{ font-size: 1.2em; font-weight: bold; }}
+        .interpretation {{ background: #1a1a2e; border-left: 4px solid #667eea; padding: 15px; margin: 15px 0; border-radius: 0 5px 5px 0; }}
+        table {{ width: 100%; border-collapse: collapse; margin: 10px 0; }}
+        th, td {{ padding: 10px; text-align: left; border-bottom: 1px solid #333; }}
+        th {{ background: #2d2d2d; }}
+        .chart {{ width: 100%; min-height: 400px; }}
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>MLXLMProbe Report</h1>
+        <p>Model: {model_path} | Generated: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}</p>
+    </div>
+
+    <div class="container">
+        <div class="tabs">
+            <button class="tab-btn active" onclick="openTab(event, 'overview')">Overview</button>
+            <button class="tab-btn" onclick="openTab(event, 'tokens')">Tokens</button>
+            <button class="tab-btn" onclick="openTab(event, 'layers')">Layers</button>
+            <button class="tab-btn" onclick="openTab(event, 'ffn')">FFN</button>
+            <button class="tab-btn" onclick="openTab(event, 'logits')">Logits</button>
+            <button class="tab-btn" onclick="openTab(event, 'embeddings')">Embeddings</button>
+            <button class="tab-btn" onclick="openTab(event, 'similarity')">Similarity</button>
+            <button class="tab-btn" onclick="openTab(event, 'residual')">Residual</button>
+        </div>
+
+        <div id="overview" class="tab-content active">
+            <div class="card">
+                <h3>Summary</h3>
+                <div class="stat"><span class="stat-label">Input Tokens</span><br><span class="stat-value">{len(results.input_tokens)}</span></div>
+                <div class="stat"><span class="stat-label">Output Tokens</span><br><span class="stat-value">{len(results.generated_tokens)}</span></div>
+                <div class="stat"><span class="stat-label">Layers</span><br><span class="stat-value">{results.num_layers}</span></div>
+                <div class="stat"><span class="stat-label">Top Prediction</span><br><span class="stat-value">{top_pred_text}</span></div>
+            </div>
+            <div class="card">
+                <h3>Input</h3>
+                <p style="background: #2d2d2d; padding: 15px; border-radius: 5px; white-space: pre-wrap;">{results.input_text[:1000]}</p>
+            </div>
+            <div class="card">
+                <h3>Generated Output</h3>
+                {f'''<details style="margin-bottom: 15px;">
+                    <summary style="cursor: pointer; color: #667eea; font-weight: bold;">🧠 Reasoning / Analysis (click to expand)</summary>
+                    <p style="background: #1a1a2e; padding: 15px; border-radius: 5px; white-space: pre-wrap; margin-top: 10px; border-left: 4px solid #667eea;">{results.reasoning_text}</p>
+                </details>
+                <h4 style="color: #4ade80; margin-bottom: 10px;">Response</h4>''' if results.reasoning_text else ''}
+                <p style="background: #1a3a1a; padding: 15px; border-radius: 5px; white-space: pre-wrap; border-left: 4px solid #4ade80;">{results.answer_text if results.reasoning_text else (results.generated_text if results.generated_text else '(No output generated)')}</p>
+                <small style="color: #888;">Generated {len(results.generated_tokens)} tokens</small>
+            </div>
+        </div>
+
+        <div id="tokens" class="tab-content">
+            <div class="card">
+                <h3>Top Predicted Tokens</h3>
+                {'<div class="chart" id="chart-token-probs"></div>' if 'token_probs' in charts else ''}
+                <table>
+                    <tr><th>Rank</th><th>Token</th><th>Probability</th></tr>
+                    {''.join(f'<tr><td>{i+1}</td><td>{(t[2] if t[2] and not t[2].isspace() else f"&lt;{t[0]}&gt;")[:30]}</td><td>{t[1]:.2%}</td></tr>' for i, t in enumerate(results.top_k_tokens[:10]))}
+                </table>
+                {f'<div class="interpretation">{interpretations.get("token_prob", "")}</div>' if interpretations and interpretations.get("token_prob") else ''}
+            </div>
+        </div>
+
+        <div id="layers" class="tab-content">
+            <div class="card">
+                <h3>Layer Activation Norms</h3>
+                {'<div class="chart" id="chart-layers"></div>' if 'layers' in charts else '<p>No layer data</p>'}
+                {f'<div class="interpretation">{interpretations.get("layers", "")}</div>' if interpretations and interpretations.get("layers") else ''}
+            </div>
+        </div>
+
+        <div id="ffn" class="tab-content">
+            <div class="card">
+                <h3>FFN Analysis</h3>
+                {'<div class="chart" id="chart-ffn"></div>' if 'ffn' in charts else '<p>No FFN data</p>'}
+                {f'<div class="interpretation">{interpretations.get("ffn", "")}</div>' if interpretations and interpretations.get("ffn") else ''}
+            </div>
+        </div>
+
+        <div id="logits" class="tab-content">
+            <div class="card">
+                <h3>Logits Distribution</h3>
+                {'<div class="chart" id="chart-logits"></div>' if 'logits' in charts else '<p>No logits data</p>'}
+                {f'<div class="interpretation">{interpretations.get("logits", "")}</div>' if interpretations and interpretations.get("logits") else ''}
+            </div>
+        </div>
+
+        <div id="embeddings" class="tab-content">
+            <div class="card">
+                <h3>Token Embeddings (PCA)</h3>
+                {'<div class="chart" id="chart-embeddings"></div>' if 'embeddings' in charts else '<p>No embedding data</p>'}
+                {f'<div class="interpretation">{interpretations.get("embeddings", "")}</div>' if interpretations and interpretations.get("embeddings") else ''}
+            </div>
+        </div>
+
+        <div id="similarity" class="tab-content">
+            <div class="card">
+                <h3>Layer Similarity</h3>
+                {'<div class="chart" id="chart-similarity"></div>' if 'similarity' in charts else '<p>Need 2+ layers</p>'}
+                {f'<div class="interpretation">{interpretations.get("similarity", "")}</div>' if interpretations and interpretations.get("similarity") else ''}
+            </div>
+        </div>
+
+        <div id="residual" class="tab-content">
+            <div class="card">
+                <h3>Residual Stream</h3>
+                {'<div class="chart" id="chart-residual"></div>' if 'residual' in charts else '<p>No residual data</p>'}
+                {f'<div class="interpretation">{interpretations.get("residual", "")}</div>' if interpretations and interpretations.get("residual") else ''}
+            </div>
+        </div>
+    </div>
+
+    <script>
+        function openTab(evt, tabName) {{
+            document.querySelectorAll('.tab-content').forEach(t => t.classList.remove('active'));
+            document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+            document.getElementById(tabName).classList.add('active');
+            evt.currentTarget.classList.add('active');
+            window.dispatchEvent(new Event('resize'));
+        }}
+
+        // Render charts
+        const charts = {json.dumps(charts)};
+        for (const [key, data] of Object.entries(charts)) {{
+            const el = document.getElementById('chart-' + key.replace('_', '-'));
+            if (el && data) {{
+                Plotly.newPlot(el, JSON.parse(data).data, JSON.parse(data).layout, {{responsive: true}});
+            }}
+        }}
+    </script>
+</body>
+</html>"""
+
+    return html
+
+
 # =============================================================================
 # Metric Definitions
 # =============================================================================
@@ -699,99 +4202,307 @@ METRIC_DEFINITIONS = {
         "short": "Magnitude of neural activity at each layer",
         "full": """**Activation Norm (L2 Norm)** measures the Euclidean length of the activation vector.
 
+**What it means:** Higher norms = stronger/more intense neural activity. The model is encoding more information or giving stronger "signals" at that layer.
+
 ---
 
-**Chart Axes:**
+**📊 Chart Axes:**
 - **X-axis (Layer):** Layer index from 0 to N-1
-- **Y-axis (L2 Norm):** Euclidean magnitude: sqrt(sum(x²))
+- **Y-axis (L2 Norm):** The Euclidean magnitude of the activation vector: sqrt(sum(x²)). Higher = stronger signal.
 
 ---
 
 **Why it matters:**
-- Increasing norms = building up representations
-- Decreasing norms = information compression
-- Sudden changes = important processing steps"""
+- Increasing norms through layers often indicate the model is building up representations
+- Decreasing norms might indicate information compression
+- Sudden changes can indicate important processing steps
+- Very high norms can indicate instability; very low norms might mean vanishing gradients"""
     },
-    "ffn_analysis": {
-        "name": "FFN Analysis",
-        "short": "Feed-forward network gate patterns",
-        "full": """**FFN Analysis** examines the feed-forward network activations.
+    "gate_sparsity": {
+        "name": "FFN Gate Analysis",
+        "short": "How the FFN filters and routes information",
+        "full": """**FFN (Feed-Forward Network)** in each transformer layer uses SwiGLU activation:
+```
+output = SiLU(gate) × up_projection
+```
+The gate controls which pathways are "open" (active) or "closed" (blocked).
 
 ---
 
-**Left Chart - Gate Sparsity:**
-- **X-axis:** Layer index
-- **Y-axis:** Fraction of activations near zero (|x| < 0.1)
-- Higher = more selective processing
+**📊 Left Chart: Gate Sparsity** (Y-axis: fraction from 0.0 to 1.0)
 
-**Right Chart - Mean Activation:**
-- **X-axis:** Layer index
-- **Y-axis:** Average |activation| magnitude
-- Higher = stronger signals"""
+Measures what fraction of gate values are near zero (|x| < 0.1).
+
+| Value | Meaning |
+|-------|---------|
+| 0.0 (0%) | All pathways open - dense processing |
+| 0.5 (50%) | Half pathways closed - selective |
+| 1.0 (100%) | All pathways closed - no information flows |
+
+**Interpretation:** Higher sparsity = more selective/efficient processing. The model has learned to "turn off" irrelevant pathways.
+
+---
+
+**📊 Right Chart: Mean Gate Activation** (Y-axis: average magnitude)
+
+Measures the average absolute value of activations: mean(|activation|)
+
+| Value | Meaning |
+|-------|---------|
+| ~0.1-0.3 | Low activity - subtle processing |
+| ~0.5-1.0 | Moderate activity - typical range |
+| >1.5 | High activity - strong signals |
+
+**Interpretation:** Higher values = stronger neural activity at that layer. Very high or very low across all layers may indicate issues.
+
+---
+
+**Why this matters:**
+- Sparsity increasing in later layers = model becoming more selective/specialized
+- Consistent mean activation = stable information flow
+- Large variations may indicate where key processing happens"""
     },
-    "embeddings": {
+    "token_probability": {
+        "name": "Token Probability",
+        "short": "Model's confidence for each possible next word",
+        "full": """**Token Probability** is the softmax output showing the model's confidence that each vocabulary token should come next.
+
+**What it means:**
+- High probability on one token (>50%) = model is confident
+- Spread across many tokens = model is uncertain or multiple valid continuations exist
+
+---
+
+**📊 Bar Chart Axes:**
+- **X-axis (Token):** The vocabulary token (word/subword) as text
+- **Y-axis (Probability):** The probability from 0.0 to 1.0 (0% to 100%). All probabilities sum to 1.0 across the full vocabulary.
+
+---
+
+**Key metrics:**
+- **Top-K tokens:** The K highest probability candidates
+- **Probability mass:** Sum of top-K probabilities. Higher = more confident
+- **Entropy:** Measures uncertainty. Low (~0-2) = confident; High (>4) = uncertain"""
+    },
+    "embedding": {
         "name": "Token Embeddings",
-        "short": "Vector representations of input tokens",
-        "full": """**Token Embeddings** are learned vectors for each token.
+        "short": "Dense vector representations of input words",
+        "full": """**Token Embeddings** are learned vector representations that convert discrete tokens into continuous vectors the model can process.
+
+**What it means:** Each token from the vocabulary is mapped to a high-dimensional vector. Similar concepts have similar vectors.
 
 ---
 
-**PCA Scatter Plot:**
-- **X-axis (PC1):** First principal component
-- **Y-axis (PC2):** Second principal component
-- **Points:** Tokens; nearby = similar meaning"""
+**📊 PCA Scatter Plot Axes:**
+- **X-axis (PC1):** First principal component - captures the dimension of maximum variance in the embedding space
+- **Y-axis (PC2):** Second principal component - captures the next most significant variation
+- **Points:** Each point is a token; nearby points have similar embeddings
+
+**📊 Heatmap Axes:**
+- **X-axis (Dimension):** Embedding dimension index
+- **Y-axis (Token):** Input tokens from the prompt
+- **Color:** Activation value (blue=negative, white=zero, red=positive)
+
+---
+
+**Key statistics:**
+- **Mean ≈ 0:** Centered embeddings (common after normalization)
+- **Std:** Higher = more expressive/varied representations
+- **Per-token norm:** Tokens with higher norms often represent more "important" or distinctive concepts"""
     },
     "logits": {
         "name": "Logits",
-        "short": "Raw output scores before softmax",
-        "full": """**Logits** are raw scores for each vocabulary token.
+        "short": "Raw model outputs before probability conversion",
+        "full": """**Logits** are the raw, unnormalized scores the model outputs for each vocabulary token before softmax converts them to probabilities.
+
+**What it means:**
+- Higher logit = model prefers that token
+- Logits can be any real number (positive or negative)
+- Softmax(logits) → probabilities
 
 ---
 
-**Histogram (Left):**
-- **X-axis:** Logit value (can be negative)
-- **Y-axis:** Count of tokens
+**📊 Histogram Axes (Raw Logits):**
+- **X-axis (Logit Value):** The raw score value, can be negative or positive
+- **Y-axis (Count):** Number of vocabulary tokens with that logit value
 
-**Log Probability (Center):**
-- **X-axis:** Log₁₀(probability)
-- **Y-axis:** Count
+**📊 Histogram Axes (Log Probability):**
+- **X-axis (Log₁₀ Probability):** Log-scaled probability (-15 to 0, where 0 = 100%)
+- **Y-axis (Count):** Number of tokens at that probability level
 
-**Top Tokens (Right):**
-- **X-axis:** Token text
-- **Y-axis:** Logit score"""
+**📊 Top Tokens Bar Chart:**
+- **X-axis (Token):** The vocabulary token text
+- **Y-axis (Logit Value):** The raw logit score for that token
+
+---
+
+**Why look at logits:**
+- See the full distribution, not just top tokens
+- Understand model confidence (tight vs spread distribution)
+- Detect potential issues (all similar logits = confused model)"""
     },
     "layer_similarity": {
         "name": "Layer Similarity",
-        "short": "Cosine similarity between layer outputs",
-        "full": """**Layer Similarity** shows how similar representations are across layers.
+        "short": "How similar are representations across layers",
+        "full": """**Layer Similarity** uses cosine similarity to measure how similar the representations are between different layers.
+
+**What it means:**
+- Similarity = 1.0: Identical representations
+- Similarity ≈ 0: Orthogonal/unrelated
+- Adjacent layers often have high similarity (incremental changes)
 
 ---
 
-**Heatmap:**
-- **X/Y axes:** Layer indices
-- **Color:** Cosine similarity (0=orthogonal, 1=identical)
-- **Diagonal:** Always 1.0 (self-similarity)"""
+**📊 Heatmap Axes:**
+- **X-axis (Layer j):** Layer index
+- **Y-axis (Layer i):** Layer index
+- **Color (Similarity):** Cosine similarity from 0.0 (blue, orthogonal) to 1.0 (red, identical)
+- **Diagonal:** Always 1.0 (layer compared to itself)
+
+**Reading the heatmap:** Each cell (i, j) shows how similar layer i's output is to layer j's output. Bright red = very similar, dark blue = very different.
+
+---
+
+**Why it matters:**
+- Large drops indicate significant transformations
+- High similarity across many layers might indicate redundancy
+- Helps identify which layers do the "heavy lifting" """
     },
     "residual_stream": {
         "name": "Residual Stream",
-        "short": "Information flow through the transformer",
-        "full": """**Residual Stream** tracks the main information pathway.
+        "short": "The main information highway through the transformer",
+        "full": """**Residual Stream** is the central pathway through which information flows in a transformer.
+
+**How it works:**
+- Starts with token embeddings
+- Each layer ADDS its contribution: `stream = stream + layer_output`
+- This "residual connection" helps gradients flow and prevents degradation
 
 ---
 
-**Top Chart - Stream Magnitude:**
-- **X-axis:** Position (Embedding → Layers)
-- **Y-axis:** L2 norm of hidden state
+**📊 Top Chart: Stream Magnitude** (Y-axis: L2 Norm)
 
-**Bottom Chart - Layer Delta:**
-- **X-axis:** Layer
-- **Y-axis:** How much that layer changed the stream"""
+Shows the "strength" of the signal at each point in the network.
+
+| Pattern | Meaning |
+|---------|---------|
+| Increasing | Information accumulating, representations getting richer |
+| Decreasing | Information compression or filtering |
+| Stable | Balanced processing, no major changes |
+| Spike | A layer added significant new information |
+
+---
+
+**📊 Bottom Chart: Layer Delta** (Y-axis: change magnitude)
+
+Shows how much each layer changes the stream.
+
+| Delta Value | Meaning |
+|-------------|---------|
+| High (>0.5) | Layer makes major transformation |
+| Medium (0.1-0.5) | Normal processing |
+| Low (<0.1) | Layer makes minimal changes |
+
+**Why this matters:**
+- High-delta layers are doing the "heavy lifting"
+- Consistently low deltas might indicate redundant layers
+- The pattern reveals where key transformations happen"""
+    },
+    "moe_routing": {
+        "name": "MoE Expert Routing",
+        "short": "How tokens are distributed across experts in Mixture of Experts models",
+        "full": """**Mixture of Experts (MoE)** models use a router/gate to select which expert networks process each token.
+
+**How it works:**
+- Each layer has multiple expert networks (FFN modules)
+- A learned router computes scores for each expert
+- Top-k experts (usually 2) are selected per token
+- Outputs are combined weighted by router probabilities
+
+---
+
+**📊 Expert Load Chart** (per layer)
+
+Shows how many tokens each expert processes.
+
+| Pattern | Meaning |
+|---------|---------|
+| Balanced | Experts share load evenly - good utilization |
+| Imbalanced | Some experts overloaded - may indicate training issues |
+| Dead experts | Zero load - expert not being used |
+
+---
+
+**📊 Router Probability Heatmap** (per token)
+
+Shows the router's confidence for each expert.
+
+- **X-axis:** Expert index
+- **Y-axis:** Token position
+- **Color:** Selection probability (darker = higher)
+
+---
+
+**📊 Expert Selection Pattern**
+
+Shows which experts were selected for each token position.
+
+---
+
+**🎯 Expert Influence Analysis**
+
+Advanced metrics using AI domain terminology:
+
+| Metric | Description |
+|--------|-------------|
+| **Effective Expert Count** | Equivalent number of equally-used experts (2^entropy) |
+| **Router Entropy** | Shannon entropy of routing - measures diversity (higher = more uniform) |
+| **Load Balance Score** | 1 - coefficient of variation (higher = more balanced) |
+| **Gini Coefficient** | Inequality measure (0 = perfect equality, 1 = max inequality) |
+| **Auxiliary Loss Proxy** | Approximates Switch Transformer's load balancing loss |
+
+**Expert Categories:**
+- 🔥 **Dominant**: Handling >2x average load (capacity bottleneck risk)
+- ✓ **Normal**: Within expected range
+- 📉 **Underutilized**: <25% of average load (wasted capacity)
+- 💀 **Dead**: Zero activations (collapsed routing)
+
+---
+
+**🔤 Expert Token Specialization**
+
+Shows which actual tokens each expert prefers to process:
+
+| Metric | Meaning |
+|--------|---------|
+| **Most Frequent Tokens** | Tokens this expert processes most often |
+| **Specialization Score** | 0-1 measure of focus (1 = highly specialized, 0 = generalist) |
+| **Avg Router Prob** | How confident the router is when selecting this expert |
+
+**Specialization Patterns:**
+- 🎯 **Specialized Expert** (score >0.7): Focuses on specific token types (e.g., punctuation, numbers, code keywords)
+- 📊 **Moderate** (score 0.4-0.7): Some preferences but handles variety
+- 🌐 **Generalist** (score <0.4): Processes diverse tokens without strong preferences
+
+**Why this matters:**
+- Reveals what each expert "learned" to specialize in
+- Shows semantic clustering (similar tokens → same expert)
+- Helps identify load balancing issues
+- Can show if experts are being utilized effectively
+- Indicates potential training instabilities or router collapse"""
     }
 }
 
 
+def metric_tooltip(key: str) -> str:
+    """Get tooltip text for a metric."""
+    if key in METRIC_DEFINITIONS:
+        return METRIC_DEFINITIONS[key]["short"]
+    return ""
+
+
 def metric_help(key: str) -> str:
-    """Get help text for a metric."""
+    """Get full help text for a metric."""
     if key in METRIC_DEFINITIONS:
         return METRIC_DEFINITIONS[key]["full"]
     return ""
@@ -811,10 +4522,9 @@ def main():
     st.title("🔬 MLXLMProbe")
     st.caption("Universal probing tool for MLX language models")
 
-    # Sidebar
+    # Sidebar - Model Selection
     st.sidebar.header("Model")
 
-    # Model selection mode
     input_mode = st.sidebar.radio(
         "Select model by",
         ["Browse mlx-community", "Enter path manually"],
@@ -825,24 +4535,20 @@ def main():
     selected_model = None
 
     if input_mode == "Browse mlx-community":
-        # Fetch and display mlx-community models
         if HF_HUB_AVAILABLE:
             with st.sidebar.container():
                 st.caption("Browse [mlx-community](https://huggingface.co/mlx-community) models")
 
-                # Fetch models (cached)
                 with st.spinner("Loading model list..."):
                     models = fetch_mlx_community_models(limit=300)
 
                 if models:
-                    # Search filter
                     search = st.text_input(
                         "🔍 Filter models",
                         placeholder="e.g., llama, mistral, 4bit...",
                         key="model_search"
                     )
 
-                    # Filter models by search
                     if search:
                         search_lower = search.lower()
                         filtered = [m for m in models if search_lower in m['name'].lower()]
@@ -850,7 +4556,6 @@ def main():
                         filtered = models
 
                     if filtered:
-                        # Create options
                         options = {format_model_option(m): m['id'] for m in filtered[:100]}
 
                         selected_display = st.selectbox(
@@ -871,7 +4576,6 @@ def main():
             input_mode = "Enter path manually"
 
     if input_mode == "Enter path manually":
-        # Manual path input
         selected_model = st.sidebar.text_input(
             "Model path or HuggingFace ID",
             value="mlx-community/Llama-3.2-1B-Instruct-4bit",
@@ -881,16 +4585,45 @@ def main():
     # Load model button
     if selected_model:
         if st.sidebar.button("Load Model", type="primary", use_container_width=True):
-            with st.spinner(f"Loading {selected_model}..."):
-                try:
-                    from mlx_lm import load
-                    model, tokenizer = load(selected_model)
-                    st.session_state.model = model
-                    st.session_state.tokenizer = tokenizer
-                    st.session_state.model_path = selected_model
-                    st.sidebar.success("Model loaded!")
-                except Exception as e:
-                    st.sidebar.error(f"Error loading model: {e}")
+            try:
+                from mlx_lm import load
+
+                is_hf_model = '/' in selected_model and not selected_model.startswith('/')
+
+                if is_hf_model and HF_HUB_AVAILABLE:
+                    progress_container = st.sidebar.container()
+                    with progress_container:
+                        progress_bar = st.progress(0)
+                        status_text = st.empty()
+
+                        status_text.text("Preparing download...")
+                        local_path = download_model_with_progress(
+                            selected_model,
+                            progress_bar,
+                            status_text
+                        )
+
+                        status_text.text("Loading model into memory...")
+                        model, tokenizer = load(local_path)
+
+                        progress_bar.empty()
+                        status_text.empty()
+                else:
+                    with st.spinner(f"Loading {selected_model}..."):
+                        model, tokenizer = load(selected_model)
+
+                st.session_state.model = model
+                st.session_state.tokenizer = tokenizer
+                st.session_state.model_path = selected_model
+
+                # Extract and cache model topology
+                st.session_state.topology = get_model_topology(model, tokenizer, selected_model)
+
+                st.sidebar.success("Model loaded!")
+                st.rerun()
+
+            except Exception as e:
+                st.sidebar.error(f"Error loading model: {e}")
 
     # Check if model is loaded
     if 'model' not in st.session_state:
@@ -919,8 +4652,6 @@ def main():
         st.markdown("---")
         st.markdown("""
         **Supported architectures:** Llama, Mistral, Mixtral, Phi, Qwen, Gemma, StarCoder, Falcon, GPT-2, and more.
-
-        All models from [mlx-community](https://huggingface.co/mlx-community) that are compatible with `mlx-lm` will work.
         """)
         return
 
@@ -929,40 +4660,172 @@ def main():
 
     st.sidebar.success(f"✓ {st.session_state.model_path}")
 
-    # Probe settings
-    st.sidebar.header("Probe Settings")
+    # Model Topology Expander
+    with st.expander("🏗️ Model Topology", expanded=False):
+        if 'topology' in st.session_state:
+            topology = st.session_state.topology
+            st.markdown(format_topology_display(topology))
+        else:
+            # Generate topology if not cached (for models loaded before this feature)
+            model_path = st.session_state.get('model_path', None)
+            topology = get_model_topology(model, tokenizer, model_path)
+            st.session_state.topology = topology
+            st.markdown(format_topology_display(topology))
+
+    # Probe Settings
+    st.sidebar.header("🔬 Probe Settings")
 
     capture_embeddings = st.sidebar.checkbox("Capture Embeddings", value=True)
     capture_layers = st.sidebar.checkbox("Capture Layer Outputs", value=True)
     capture_ffn = st.sidebar.checkbox("Capture FFN Activations", value=True)
     capture_logits = st.sidebar.checkbox("Capture Logits", value=True)
+    capture_token_probs = st.sidebar.checkbox("Capture Token Probabilities", value=True)
     capture_residual = st.sidebar.checkbox("Capture Residual Stream", value=True)
 
-    # Create probe config
+    # Max sequence positions
+    max_seq_positions = st.sidebar.slider("Max Sequence Positions", 32, 512, 256,
+        help="Limit positions captured to reduce memory usage")
+
+    # Layer selection
+    st.sidebar.markdown("**Layers to Capture**")
+    layer_mode = st.sidebar.radio("", ["All", "Sample", "Custom"], horizontal=True, label_visibility="collapsed")
+
     probe_config = ProbeConfig(
         capture_embeddings=capture_embeddings,
         capture_layer_outputs=capture_layers,
         capture_ffn_activations=capture_ffn,
         capture_logits=capture_logits,
-        capture_residual_stream=capture_residual
+        capture_token_probs=capture_token_probs,
+        capture_residual_stream=capture_residual,
+        max_sequence_positions=max_seq_positions
     )
 
-    # Main input
-    st.header("Input")
-    prompt = st.text_area(
-        "Enter your prompt",
-        value="The capital of France is",
-        height=100
+    if layer_mode == "Sample":
+        sample_every = st.sidebar.slider("Sample every N layers", 1, 10, 4)
+        probe_config.layer_indices = list(range(0, 100, sample_every))
+    elif layer_mode == "Custom":
+        custom_layers = st.sidebar.text_input("Layer indices (comma-separated)", "0,5,10,15,20")
+        try:
+            probe_config.layer_indices = [int(x.strip()) for x in custom_layers.split(",")]
+        except:
+            probe_config.layer_indices = None
+
+    # Generation Settings
+    st.sidebar.header("🚀 Generation Settings")
+    gen_max_tokens = st.sidebar.slider("Max Tokens", 10, 500, 200,
+        help="Maximum tokens to generate")
+    gen_temperature = st.sidebar.slider("Temperature", 0.0, 1.5, 0.0, 0.1,
+        help="0.0 = greedy (deterministic), higher = more random")
+
+    # AI Intelligence
+    st.sidebar.header("🤖 AI Intelligence")
+    use_ai_interpretation = st.sidebar.checkbox(
+        "Enable AI Interpretation",
+        value=True,
+        help="Generate AI-powered analysis of probe results"
     )
 
-    # Run probe button
-    if st.button("🔬 Run Probe", type="primary"):
-        with st.spinner("Probing model..."):
+    # Check for Claude Code availability
+    claude_available = detect_claude_code()
+    interpreter_choice = "local"  # Default to local LLM
+
+    if use_ai_interpretation:
+        if claude_available:
+            st.sidebar.success("✓ Claude Code detected")
+            # Get previous selection from session state
+            prev_choice = st.session_state.get('interpreter_choice', 'local')
+            default_idx = 1 if prev_choice == "claude" else 0
+
+            interpreter_choice = st.sidebar.radio(
+                "Interpreter",
+                ["Local LLM", "Claude (via Claude Code)"],
+                index=default_idx,
+                help="Choose which AI to use for interpretation"
+            )
+            interpreter_choice = "claude" if "Claude" in interpreter_choice else "local"
+            # Update session state immediately so tabs can use it
+            st.session_state.interpreter_choice = interpreter_choice
+
+            # Show warning when Claude is selected
+            if interpreter_choice == "claude":
+                st.sidebar.warning("⚠️ **Claude API Usage**: Generating interpretations will consume tokens. Rates may apply based on your subscription.")
+        else:
+            st.sidebar.info("Claude Code not detected - using local LLM")
+            interpreter_choice = "local"
+            st.session_state.interpreter_choice = interpreter_choice
+
+    # Main Input
+    st.header("💬 Input")
+
+    # System prompt
+    system_prompt = st.text_area(
+        "System Prompt",
+        value="You are a helpful assistant.",
+        height=80,
+        help="System instruction for the model (used when formatting the full prompt)"
+    )
+
+    # User prompt (changed default to match AFM7)
+    user_prompt = st.text_area(
+        "User Message",
+        value="Explain the concept of attention in neural networks in one paragraph.",
+        height=100,
+        help="The text you want to probe"
+    )
+
+    # Format the prompt using chat template if available
+    def format_prompt_for_model(system: str, user: str, tok) -> str:
+        """Format prompt using chat template or fallback."""
+        messages = [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user}
+        ]
+
+        if hasattr(tok, 'apply_chat_template'):
             try:
-                prober = ModelProber(model, tokenizer, probe_config)
-                results = prober.probe(prompt)
+                return tok.apply_chat_template(
+                    messages,
+                    tokenize=False,
+                    add_generation_prompt=True
+                )
+            except Exception:
+                pass
+
+        # Fallback: simple format
+        return f"{system}\n\nUser: {user}\n\nAssistant:"
+
+    # Show formatted prompt preview
+    with st.expander("View formatted prompt"):
+        formatted = format_prompt_for_model(system_prompt, user_prompt, tokenizer)
+        st.code(formatted, language=None)
+
+    run_probe = st.button("🚀 Run Inference with Probing", type="primary")
+
+    # Run probe
+    if run_probe:
+        with st.spinner("Running inference and probing..."):
+            try:
+                # Format prompt using chat template
+                prompt = format_prompt_for_model(system_prompt, user_prompt, tokenizer)
+
+                # Get topology for MoE info
+                topology = st.session_state.get('topology', {})
+                prober = ModelProber(model, tokenizer, probe_config, topology)
+                # Use probe_with_generation to actually generate text
+                results = prober.probe_with_generation(
+                    prompt,
+                    max_tokens=gen_max_tokens,
+                    temperature=gen_temperature
+                )
                 st.session_state.results = results
                 st.session_state.prober = prober
+                st.session_state.use_ai_interpretation = use_ai_interpretation
+
+                # Store settings for on-demand interpretation generation
+                st.session_state.use_ai_interpretation = use_ai_interpretation
+                st.session_state.interpreter_choice = interpreter_choice
+                st.session_state.inference_complete = True
+
             except Exception as e:
                 st.error(f"Error during probing: {e}")
                 import traceback
@@ -975,109 +4838,1075 @@ def main():
     results = st.session_state.results
     prober = st.session_state.prober
 
-    # Tabs
-    tabs = st.tabs([
-        "📊 Layers",
-        "🧠 FFN",
-        "📈 Logits",
-        "🎯 Embeddings",
-        "🔗 Similarity",
-        "🌊 Residual"
-    ])
+    # Inference complete message
+    if st.session_state.get('inference_complete'):
+        st.success("✅ Inference complete!")
 
-    # Layers tab
-    with tabs[0]:
-        st.subheader("Layer Activation Norms")
-        with st.expander("ℹ️ What is this?"):
+    # Generated Output section
+    st.header("📝 Generated Output")
+    if results.generated_text:
+        # Check if there's reasoning to display separately
+        if results.reasoning_text:
+            # Show reasoning in a collapsible section
+            with st.expander("🧠 Reasoning / Analysis", expanded=True):
+                st.text_area(
+                    "Model's internal reasoning",
+                    value=results.reasoning_text,
+                    height=150,
+                    disabled=True,
+                    label_visibility="collapsed"
+                )
+
+            # Show the final answer
+            st.subheader("Response")
+            if results.answer_text and not results.answer_text.startswith("(Response generation"):
+                st.text_area(
+                    "Final answer",
+                    value=results.answer_text,
+                    height=150,
+                    disabled=True,
+                    label_visibility="collapsed"
+                )
+            else:
+                st.warning("⚠️ Response generation incomplete - try increasing 'Max tokens to generate' in the sidebar")
+        else:
+            # No reasoning detected, show raw output
+            st.text_area("Response", value=results.generated_text, height=150, disabled=True)
+
+        st.caption(f"Generated {len(results.generated_tokens)} tokens")
+    else:
+        st.info("No text generated yet.")
+
+    # Quick stats
+    st.markdown("---")
+    st.header("📊 Visualizations")
+    col1, col2, col3, col4 = st.columns(4)
+    total_tokens = len(results.input_tokens) + len(results.generated_tokens) if results.generated_tokens else len(results.input_tokens)
+    col1.metric("Total Tokens", total_tokens, delta=f"+{len(results.generated_tokens)} generated" if results.generated_tokens else None)
+    col2.metric("Layers Probed", len(results.layer_outputs))
+    if results.top_k_tokens:
+        top_token_text = results.top_k_tokens[0][2]
+        if not top_token_text or top_token_text.isspace():
+            top_token_text = f"<{results.top_k_tokens[0][0]}>"
+        col3.metric("Top Prediction", top_token_text[:15])
+
+        # Show confidence or logit depending on distribution
+        top_prob = results.top_k_tokens[0][1]
+        if top_prob > 0.99 and results.logits is not None:
+            # Distribution is peaked - show logit value instead (more informative)
+            top_token_id = results.top_k_tokens[0][0]
+            if 0 <= top_token_id < len(results.logits):
+                top_logit = float(results.logits[top_token_id])
+                col4.metric("Top Logit", f"{top_logit:.1f}")
+            else:
+                col4.metric("Confidence", ">99%")
+        else:
+            col4.metric("Confidence", f"{top_prob:.1%}")
+
+    # Tabs - matching AFM7 structure
+    # Build tab list - add MoE tab if model is MoE
+    tab_names = [
+        "Layer Activations",
+        "FFN Analysis",
+        "Token Probabilities",
+        "Tokens",
+        "Embeddings",
+        "Logits",
+        "Layer Similarity",
+        "Residual Stream"
+    ]
+
+    if results.is_moe:
+        tab_names.append("MoE Routing")
+
+    tabs = st.tabs(tab_names)
+
+    # Unpack tabs (handle both MoE and non-MoE cases)
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = tabs[:8]
+    tab_moe = tabs[8] if results.is_moe else None
+
+    # Get interpretation settings from session state
+    ai_interpret = st.session_state.get('use_ai_interpretation', False)
+    interp_choice = st.session_state.get('interpreter_choice', 'local')
+
+    # Tab 1: Layer Activations
+    with tab1:
+        st.subheader("Layer-wise Activation Analysis")
+
+        with st.expander("ℹ️ What is this? (click to learn)", expanded=False):
             st.markdown(metric_help("activation_norm"))
 
         if results.layer_outputs:
             fig = plot_layer_norms(results)
             st.plotly_chart(fig, use_container_width=True)
-        else:
-            st.info("No layer outputs captured. Enable 'Capture Layer Outputs' and re-run.")
 
-    # FFN tab
-    with tabs[1]:
-        st.subheader("FFN Analysis")
-        with st.expander("ℹ️ What is this?"):
-            st.markdown(metric_help("ffn_analysis"))
+            # Individual layer histogram
+            available_layers = sorted(results.layer_outputs.keys())
+            if available_layers:
+                selected_layer = st.selectbox(
+                    "Select layer for distribution",
+                    available_layers
+                )
+                # Plot distribution for selected layer
+                layer_data = results.layer_outputs[selected_layer]
+                flat_data = np.array(layer_data).flatten()
+                fig_dist = go.Figure()
+                fig_dist.add_trace(go.Histogram(
+                    x=flat_data,
+                    nbinsx=50,
+                    name=f"Layer {selected_layer}"
+                ))
+                fig_dist.update_layout(
+                    title=f"Activation Distribution - Layer {selected_layer}",
+                    xaxis_title="Activation Value",
+                    yaxis_title="Count",
+                    height=300
+                )
+                st.plotly_chart(fig_dist, use_container_width=True)
+
+            # AI Interpretation (cached)
+            if ai_interpret:
+                interp_label = "Claude" if interp_choice == "claude" else "Local LLM"
+                with st.expander("🧠 AI Interpretation", expanded=True):
+                    render_cached_interpretation(
+                        f"layer_activation_{interp_choice}",
+                        results,
+                        lambda: get_layer_activation_interpretation(
+                            results, model, tokenizer, use_ai=True, interpreter=interp_choice
+                        ),
+                        interp_label
+                    )
+        else:
+            st.info("Enable 'Capture Layer Outputs' to see this visualization.")
+
+    # Tab 2: FFN Analysis
+    with tab2:
+        st.subheader("FFN Gate Pattern Analysis")
+
+        with st.expander("ℹ️ What is this? (click to learn)", expanded=False):
+            st.markdown(metric_help("gate_sparsity"))
 
         if results.ffn_activations:
             fig = plot_ffn_analysis(results)
             st.plotly_chart(fig, use_container_width=True)
-        else:
-            st.info("No FFN activations captured. Enable 'Capture FFN Activations' and re-run.")
 
-    # Logits tab
-    with tabs[2]:
+            # AI Interpretation
+            if ai_interpret:
+                interp_label = "Claude" if interp_choice == "claude" else "Local LLM"
+                with st.expander("🧠 AI Interpretation", expanded=True):
+                    render_cached_interpretation(
+                        f"ffn_analysis_{interp_choice}",
+                        results,
+                        lambda: get_ffn_interpretation(
+                            results, model, tokenizer, use_ai=True, interpreter=interp_choice
+                        ),
+                        interp_label
+                    )
+        else:
+            st.info("Enable 'Capture FFN Activations' to see this visualization.")
+
+    # Tab 3: Token Probabilities
+    with tab3:
+        st.subheader("Next Token Prediction")
+
+        with st.expander("ℹ️ What is this? (click to learn)", expanded=False):
+            st.markdown(metric_help("token_probability"))
+
+        if results.top_k_tokens:
+            # Check if distribution is peaked
+            top_prob = results.top_k_tokens[0][1]
+            if top_prob > 0.99:
+                st.info("⚠️ **Peaked Distribution**: The model is extremely confident (>99%) in its top prediction. "
+                        "This causes numerical underflow in softmax, making other probabilities appear as 0. "
+                        "The chart below shows **logit differences from max** instead of probabilities for better visibility.")
+
+            fig = plot_token_probabilities(results)
+            st.plotly_chart(fig, use_container_width=True)
+
+            # Token probability table - show logit values when peaked
+            if top_prob > 0.99 and results.logits is not None:
+                # Show logit values instead of probabilities for peaked distributions
+                table_data = []
+                for t in results.top_k_tokens:
+                    token_id = t[0]
+                    token_text = t[2]
+                    if 0 <= token_id < len(results.logits):
+                        logit_val = float(results.logits[token_id])
+                    else:
+                        logit_val = 0.0
+                    table_data.append((token_id, logit_val, token_text))
+                df = pd.DataFrame(table_data, columns=["Token ID", "Logit", "Token"])
+                df["Logit"] = df["Logit"].apply(lambda x: f"{x:.2f}")
+            else:
+                df = pd.DataFrame(results.top_k_tokens, columns=["Token ID", "Probability", "Token"])
+                # Format probability: use percentage for > 0.01%, scientific notation for smaller
+                def format_prob(x):
+                    if x >= 0.0001:
+                        return f"{x:.4f} ({x*100:.2f}%)"
+                    elif x > 0:
+                        return f"{x:.2e}"
+                    else:
+                        return "~0"
+                df["Probability"] = df["Probability"].apply(format_prob)
+            st.dataframe(df, hide_index=True)
+
+            # AI Interpretation
+            if ai_interpret:
+                interp_label = "Claude" if interp_choice == "claude" else "Local LLM"
+                with st.expander("🧠 AI Interpretation", expanded=True):
+                    render_cached_interpretation(
+                        f"token_prob_{interp_choice}",
+                        results,
+                        lambda: get_token_prob_interpretation(
+                            results, model, tokenizer, use_ai=True, interpreter=interp_choice
+                        ),
+                        interp_label
+                    )
+        else:
+            st.info("Enable 'Capture Token Probabilities' to see this visualization.")
+
+    # Tab 4: Tokens
+    with tab4:
+        st.subheader("Token Analysis")
+
+        # Input tokens with decoded text
+        st.markdown("**Input Tokens**")
+        if results.input_tokens:
+            input_token_data = []
+            for i, tok_id in enumerate(results.input_tokens):
+                tok_text = tokenizer.decode([tok_id])
+                # Handle special characters for display
+                display_text = repr(tok_text)[1:-1]  # Remove outer quotes
+                input_token_data.append({
+                    "Position": i,
+                    "Token ID": tok_id,
+                    "Text": tok_text,
+                    "Display": display_text
+                })
+            input_df = pd.DataFrame(input_token_data)
+            st.dataframe(input_df, hide_index=True, use_container_width=True)
+
+            # MoE Expert Routing Inspector for input tokens
+            if results.is_moe and results.moe_router_outputs:
+                with st.expander("🔀 MoE Expert Routing Inspector (Input Tokens)", expanded=False):
+                    st.caption("Select a token position to see which experts processed it")
+
+                    # Position selector
+                    max_pos = len(results.input_tokens) - 1
+                    selected_pos = st.slider("Token Position", 0, max_pos, 0, key="input_token_moe_pos")
+
+                    # Show token info
+                    tok_id = results.input_tokens[selected_pos]
+                    tok_text = tokenizer.decode([tok_id])
+                    st.markdown(f"**Position {selected_pos}:** `{tok_text}` (ID: {tok_id})")
+
+                    # Show routing for each MoE layer
+                    moe_layers = sorted(results.moe_router_outputs.keys())
+
+                    # Layer selector
+                    if len(moe_layers) > 1:
+                        selected_layer = st.selectbox(
+                            "MoE Layer",
+                            moe_layers,
+                            format_func=lambda x: f"Layer {x}",
+                            key="input_token_moe_layer"
+                        )
+                    else:
+                        selected_layer = moe_layers[0]
+
+                    router_data = results.moe_router_outputs[selected_layer]
+                    probs = router_data["probs"][0]  # (seq, num_experts)
+                    selected_experts = router_data["selected"][0]  # (seq, top_k)
+
+                    if selected_pos < len(probs):
+                        expert_probs = probs[selected_pos]
+                        expert_selected = selected_experts[selected_pos]
+                        top_k = len(expert_selected)
+                        num_experts = len(expert_probs)
+
+                        # Create expert routing visualization
+                        col_info, col_chart = st.columns([1, 2])
+
+                        with col_info:
+                            st.markdown(f"**Top-{top_k} Experts Selected:**")
+                            expert_data = []
+                            for k in range(top_k):
+                                exp_id = int(expert_selected[k])
+                                exp_prob = float(expert_probs[exp_id])
+                                expert_data.append({
+                                    "Rank": k + 1,
+                                    "Expert": f"E{exp_id}",
+                                    "Weight": f"{exp_prob:.2%}",
+                                })
+                            expert_df = pd.DataFrame(expert_data)
+                            st.dataframe(expert_df, hide_index=True)
+
+                            # Routing summary
+                            dominant = int(expert_selected[0])
+                            dominant_w = float(expert_probs[dominant])
+                            if dominant_w > 0.5:
+                                st.info(f"⚡ **Dominant routing** to Expert {dominant}")
+                            elif dominant_w > 0.3:
+                                st.info(f"🔄 **Balanced routing** across experts")
+                            else:
+                                st.info(f"🌐 **Distributed routing** - no clear dominant")
+
+                        with col_chart:
+                            # Bar chart of all expert weights
+                            fig = go.Figure(go.Bar(
+                                x=list(range(num_experts)),
+                                y=[float(expert_probs[e]) * 100 for e in range(num_experts)],
+                                marker_color=['#EF553B' if e in expert_selected else '#636EFA'
+                                             for e in range(num_experts)],
+                                text=[f"E{e}" if e in expert_selected else "" for e in range(num_experts)],
+                                textposition='outside'
+                            ))
+                            fig.update_layout(
+                                title=f"Router Weights - All {num_experts} Experts",
+                                xaxis_title="Expert ID",
+                                yaxis_title="Weight (%)",
+                                height=250,
+                                margin=dict(l=40, r=20, t=40, b=40)
+                            )
+                            st.plotly_chart(fig, use_container_width=True)
+                            st.caption("🔴 Red = Selected experts | 🔵 Blue = Not selected")
+                    else:
+                        st.warning(f"Position {selected_pos} not captured in router outputs")
+        else:
+            st.info("No input tokens captured.")
+
+        st.markdown("---")
+
+        # Generated tokens with decoded text and alternatives
+        st.markdown("**Generated Tokens** *(with top-10 alternatives at each step)*")
+
+        if results.generated_tokens:
+            # Check if we have per-token alternatives
+            has_alternatives = (hasattr(results, 'per_token_alternatives') and
+                                results.per_token_alternatives and
+                                len(results.per_token_alternatives) > 0)
+
+            for i, tok_id in enumerate(results.generated_tokens):
+                tok_text = tokenizer.decode([tok_id])
+                display_text = repr(tok_text)[1:-1]
+
+                # Get probability of selected token
+                selected_prob = "N/A"
+                if has_alternatives and i < len(results.per_token_alternatives):
+                    alts = results.per_token_alternatives[i]
+                    for alt_id, alt_prob, _ in alts:
+                        if alt_id == tok_id:
+                            selected_prob = f"{alt_prob:.2%}"
+                            break
+
+                # Create row for each token
+                col1, col2, col3, col4 = st.columns([1, 2, 3, 2])
+                with col1:
+                    st.markdown(f"**{i}**")
+                with col2:
+                    st.markdown(f"`{tok_id}`")
+                with col3:
+                    st.markdown(f"**{tok_text}**")
+                with col4:
+                    st.markdown(f"*{selected_prob}*")
+
+                # Show alternatives in expander
+                if has_alternatives and i < len(results.per_token_alternatives):
+                    alts = results.per_token_alternatives[i]
+                    with st.expander(f"🎯 Top 10 alternatives at position {i}", expanded=False):
+                        alt_data = []
+                        for rank, (alt_id, alt_prob, alt_text) in enumerate(alts):
+                            is_selected = "✓" if alt_id == tok_id else ""
+                            alt_data.append({
+                                "Rank": rank + 1,
+                                "Selected": is_selected,
+                                "Token ID": alt_id,
+                                "Token": alt_text,
+                                "Probability": f"{alt_prob:.4f}",
+                                "Percent": f"{alt_prob:.2%}"
+                            })
+                        alt_df = pd.DataFrame(alt_data)
+                        st.dataframe(alt_df, hide_index=True, use_container_width=True)
+
+                        # MoE Expert Routing Info for this generated token
+                        if results.is_moe and results.moe_router_outputs:
+                            moe_layers = sorted(results.moe_router_outputs.keys())
+                            first_layer = moe_layers[0]
+                            router_data = results.moe_router_outputs[first_layer]
+                            captured_len = len(router_data["probs"][0])
+
+                            # Position for this generated token
+                            seq_pos = len(results.input_tokens) + i
+
+                            if seq_pos < captured_len:
+                                # We have actual captured data for this generation step!
+                                st.markdown("---")
+                                st.markdown(f"**🔀 MoE Expert Routing** *(position {seq_pos})*")
+
+                                # Show first and last MoE layers
+                                if len(moe_layers) > 4:
+                                    layer_options = [moe_layers[0], moe_layers[-1]]
+                                    layer_labels = {moe_layers[0]: f"Layer {moe_layers[0]} (First)",
+                                                   moe_layers[-1]: f"Layer {moe_layers[-1]} (Last)"}
+                                else:
+                                    layer_options = moe_layers
+                                    layer_labels = {l: f"Layer {l}" for l in moe_layers}
+
+                                for layer_idx in layer_options:
+                                    router_data = results.moe_router_outputs[layer_idx]
+                                    probs = router_data["probs"][0]
+                                    selected = router_data["selected"][0]
+
+                                    if seq_pos < len(probs):
+                                        expert_probs = probs[seq_pos]
+                                        expert_selected = selected[seq_pos]
+                                        top_k = len(expert_selected)
+
+                                        # Create expert routing table
+                                        expert_data = []
+                                        # Find max weight for relative scaling
+                                        max_weight = max(float(expert_probs[int(expert_selected[k])]) for k in range(top_k))
+                                        for k in range(top_k):
+                                            exp_id = int(expert_selected[k])
+                                            exp_prob = float(expert_probs[exp_id])
+                                            # Scale bars relative to max (max=10 bars) with minimum of 1
+                                            bar_count = max(1, int((exp_prob / max_weight) * 10)) if max_weight > 0 else 1
+                                            expert_data.append({
+                                                "Rank": k + 1,
+                                                "Expert": f"E{exp_id}",
+                                                "Weight": f"{exp_prob:.1%}",
+                                                "Bar": "█" * bar_count
+                                            })
+
+                                        st.markdown(f"**{layer_labels[layer_idx]}:**")
+                                        expert_df = pd.DataFrame(expert_data)
+                                        st.dataframe(expert_df, hide_index=True, use_container_width=True)
+
+                                        # Routing summary
+                                        dominant = int(expert_selected[0])
+                                        dominant_w = float(expert_probs[dominant])
+                                        if dominant_w > 0.5:
+                                            st.caption(f"⚡ Dominant: E{dominant} ({dominant_w:.0%})")
+                                        elif dominant_w > 0.3:
+                                            st.caption(f"🔄 Balanced routing")
+                                        else:
+                                            st.caption(f"🌐 Distributed routing")
+                            else:
+                                # Fallback to context display
+                                st.markdown("---")
+                                st.caption(f"💡 Router data not captured for position {seq_pos}")
+
+            # Summary statistics
+            st.markdown("---")
+            st.markdown(f"**Total generated:** {len(results.generated_tokens)} tokens")
+        else:
+            st.info("No generated tokens yet.")
+
+    # Tab 5: Embeddings
+    with tab5:
+        st.subheader("Token Embedding Analysis")
+
+        with st.expander("ℹ️ What is this? (click to learn)", expanded=False):
+            st.markdown(metric_help("embedding"))
+
+        if results.embeddings is not None:
+            try:
+                fig = plot_embeddings_pca(results, tokenizer)
+                st.plotly_chart(fig, use_container_width=True)
+            except ImportError:
+                st.warning("Install scikit-learn for PCA visualization: pip install scikit-learn")
+            except Exception as e:
+                st.error(f"PCA visualization failed: {e}")
+
+            # Embedding statistics
+            emb = results.embeddings
+            if len(emb.shape) == 3:
+                emb = emb[0]
+            st.markdown(f"""
+            **Embedding Statistics:**
+            - Shape: {emb.shape}
+            - Mean: {emb.mean():.4f}
+            - Std: {emb.std():.4f}
+            - Min: {emb.min():.4f}
+            - Max: {emb.max():.4f}
+            """)
+
+            # AI Interpretation
+            if ai_interpret:
+                interp_label = "Claude" if interp_choice == "claude" else "Local LLM"
+                with st.expander("🧠 AI Interpretation", expanded=True):
+                    render_cached_interpretation(
+                        f"embeddings_{interp_choice}",
+                        results,
+                        lambda: get_embedding_interpretation(
+                            results, model, tokenizer, use_ai=True, interpreter=interp_choice
+                        ),
+                        interp_label
+                    )
+        else:
+            st.info("Enable 'Capture Embeddings' to see this visualization.")
+
+    # Tab 6: Logits
+    with tab6:
         st.subheader("Logits Distribution")
-        with st.expander("ℹ️ What is this?"):
+
+        with st.expander("ℹ️ What is this? (click to learn)", expanded=False):
             st.markdown(metric_help("logits"))
 
         if results.logits is not None:
             fig = plot_logits_distribution(results, tokenizer)
             st.plotly_chart(fig, use_container_width=True)
 
-            # Top tokens table
-            st.subheader("Top Predicted Tokens")
-            if results.top_k_tokens:
-                top_data = []
-                for tok_id, logit in results.top_k_tokens[:10]:
-                    text = prober.decode_token(tok_id)
-                    prob = np.exp(logit - results.logits.max())
-                    top_data.append({
-                        "Token": text,
-                        "ID": tok_id,
-                        "Logit": f"{logit:.2f}",
-                        "~Prob": f"{prob:.4f}"
-                    })
-                st.table(pd.DataFrame(top_data))
+            st.markdown(f"""
+            **Logits Statistics:**
+            - Vocabulary Size: {len(results.logits):,}
+            - Mean: {results.logits.mean():.4f}
+            - Std: {results.logits.std():.4f}
+            - Min: {results.logits.min():.4f}
+            - Max: {results.logits.max():.4f}
+            """)
+
+            # AI Interpretation
+            if ai_interpret:
+                interp_label = "Claude" if interp_choice == "claude" else "Local LLM"
+                with st.expander("🧠 AI Interpretation", expanded=True):
+                    render_cached_interpretation(
+                        f"logits_{interp_choice}",
+                        results,
+                        lambda: get_logits_interpretation(
+                            results, model, tokenizer, use_ai=True, interpreter=interp_choice
+                        ),
+                        interp_label
+                    )
         else:
-            st.info("No logits captured. Enable 'Capture Logits' and re-run.")
+            st.info("Enable 'Capture Logits' to see this visualization.")
 
-    # Embeddings tab
-    with tabs[3]:
-        st.subheader("Token Embeddings")
-        with st.expander("ℹ️ What is this?"):
-            st.markdown(metric_help("embeddings"))
+    # Tab 7: Layer Similarity
+    with tab7:
+        st.subheader("Layer Output Similarity")
 
-        if results.embeddings is not None:
-            fig = plot_embeddings_pca(results, tokenizer)
-            st.plotly_chart(fig, use_container_width=True)
-
-            # Stats
-            st.markdown("**Embedding Statistics:**")
-            col1, col2, col3 = st.columns(3)
-            col1.metric("Shape", str(results.embeddings.shape))
-            col2.metric("Mean", f"{results.embeddings.mean():.4f}")
-            col3.metric("Std", f"{results.embeddings.std():.4f}")
-        else:
-            st.info("No embeddings captured. Enable 'Capture Embeddings' and re-run.")
-
-    # Similarity tab
-    with tabs[4]:
-        st.subheader("Layer Similarity")
-        with st.expander("ℹ️ What is this?"):
+        with st.expander("ℹ️ What is this? (click to learn)", expanded=False):
             st.markdown(metric_help("layer_similarity"))
 
         if len(results.layer_outputs) >= 2:
             fig = plot_layer_similarity(results)
             st.plotly_chart(fig, use_container_width=True)
-        else:
-            st.info("Need at least 2 layers for similarity analysis.")
 
-    # Residual tab
-    with tabs[5]:
-        st.subheader("Residual Stream")
-        with st.expander("ℹ️ What is this?"):
+            st.markdown("""
+            **Quick Reference:**
+            - Diagonal: Self-similarity (always 1.0)
+            - Off-diagonal: Similarity between different layers
+            - Adjacent layers often have high similarity
+            - Large differences may indicate feature transformations
+            """)
+
+            # AI Interpretation
+            if ai_interpret:
+                interp_label = "Claude" if interp_choice == "claude" else "Local LLM"
+                with st.expander("🧠 AI Interpretation", expanded=True):
+                    render_cached_interpretation(
+                        f"layer_similarity_{interp_choice}",
+                        results,
+                        lambda: get_layer_similarity_interpretation(
+                            results, model, tokenizer, use_ai=True, interpreter=interp_choice
+                        ),
+                        interp_label
+                    )
+        else:
+            st.info("Enable 'Capture Layer Outputs' with multiple layers to see this visualization.")
+
+    # Tab 8: Residual Stream
+    with tab8:
+        st.subheader("Residual Stream Analysis")
+
+        with st.expander("ℹ️ What is this? (click to learn)", expanded=False):
             st.markdown(metric_help("residual_stream"))
 
         if results.residual_stream_norms:
             fig = plot_residual_stream(results)
             st.plotly_chart(fig, use_container_width=True)
+
+            # Summary statistics
+            if results.residual_stream_deltas:
+                deltas = [d[1] for d in results.residual_stream_deltas]
+                max_delta_idx = np.argmax(deltas)
+                max_delta_layer = results.residual_stream_deltas[max_delta_idx][0]
+                max_delta_val = deltas[max_delta_idx]
+
+                st.markdown(f"""
+                **Quick Statistics:**
+                - Total layers tracked: {len(results.residual_stream_norms)}
+                - Largest change at: **{max_delta_layer}** (delta = {max_delta_val:.4f})
+                - Average delta: {np.mean(deltas):.4f}
+                - Final stream magnitude: {results.residual_stream_norms[-1][1]:.4f}
+                """)
+
+            # AI Interpretation
+            if ai_interpret:
+                interp_label = "Claude" if interp_choice == "claude" else "Local LLM"
+                with st.expander("🧠 AI Interpretation", expanded=True):
+                    render_cached_interpretation(
+                        f"residual_stream_{interp_choice}",
+                        results,
+                        lambda: get_residual_stream_interpretation(
+                            results, model, tokenizer, use_ai=True, interpreter=interp_choice
+                        ),
+                        interp_label
+                    )
         else:
-            st.info("No residual stream data. Enable 'Capture Residual Stream' and re-run.")
+            st.info("Enable 'Capture Residual Stream' to see this visualization.")
+
+    # Tab 9: MoE Routing (only if model is MoE)
+    if tab_moe is not None:
+        with tab_moe:
+            st.subheader("Mixture of Experts Routing Analysis")
+
+            with st.expander("ℹ️ What is this? (click to learn)", expanded=False):
+                st.markdown(metric_help("moe_routing"))
+
+            if results.is_moe:
+                # MoE summary info
+                col1, col2, col3 = st.columns(3)
+                col1.metric("Experts", results.num_experts)
+                col2.metric("Top-K Selection", results.num_experts_per_tok or "N/A")
+                col3.metric("MoE Layers", len(results.moe_router_outputs) if results.moe_router_outputs else "N/A")
+
+                if results.moe_expert_load:
+                    st.markdown("---")
+                    st.markdown("### Expert Load Distribution")
+                    st.caption("How tokens are distributed across experts (all layers). Color: ⬜ light = low influence (rarely selected) → 🟦 dark blue = high influence (frequently selected, dominant expert)")
+
+                    fig_load = plot_moe_expert_load(results)
+                    st.plotly_chart(fig_load, use_container_width=True)
+
+                    # Layer selector for detailed view
+                    st.markdown("---")
+                    st.markdown("### Per-Layer Analysis")
+
+                    moe_layers = sorted(results.moe_router_outputs.keys())
+                    if moe_layers:
+                        selected_moe_layer = st.selectbox(
+                            "Select MoE layer to analyze",
+                            moe_layers,
+                            format_func=lambda x: f"Layer {x}"
+                        )
+
+                        # Show router probabilities heatmap
+                        st.markdown("#### Router Probabilities")
+                        st.caption("Router confidence for each expert per token. Color: 🟣 purple = low influence (expert ignored for this token) → 🟡 yellow = high influence (expert strongly activated for this token)")
+                        fig_probs = plot_moe_router_probs(results, selected_moe_layer, tokenizer)
+                        st.plotly_chart(fig_probs, use_container_width=True)
+
+                        # Show expert selection pattern
+                        st.markdown("#### Expert Selection Pattern")
+                        st.caption("Marker size indicates router confidence")
+                        fig_select = plot_moe_expert_selection(results, selected_moe_layer, tokenizer)
+                        st.plotly_chart(fig_select, use_container_width=True)
+
+                        # Top-K Expert Weights by Section (System, User, Response)
+                        st.markdown("#### Top-K Expert Weights by Section")
+                        top_k = results.num_experts_per_tok or 4
+                        st.caption(f"""**How to read:** Each bar shows the {top_k} experts selected for that token.
+Colors indicate selection rank (🟡 Top-1, 🟣 Top-2, 🔵 Top-3, 🟠 Top-4). Bar length = router weight.
+Labels inside bars show expert ID (E0-E{results.num_experts-1 if results.num_experts else '?'}).
+**Why {top_k} experts?** This model uses top-{top_k} routing—only {top_k} experts are activated per token (architecture setting, not a display limit).""")
+                        render_moe_topk_sections(results, selected_moe_layer, tokenizer)
+
+                        # Verification/Debug Panel
+                        with st.expander("🔍 Verify Router Data (Debug)", expanded=False):
+                            st.caption("Sanity check: verify Top-1 weight > Top-2 > Top-3 > Top-4 for selected tokens")
+
+                            if selected_moe_layer in results.moe_router_outputs:
+                                router_data = results.moe_router_outputs[selected_moe_layer]
+                                selected_arr = router_data["selected"][0]  # (seq, top_k)
+                                probs_arr = router_data["probs"][0]  # (seq, num_experts)
+
+                                seq_len, top_k_actual = selected_arr.shape
+
+                                # Run sanity check across all tokens
+                                violations = []
+                                for i in range(seq_len):
+                                    weights = []
+                                    for rank in range(1, top_k_actual + 1):
+                                        sel_idx = top_k_actual - rank  # Top-1 → last index
+                                        expert_id = int(selected_arr[i, sel_idx])
+                                        weight = float(probs_arr[i, expert_id])
+                                        weights.append((rank, expert_id, weight))
+
+                                    # Check ordering: Top-1 should have highest weight
+                                    for j in range(len(weights) - 1):
+                                        if weights[j][2] < weights[j + 1][2]:
+                                            violations.append((i, weights[j], weights[j + 1]))
+
+                                if violations:
+                                    st.error(f"⚠️ Found {len(violations)} ordering violations!")
+                                    for v in violations[:5]:  # Show first 5
+                                        st.write(f"Token {v[0]}: Top-{v[1][0]} (E{v[1][1]}, {v[1][2]:.2%}) < Top-{v[2][0]} (E{v[2][1]}, {v[2][2]:.2%})")
+                                else:
+                                    st.success(f"✅ All {seq_len} tokens pass ordering check: Top-1 ≥ Top-2 ≥ Top-3 ≥ Top-4")
+
+                                # Show raw data for specific token
+                                st.markdown("---")
+                                st.markdown("**Inspect single token:**")
+
+                                # Combine tokens for selection
+                                all_tokens = list(results.input_tokens) if results.input_tokens else []
+                                if hasattr(results, 'generated_tokens') and results.generated_tokens:
+                                    all_tokens = all_tokens + list(results.generated_tokens)
+
+                                inspect_pos = st.slider("Token position", 0, seq_len - 1, 0, key="inspect_token_pos")
+
+                                # Get token text
+                                if inspect_pos < len(all_tokens):
+                                    try:
+                                        tok_text = tokenizer.decode([all_tokens[inspect_pos]])
+                                    except:
+                                        tok_text = f"[{all_tokens[inspect_pos]}]"
+                                else:
+                                    tok_text = "?"
+
+                                st.write(f"**Token {inspect_pos}:** `{tok_text}`")
+
+                                # Show all expert probabilities sorted
+                                all_probs = [(int(e), float(probs_arr[inspect_pos, e])) for e in range(probs_arr.shape[1])]
+                                all_probs.sort(key=lambda x: x[1], reverse=True)
+
+                                # Show top-k (selected) + 2 more (not selected) to see the drop-off
+                                show_count = top_k_actual + 2
+                                st.write(f"**All experts by probability** (top-{top_k_actual} are selected, rest ignored):")
+                                top_df = pd.DataFrame([
+                                    {
+                                        "Rank": i+1,
+                                        "Expert": f"E{e}",
+                                        "Weight": f"{p:.4%}",
+                                        "Status": "✅ Selected" if i < top_k_actual else "❌ Not used"
+                                    }
+                                    for i, (e, p) in enumerate(all_probs[:show_count])
+                                ])
+                                st.dataframe(top_df, hide_index=True, use_container_width=True)
+
+                                # Show the drop-off
+                                if len(all_probs) > top_k_actual:
+                                    last_selected_weight = all_probs[top_k_actual - 1][1]
+                                    first_rejected_weight = all_probs[top_k_actual][1]
+                                    drop_pct = ((last_selected_weight - first_rejected_weight) / last_selected_weight * 100) if last_selected_weight > 0 else 0
+                                    st.caption(f"Drop-off: Top-{top_k_actual} weight ({last_selected_weight:.2%}) → next expert ({first_rejected_weight:.2%}) = {drop_pct:.0f}% decrease")
+
+                                # Show what the chart displays
+                                st.write(f"**Chart shows (Top-{top_k_actual} selected):**")
+                                chart_data = []
+                                for rank in range(1, top_k_actual + 1):
+                                    sel_idx = top_k_actual - rank
+                                    expert_id = int(selected_arr[inspect_pos, sel_idx])
+                                    weight = float(probs_arr[inspect_pos, expert_id])
+                                    chart_data.append({"Rank": f"Top-{rank}", "Expert": f"E{expert_id}", "Weight": f"{weight:.4%}"})
+                                st.dataframe(pd.DataFrame(chart_data), hide_index=True, use_container_width=True)
+                            else:
+                                st.info("No router data available for this layer")
+
+                        # Expert Selection Table (full)
+                        with st.expander("📋 Expert Selection Details (Full Table)", expanded=False):
+                            st.caption("Complete table showing all tokens with their expert selections and weights")
+                            df_experts = plot_moe_expert_weights_table(results, selected_moe_layer, tokenizer)
+                            if not df_experts.empty:
+                                st.dataframe(df_experts, hide_index=True, use_container_width=True)
+                            else:
+                                st.info("No expert selection data available")
+
+                        # Expert load for this layer
+                        st.markdown("#### Expert Load (This Layer)")
+                        st.caption("Token count per expert in this layer. Taller bars = higher influence (expert processed more tokens)")
+                        fig_layer_load = plot_moe_expert_load(results, selected_moe_layer)
+                        st.plotly_chart(fig_layer_load, use_container_width=True)
+
+                        # Load balance statistics
+                        if selected_moe_layer in results.moe_expert_load:
+                            load = results.moe_expert_load[selected_moe_layer]
+                            counts = list(load.values())
+                            if counts:
+                                total = sum(counts)
+                                max_load = max(counts)
+                                min_load = min(counts)
+                                avg_load = total / len(counts)
+                                # Compute load imbalance (coefficient of variation)
+                                if avg_load > 0:
+                                    std_load = np.std(counts)
+                                    imbalance = std_load / avg_load
+                                else:
+                                    imbalance = 0
+
+                                st.markdown(f"""
+                                **Load Statistics:**
+                                - Total tokens routed: {total}
+                                - Max expert load: {max_load} ({max_load/total*100:.1f}%)
+                                - Min expert load: {min_load} ({min_load/total*100:.1f}%)
+                                - Load imbalance (CV): {imbalance:.3f} (lower = more balanced)
+                                """)
+
+                                # Identify dead or overloaded experts
+                                dead_experts = [e for e, c in load.items() if c == 0]
+                                if dead_experts:
+                                    st.warning(f"⚠️ Dead experts (no tokens): {dead_experts}")
+
+                    # Global Expert Influence Analysis
+                    st.markdown("---")
+                    st.markdown("### 🎯 Expert Influence Analysis")
+                    st.caption("Comprehensive routing statistics using AI domain metrics")
+
+                    moe_stats = compute_moe_influence_stats(results)
+
+                    if moe_stats["total_routing_decisions"] > 0:
+                        # Summary metrics in columns
+                        col_m1, col_m2, col_m3, col_m4 = st.columns(4)
+
+                        with col_m1:
+                            eff_count = moe_stats.get("effective_expert_count", 0)
+                            st.metric(
+                                "Effective Experts",
+                                f"{eff_count:.1f}",
+                                delta=f"{eff_count/results.num_experts*100:.0f}% utilization" if results.num_experts else None,
+                                delta_color="normal"
+                            )
+
+                        with col_m2:
+                            norm_entropy = moe_stats.get("normalized_entropy", 0)
+                            st.metric(
+                                "Router Entropy",
+                                f"{norm_entropy*100:.1f}%",
+                                delta="High diversity" if norm_entropy > 0.8 else "Moderate" if norm_entropy > 0.5 else "Low diversity",
+                                delta_color="normal" if norm_entropy > 0.5 else "inverse"
+                            )
+
+                        with col_m3:
+                            lb_score = moe_stats.get("load_balance_score", 0)
+                            st.metric(
+                                "Load Balance",
+                                f"{lb_score:.2f}",
+                                delta="Balanced" if lb_score > 0.7 else "Moderate" if lb_score > 0.4 else "Imbalanced",
+                                delta_color="normal" if lb_score > 0.5 else "inverse"
+                            )
+
+                        with col_m4:
+                            gini = moe_stats.get("gini_coefficient", 0)
+                            st.metric(
+                                "Gini Coefficient",
+                                f"{gini:.3f}",
+                                delta="Equal" if gini < 0.3 else "Moderate" if gini < 0.5 else "Unequal",
+                                delta_color="normal" if gini < 0.4 else "inverse"
+                            )
+
+                        # Detailed report
+                        with st.expander("📊 Full Expert Influence Report", expanded=True):
+                            report = format_moe_influence_report(moe_stats, results.num_experts)
+                            st.markdown(report)
+
+                        # Expert Token Specialization
+                        if results.moe_expert_tokens:
+                            with st.expander("🔤 Expert Token Specialization", expanded=False):
+                                st.caption("Which tokens each expert prefers to process - reveals expert specialization patterns")
+
+                                expert_token_analysis = get_expert_token_specialization(results, tokenizer, top_n=15)
+
+                                # Let user select which expert to view
+                                # Default to top influential expert
+                                top_experts = [item["expert_id"] for item in moe_stats.get("expert_influence_ranking", [])[:10]]
+                                if top_experts:
+                                    selected_expert = st.selectbox(
+                                        "Select Expert to Analyze",
+                                        top_experts,
+                                        format_func=lambda x: f"Expert {x} ({expert_token_analysis.get(x, {}).get('total_activations', 0):,} activations)"
+                                    )
+
+                                    if selected_expert in expert_token_analysis:
+                                        analysis = expert_token_analysis[selected_expert]
+
+                                        # Summary metrics
+                                        col_e1, col_e2, col_e3 = st.columns(3)
+                                        col_e1.metric("Total Activations", f"{analysis['total_activations']:,}")
+                                        col_e2.metric("Unique Tokens", f"{analysis['unique_tokens']:,}")
+                                        col_e3.metric(
+                                            "Specialization",
+                                            f"{analysis['specialization_score']:.2f}",
+                                            delta="Focused" if analysis['specialization_score'] > 0.5 else "Diverse",
+                                            delta_color="normal"
+                                        )
+
+                                        # Token table
+                                        if analysis["tokens"]:
+                                            st.markdown("**Most Frequently Processed Tokens:**")
+                                            token_table = "| Rank | Token | Count | Avg Router Prob |\n"
+                                            token_table += "|------|-------|-------|----------------|\n"
+                                            for i, (token_text, token_id, count, avg_prob) in enumerate(analysis["tokens"], 1):
+                                                # Escape pipe characters for markdown table
+                                                safe_text = token_text.replace("|", "\\|")
+                                                token_table += f"| {i} | `{safe_text}` | {count:,} | {avg_prob:.4f} |\n"
+                                            st.markdown(token_table)
+
+                                            # Quick interpretation
+                                            if analysis['specialization_score'] > 0.7:
+                                                st.info(f"🎯 **Highly Specialized Expert**: This expert strongly focuses on specific token types, suggesting learned specialization.")
+                                            elif analysis['specialization_score'] > 0.4:
+                                                st.info(f"📊 **Moderately Specialized Expert**: This expert shows some preference patterns but handles diverse tokens.")
+                                            else:
+                                                st.info(f"🌐 **Generalist Expert**: This expert processes a wide variety of tokens without strong preferences.")
+                                        else:
+                                            st.info("No token data available for this expert.")
+
+                        # AI Interpretation for MoE
+                        if ai_interpret:
+                            interp_label = "Claude" if interp_choice == "claude" else "Local LLM"
+
+                            # Build context for AI interpretation
+                            moe_context = f"""
+MoE Model Analysis:
+- Total Experts: {results.num_experts}
+- Top-K per Token: {results.num_experts_per_tok}
+- Effective Expert Count: {moe_stats.get('effective_expert_count', 0):.1f} ({moe_stats.get('effective_expert_count', 0)/results.num_experts*100:.1f}% of total)
+- Router Entropy: {moe_stats.get('normalized_entropy', 0)*100:.1f}% of maximum
+- Load Balance Score: {moe_stats.get('load_balance_score', 0):.3f}
+- Gini Coefficient: {moe_stats.get('gini_coefficient', 0):.3f}
+- Dead Experts: {len(moe_stats.get('dead_experts', []))}
+- Dominant Experts: {len(moe_stats.get('dominant_experts', []))}
+- Auxiliary Loss Proxy: {moe_stats.get('auxiliary_loss_proxy', 0):.3f}
+
+Top 5 Most Active Experts:
+"""
+                            for item in moe_stats.get('expert_influence_ranking', [])[:5]:
+                                moe_context += f"  Expert {item['expert_id']}: {item['frequency']*100:.2f}% of tokens\n"
+
+                            with st.expander("🧠 AI Interpretation", expanded=True):
+                                render_cached_interpretation(
+                                    f"moe_routing_{interp_choice}",
+                                    results,
+                                    lambda ctx=moe_context: generate_ai_interpretation(
+                                        model,
+                                        tokenizer,
+                                        ctx,
+                                        "Analyze these MoE routing patterns. What do the expert load distribution, router entropy, and specialization metrics reveal about how this model routes tokens to experts? Are there any concerns about load balancing or dead experts?",
+                                        interpreter=interp_choice
+                                    ),
+                                    interp_label
+                                )
+                    else:
+                        st.info("No routing statistics available. Run inference to capture MoE data.")
+                else:
+                    st.info("No MoE routing data captured. Enable 'Capture Layer Outputs' and ensure the model is MoE.")
+            else:
+                st.info("This model is not a Mixture of Experts (MoE) model.")
+
+    # Export section (not a tab, like AFM7)
+    st.header("💾 Export")
+
+    col_export1, col_export2, col_export3 = st.columns(3)
+
+    with col_export1:
+        if st.button("📄 Export JSON"):
+            export_data = {
+                'model': st.session_state.model_path,
+                'input_text': results.input_text,
+                'input_tokens': results.input_tokens,
+                'generated_text': results.generated_text,
+                'reasoning_text': results.reasoning_text,
+                'answer_text': results.answer_text,
+                'generated_tokens': results.generated_tokens,
+                'num_layers': results.num_layers,
+                'top_predictions': [
+                    {'token': t[2], 'probability': t[1], 'id': t[0]}
+                    for t in results.top_k_tokens[:10]
+                ],
+                'layer_norms': {
+                    str(k): float(np.linalg.norm(v, axis=-1).mean())
+                    for k, v in results.layer_outputs.items()
+                }
+            }
+            st.download_button(
+                "Download JSON",
+                data=json.dumps(export_data, indent=2),
+                file_name="mlxlmprobe_results.json",
+                mime="application/json"
+            )
+
+    with col_export2:
+        if st.button("🌐 Export HTML"):
+            with st.spinner("Generating HTML report..."):
+                # Collect AI interpretations if enabled
+                interpretations = {}
+                if ai_interpret:
+                    try:
+                        interpretations["token_probs"] = get_token_prob_interpretation(
+                            results, model, tokenizer, use_ai=True, interpreter=interp_choice)
+                        interpretations["layer_activations"] = get_layer_activation_interpretation(
+                            results, model, tokenizer, use_ai=True, interpreter=interp_choice)
+                        interpretations["ffn"] = get_ffn_interpretation(
+                            results, model, tokenizer, use_ai=True, interpreter=interp_choice)
+                        interpretations["embeddings"] = get_embedding_interpretation(
+                            results, model, tokenizer, use_ai=True, interpreter=interp_choice)
+                        interpretations["logits"] = get_logits_interpretation(
+                            results, model, tokenizer, use_ai=True, interpreter=interp_choice)
+                        interpretations["layer_similarity"] = get_layer_similarity_interpretation(
+                            results, model, tokenizer, use_ai=True, interpreter=interp_choice)
+                    except Exception as e:
+                        st.warning(f"Could not generate AI interpretations: {e}")
+
+                try:
+                    html_content = generate_html_report(
+                        results,
+                        st.session_state.model_path,
+                        probe_config,
+                        tokenizer,
+                        interpretations if ai_interpret else None
+                    )
+                    st.download_button(
+                        "📥 Download HTML",
+                        data=html_content,
+                        file_name="mlxlmprobe_report.html",
+                        mime="text/html"
+                    )
+                    st.success("HTML report generated!")
+                except Exception as e:
+                    st.error(f"Failed to generate HTML: {e}")
+
+    with col_export3:
+        if PDF_AVAILABLE:
+            if st.button("📑 Export PDF"):
+                with st.spinner("Generating PDF report..."):
+                    # Collect AI interpretations if enabled
+                    interpretations = {}
+                    if ai_interpret:
+                        try:
+                            interpretations["token_probs"] = get_token_prob_interpretation(
+                                results, model, tokenizer, use_ai=True, interpreter=interp_choice)
+                            interpretations["layer_activations"] = get_layer_activation_interpretation(
+                                results, model, tokenizer, use_ai=True, interpreter=interp_choice)
+                            interpretations["ffn"] = get_ffn_interpretation(
+                                results, model, tokenizer, use_ai=True, interpreter=interp_choice)
+                            interpretations["embeddings"] = get_embedding_interpretation(
+                                results, model, tokenizer, use_ai=True, interpreter=interp_choice)
+                            interpretations["logits"] = get_logits_interpretation(
+                                results, model, tokenizer, use_ai=True, interpreter=interp_choice)
+                            interpretations["layer_similarity"] = get_layer_similarity_interpretation(
+                                results, model, tokenizer, use_ai=True, interpreter=interp_choice)
+                        except Exception as e:
+                            st.warning(f"Could not generate AI interpretations: {e}")
+
+                    try:
+                        pdf_bytes = generate_pdf_report(
+                            results,
+                            st.session_state.model_path,
+                            probe_config,
+                            interpretations if ai_interpret else None
+                        )
+                        st.download_button(
+                            "📥 Download PDF",
+                            data=pdf_bytes,
+                            file_name="mlxlmprobe_report.pdf",
+                            mime="application/pdf"
+                        )
+                        st.success("PDF report generated!")
+                    except Exception as e:
+                        st.error(f"Failed to generate PDF: {e}")
+        else:
+            st.warning("Install fpdf2 for PDF export: `pip install fpdf2`")
 
 
 if __name__ == "__main__":
