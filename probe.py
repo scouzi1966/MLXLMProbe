@@ -2756,9 +2756,22 @@ def plot_moe_expert_selection(results: ProbeResults, layer_idx: int, tokenizer=N
     # Create traces for each top-k position
     fig = go.Figure()
 
-    colors = ['#636EFA', '#EF553B', '#00CC96', '#AB63FA']
-    for k in range(top_k):
-        expert_ids = selected[:, k]
+    # Use same distinct colors as other MoE charts
+    rank_colors = [
+        '#FFD700',  # Top-1: Gold
+        '#FF00FF',  # Top-2: Magenta
+        '#00FFFF',  # Top-3: Cyan
+        '#FF6600',  # Top-4: Orange
+        '#00FF00',  # Top-5: Lime
+        '#9900FF',  # Top-6: Purple
+        '#FF3333',  # Top-7: Red
+        '#00CC99',  # Top-8: Teal
+    ]
+
+    # Note: argsort returns ascending order, so selected[:, -1] is highest prob (Top-1)
+    for rank in range(1, top_k + 1):
+        sel_idx = top_k - rank  # Top-1 → last index, Top-4 → index 0
+        expert_ids = selected[:, sel_idx]
         # Get the probability for each selected expert
         expert_probs = [probs[i, expert_ids[i]] for i in range(seq_len)]
 
@@ -2768,11 +2781,11 @@ def plot_moe_expert_selection(results: ProbeResults, layer_idx: int, tokenizer=N
             mode='markers',
             marker=dict(
                 size=[p * 30 + 5 for p in expert_probs],  # Size by probability
-                color=colors[k % len(colors)],
+                color=rank_colors[(rank - 1) % len(rank_colors)],
                 opacity=0.7
             ),
-            name=f"Top-{k+1}",
-            text=[f"Token: {token_labels[i]}<br>Expert: E{expert_ids[i]}<br>Prob: {expert_probs[i]:.2%}"
+            name=f"Top-{rank}",
+            text=[f"Token: {token_labels[i]}<br>Expert: E{expert_ids[i]}<br>Prob: {expert_probs[i]:.2%}<br>Rank: Top-{rank}"
                   for i in range(seq_len)],
             hoverinfo='text'
         ))
@@ -2948,10 +2961,12 @@ def plot_moe_expert_weights_table(results: ProbeResults, layer_idx: int, tokeniz
         row = {"Position": i, "Token": text}
 
         # Add each top-k expert and its weight
-        for k in range(top_k):
-            expert_id = int(selected[i, k])
+        # Note: argsort returns ascending order, so selected[i, -1] is highest prob (Top-1)
+        for rank in range(1, top_k + 1):
+            sel_idx = top_k - rank  # Top-1 → last index
+            expert_id = int(selected[i, sel_idx])
             expert_prob = float(probs[i, expert_id])
-            row[f"Expert #{k+1}"] = f"E{expert_id} ({expert_prob:.1%})"
+            row[f"Top-{rank}"] = f"E{expert_id} ({expert_prob:.1%})"
 
         rows.append(row)
 
@@ -5130,19 +5145,21 @@ def main():
                         with col_info:
                             st.markdown(f"**Top-{top_k} Experts Selected:**")
                             expert_data = []
-                            for k in range(top_k):
-                                exp_id = int(expert_selected[k])
+                            # Note: argsort returns ascending order, so expert_selected[-1] is highest prob (Top-1)
+                            for rank in range(1, top_k + 1):
+                                sel_idx = top_k - rank  # Top-1 → last index
+                                exp_id = int(expert_selected[sel_idx])
                                 exp_prob = float(expert_probs[exp_id])
                                 expert_data.append({
-                                    "Rank": k + 1,
+                                    "Rank": f"Top-{rank}",
                                     "Expert": f"E{exp_id}",
                                     "Weight": f"{exp_prob:.2%}",
                                 })
                             expert_df = pd.DataFrame(expert_data)
                             st.dataframe(expert_df, hide_index=True)
 
-                            # Routing summary
-                            dominant = int(expert_selected[0])
+                            # Routing summary - Top-1 is at index -1 (last)
+                            dominant = int(expert_selected[-1])
                             dominant_w = float(expert_probs[dominant])
                             if dominant_w > 0.5:
                                 st.info(f"⚡ **Dominant routing** to Expert {dominant}")
@@ -5264,15 +5281,17 @@ def main():
 
                                         # Create expert routing table
                                         expert_data = []
-                                        # Find max weight for relative scaling
-                                        max_weight = max(float(expert_probs[int(expert_selected[k])]) for k in range(top_k))
-                                        for k in range(top_k):
-                                            exp_id = int(expert_selected[k])
+                                        # Find max weight for relative scaling (Top-1 is at index -1)
+                                        max_weight = float(expert_probs[int(expert_selected[-1])])
+                                        # Note: argsort returns ascending order, so expert_selected[-1] is highest prob (Top-1)
+                                        for rank in range(1, top_k + 1):
+                                            sel_idx = top_k - rank  # Top-1 → last index
+                                            exp_id = int(expert_selected[sel_idx])
                                             exp_prob = float(expert_probs[exp_id])
                                             # Scale bars relative to max (max=10 bars) with minimum of 1
                                             bar_count = max(1, int((exp_prob / max_weight) * 10)) if max_weight > 0 else 1
                                             expert_data.append({
-                                                "Rank": k + 1,
+                                                "Rank": f"Top-{rank}",
                                                 "Expert": f"E{exp_id}",
                                                 "Weight": f"{exp_prob:.1%}",
                                                 "Bar": "█" * bar_count
@@ -5282,8 +5301,8 @@ def main():
                                         expert_df = pd.DataFrame(expert_data)
                                         st.dataframe(expert_df, hide_index=True, use_container_width=True)
 
-                                        # Routing summary
-                                        dominant = int(expert_selected[0])
+                                        # Routing summary - Top-1 is at index -1 (last)
+                                        dominant = int(expert_selected[-1])
                                         dominant_w = float(expert_probs[dominant])
                                         if dominant_w > 0.5:
                                             st.caption(f"⚡ Dominant: E{dominant} ({dominant_w:.0%})")
