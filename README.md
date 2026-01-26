@@ -19,6 +19,22 @@ A visual probing and interpretability tool for MLX language models on Apple Sili
 - **AI Interpretation**: Optional AI-powered analysis using local model or Claude
 - **Export**: PDF reports and interactive HTML exports
 
+### Deep dive into MoE on a per token and per layer basis
+
+![MoE Expert Routing Inspector](docs/images/moe-expert-routing.png)
+
+### Attention pattern analysis
+
+![Attention Pattern Analysis](docs/images/attention-pattern-analysis.png)
+
+### RoPE Analysis
+
+![RoPE Analysis](docs/images/rope-analysis.png)
+
+### Deep Response and Input Sequence Token Analysis
+
+![Token Analysis](docs/images/token-analysis.png)
+
 ## Requirements
 
 - **Mac with Apple Silicon** (M1, M2, M3, M4, or later)
