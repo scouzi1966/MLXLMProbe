@@ -4850,7 +4850,7 @@ def main():
 
     # Layer selection
     st.sidebar.markdown("**Layers to Capture**")
-    layer_mode = st.sidebar.radio("", ["All", "Sample", "Custom"], horizontal=True, label_visibility="collapsed")
+    layer_mode = st.sidebar.radio("Layer capture mode", ["All", "Sample", "Custom"], horizontal=True, label_visibility="collapsed")
 
     probe_config = ProbeConfig(
         capture_embeddings=capture_embeddings,
@@ -4875,9 +4875,9 @@ def main():
 
     # Generation Settings
     st.sidebar.header("🚀 Generation Settings")
-    gen_max_tokens = st.sidebar.slider("Max Tokens", 10, 500, 200,
+    gen_max_tokens = st.sidebar.slider("Max Tokens", 10, 2000, 1000,
         help="Maximum tokens to generate")
-    gen_temperature = st.sidebar.slider("Temperature", 0.0, 1.5, 0.0, 0.1,
+    gen_temperature = st.sidebar.slider("Temperature", 0.0, 1.5, 0.7, 0.1,
         help="0.0 = greedy (deterministic), higher = more random")
 
     # AI Intelligence
@@ -4966,6 +4966,17 @@ def main():
 
     # Run probe
     if run_probe:
+        # Clear previous results and reset all counters - start fresh like a new chat
+        keys_to_delete = []
+        for key in st.session_state.keys():
+            # Keep model, tokenizer, topology (expensive to reload)
+            # Delete everything else related to previous probe
+            if key not in ['model', 'tokenizer', 'model_path', 'topology']:
+                keys_to_delete.append(key)
+
+        for key in keys_to_delete:
+            del st.session_state[key]
+
         with st.spinner("Running inference and probing..."):
             try:
                 # Format prompt using chat template
