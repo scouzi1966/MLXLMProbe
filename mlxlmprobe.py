@@ -6287,7 +6287,7 @@ def _streamlit_app():
     if input_mode == "Enter path manually":
         selected_model = st.sidebar.text_input(
             "Model path or HuggingFace ID",
-            value="mlx-community/Llama-3.2-1B-Instruct-4bit",
+            value="mlx-community/gpt-oss-20b-MXFP4-Q8",
             help="Path to local MLX model or HuggingFace model ID"
         )
 
