@@ -19,6 +19,10 @@ A visual probing and interpretability tool for MLX language models on Apple Sili
 - **AI Interpretation**: Optional AI-powered analysis using local model or Claude
 - **Export**: PDF reports and interactive HTML exports
 
+### Deep token MoE tracing
+
+![Deep token MoE tracing](docs/images/deep-token-tracing.png)
+
 ### Deep dive into MoE on a per token and per layer basis
 
 ![MoE Expert Routing Inspector](docs/images/moe-expert-routing.png)
