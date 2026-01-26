@@ -2285,6 +2285,11 @@ class ModelProber:
                 )
 
                 # Capture layer outputs if in standard/full mode
+                # NOTE: Currently self.results.layer_outputs is empty during generation
+                # because _capture_activations runs after the loop. Per-step layer outputs
+                # would require capturing during each forward pass, which adds overhead.
+                # TODO: Consider post-filling step layer_outputs using position mapping
+                # after _capture_activations completes.
                 if capture_config.capture_layer_outputs and capture_config.mode in ['standard', 'full']:
                     # Sample layers based on config
                     layer_outputs = {}
@@ -2417,10 +2422,11 @@ class ModelProber:
             input_text=timeline.input_text
         )
 
-        # Copy steps up to branch point
+        # Copy steps up to branch point (shallow copy to avoid shared mutable state)
+        import copy
         for i, step in enumerate(timeline.steps):
             if i < branch_step:
-                new_timeline.steps.append(step)
+                new_timeline.steps.append(copy.copy(step))
 
         # Add the branch step with alternative token
         branch_step_state = GenerationStepState(
@@ -2648,7 +2654,6 @@ class CausalTracer:
 
     def _forward_with_intervention(
         self,
-        tokens: mx.array,
         clean_embeddings: mx.array,
         corrupted_embeddings: mx.array,
         restore_layer: Optional[int] = None,
@@ -2659,6 +2664,10 @@ class CausalTracer:
 
         If restore_layer/positions specified, start with corrupted embeddings
         but restore clean activations at specified layer and positions.
+
+        Note: This implementation recomputes clean activations up to restore_layer
+        on each call, making actual cost O(L^2 * positions) rather than O(L * positions).
+        A future optimization could cache per-layer activations to avoid recomputation.
         """
         # Start with corrupted or clean embeddings
         if restore_layer is not None:
@@ -2685,15 +2694,16 @@ class CausalTracer:
                         h_clean = h_clean[0]
                 mx.eval(h_clean)
 
-                # Restore clean activations at specified positions
+                # Restore clean activations at specified positions using mask
+                # More efficient than repeated concatenation
+                seq_len = h.shape[1]
+                mask = mx.zeros((1, seq_len, 1))
                 for pos in restore_positions:
-                    if pos < h.shape[1]:
-                        # h[:, pos, :] = h_clean[:, pos, :]
-                        h = mx.concatenate([
-                            h[:, :pos, :],
-                            h_clean[:, pos:pos+1, :],
-                            h[:, pos+1:, :]
-                        ], axis=1)
+                    if pos < seq_len:
+                        mask = mask.at[:, pos:pos+1, :].add(mx.ones((1, 1, 1)))
+                mx.eval(mask)
+                # Blend: h = h * (1 - mask) + h_clean * mask
+                h = h * (1 - mask) + h_clean * mask
                 mx.eval(h)
 
             # Forward through layer
@@ -2815,26 +2825,31 @@ class CausalTracer:
         embedding_std = self._get_embedding_std()
         noise_scale = config.noise_multiplier * embedding_std
 
-        # Generate noise
+        # Generate noise for subject positions only (more efficient than full tensor)
         noise_shape = clean_embeddings.shape
         noise = mx.random.normal(noise_shape) * noise_scale
         mx.eval(noise)
 
-        # Apply noise only to subject positions
+        # Create a mask for subject positions to apply noise efficiently
+        # Instead of repeated concatenation, use a single masked addition
         corrupted_embeddings = clean_embeddings.astype(mx.float32)
+        seq_len = corrupted_embeddings.shape[1]
+
+        # Create mask: 1 for subject positions, 0 elsewhere
+        mask = mx.zeros((1, seq_len, 1))
         for pos in subject_positions:
-            if pos < corrupted_embeddings.shape[1]:
-                # Add noise to this position
-                corrupted_embeddings = mx.concatenate([
-                    corrupted_embeddings[:, :pos, :],
-                    corrupted_embeddings[:, pos:pos+1, :] + noise[:, pos:pos+1, :],
-                    corrupted_embeddings[:, pos+1:, :]
-                ], axis=1)
+            if pos < seq_len:
+                # Build mask with 1s at subject positions
+                mask = mask.at[:, pos:pos+1, :].add(mx.ones((1, 1, 1)))
+        mx.eval(mask)
+
+        # Apply noise only where mask is 1
+        corrupted_embeddings = corrupted_embeddings + noise * mask
         mx.eval(corrupted_embeddings)
 
         # Step 1: Clean run - get P(target)
         clean_logits = self._forward_with_intervention(
-            x, clean_embeddings, corrupted_embeddings,
+            clean_embeddings, corrupted_embeddings,
             restore_layer=None, restore_positions=None
         )
 
@@ -2872,7 +2887,7 @@ class CausalTracer:
 
         # Step 2: Corrupted run - P(target) should drop
         corrupted_logits = self._forward_with_intervention(
-            x, corrupted_embeddings, corrupted_embeddings,
+            corrupted_embeddings, corrupted_embeddings,
             restore_layer=None, restore_positions=None
         )
         results.corrupted_prob = self._get_target_prob(corrupted_logits, target_token_id)
@@ -2914,7 +2929,7 @@ class CausalTracer:
             for pi, pos in enumerate(positions_to_test):
                 # Restore clean activation at this (layer, position)
                 restored_logits = self._forward_with_intervention(
-                    x, clean_embeddings, corrupted_embeddings,
+                    clean_embeddings, corrupted_embeddings,
                     restore_layer=layer_idx, restore_positions=[pos]
                 )
                 restored_prob = self._get_target_prob(restored_logits, target_token_id)
@@ -2935,6 +2950,9 @@ class CausalTracer:
                     progress_callback(pass_count, total_passes)
 
         results.indirect_effects = indirect_effects
+        # Note: num_forward_passes counts logical passes, but actual compute is higher
+        # because _forward_with_intervention recomputes clean activations up to restore_layer.
+        # Actual cost scales as O(L^2 * positions) rather than O(L * positions).
         results.num_forward_passes = 2 + total_passes  # clean + corrupted + restore runs
 
         # Find critical site (max recovery)
@@ -8696,7 +8714,7 @@ Top 5 Most Active Experts:
                             x = mx.array([tokens])
                             clean_emb = tracer.embedding(x)
                             mx.eval(clean_emb)
-                            clean_logits = tracer._forward_with_intervention(x, clean_emb, clean_emb, None, None)
+                            clean_logits = tracer._forward_with_intervention(clean_emb, clean_emb, None, None)
 
                             # Get top 5 predictions
                             probs = mx.softmax(clean_logits[0, -1, :], axis=-1)
