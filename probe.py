@@ -4301,7 +4301,7 @@ def plot_moe_expert_path(results: ProbeResults, token_position: int, tokenizer=N
 
     # Add bounding boxes around selected experts (top-K) with contrasting colors
     # Colors chosen to stand out against warm heatmap (yellow/orange/red)
-    rank_colors = ['#00ff00', '#00bfff', '#000000', '#ffffff']  # Top-1: lime green, Top-2: deep sky blue, Top-3: black, Top-4: white
+    rank_colors = ['#00ff00', '#00bfff', '#000000', '#ff0000']  # Top-1: lime green, Top-2: deep sky blue, Top-3: black, Top-4: red
     rank_widths = [3.5, 3, 2.5, 2]  # Thicker border for higher rank
 
     for li, layer_idx in enumerate(moe_layers):
@@ -4404,7 +4404,7 @@ def plot_moe_expert_path(results: ProbeResults, token_position: int, tokenizer=N
 
     # Add legend annotation for border colors at top of chart (prominent position)
     fig.add_annotation(
-        text="<b>Selected Expert Borders:</b>  🟢 Top-1  🔵 Top-2  ⬛ Top-3  ⬜ Top-4",
+        text="<b>Selected Expert Borders:</b>  🟢 Top-1  🔵 Top-2  ⬛ Top-3  🔴 Top-4",
         xref="paper", yref="paper",
         x=0.5, y=1.12,
         showarrow=False,
