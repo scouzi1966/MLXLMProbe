@@ -43,77 +43,49 @@ A visual probing and interpretability tool for MLX language models on Apple Sili
 
 - **Mac with Apple Silicon** (M1, M2, M3, M4, or later)
 - **macOS 15.0+** (Sequoia or later recommended)
-- **Python 3.10+**
 - **8GB+ unified memory** (16GB+ recommended for larger models, 32GB+ for 30B+ models)
 
-## Quick Start (From Scratch)
+## Installation
 
-### Step 1: Verify Your System
+### Option 1: Homebrew (Recommended)
 
 ```bash
-# Check you have Apple Silicon
-uname -m
-# Should output: arm64
-
-# Check macOS version
-sw_vers
-# ProductVersion should be 15.0 or higher
-
-# Check Python version
-python3 --version
-# Should be 3.10 or higher
+brew install scouzi1966/afm/mlxlmprobe
 ```
 
-### Step 2: Clone the Repository
+Then run:
+```bash
+mlxlmprobe
+```
+
+### Option 2: pip
+
+```bash
+pip install mlxlmprobe
+```
+
+Then run:
+```bash
+mlxlmprobe
+```
+
+### Option 3: From Source
 
 ```bash
 git clone https://github.com/scouzi1966/MLXLMProbe.git
 cd MLXLMProbe
-```
-
-### Step 3: Create a Virtual Environment (Recommended)
-
-```bash
-# Create virtual environment
-python3 -m venv venv
-
-# Activate it
-source venv/bin/activate
-
-# Verify activation (should show path to venv)
-which python
-```
-
-### Step 4: Install Dependencies
-
-```bash
-# Upgrade pip first
-pip install --upgrade pip
-
-# Install all requirements
 pip install -r requirements.txt
+streamlit run mlxlmprobe.py
 ```
 
-This installs:
-- `mlx` - Apple's ML framework for Apple Silicon
-- `mlx-lm` - Language model utilities for MLX
-- `streamlit` - Web UI framework
-- `plotly` - Interactive charts
-- `pandas` - Data manipulation
-- `scikit-learn` - PCA for embeddings
-- `huggingface-hub` - Model downloading
-- `fpdf2` - PDF export
+## Quick Start
 
-### Step 5: Run MLXLMProbe
+1. Run `mlxlmprobe` - the UI opens in your browser at `http://localhost:8501`
+2. Select a model from the sidebar (or enter a HuggingFace model ID)
+3. Enter a prompt and click "Run Probe"
+4. Explore the analysis tabs
 
-```bash
-# Start the web UI (will open in browser)
-streamlit run probe.py
-```
-
-The app will open at `http://localhost:8501`
-
-### Step 6: Load a Model
+### Load a Model
 
 **Option A: Use the sidebar to enter a HuggingFace model ID**
 
@@ -129,13 +101,13 @@ Popular MLX models from [mlx-community](https://huggingface.co/mlx-community):
 **Option B: Specify model on command line**
 
 ```bash
-streamlit run probe.py -- --model mlx-community/Llama-3.2-1B-Instruct-4bit
+mlxlmprobe -- --model mlx-community/Llama-3.2-1B-Instruct-4bit
 ```
 
 **Option C: Use a local model path**
 
 ```bash
-streamlit run probe.py -- --model /path/to/your/mlx-model
+mlxlmprobe -- --model /path/to/your/mlx-model
 ```
 
 ## Usage Guide
@@ -165,7 +137,7 @@ For Mixture-of-Experts models (like Mixtral), the MoE tab shows:
 ### Command Line Options
 
 ```bash
-streamlit run probe.py -- --help
+mlxlmprobe -- --help
 
 Options:
   --model PATH         Path or HuggingFace ID of MLX model
@@ -200,7 +172,7 @@ MLX only works on Apple Silicon Macs. Verify with `uname -m` (should be `arm64`)
 pkill -f streamlit
 
 # Try a different port
-streamlit run probe.py --server.port 8502
+mlxlmprobe --server.port 8502
 ```
 
 ## How It Works

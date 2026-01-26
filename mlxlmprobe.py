@@ -6220,7 +6220,8 @@ def metric_help(key: str) -> str:
 # Streamlit App
 # =============================================================================
 
-def main():
+def _streamlit_app():
+    """Main Streamlit application."""
     st.set_page_config(
         page_title="MLXLMProbe",
         page_icon="🔬",
@@ -9550,5 +9551,27 @@ The timeline will be captured automatically during generation.
             st.warning("Install fpdf2 for PDF export: `pip install fpdf2`")
 
 
+def main():
+    """CLI entry point for Homebrew/pip installation - launches Streamlit."""
+    import sys
+    import os
+    from streamlit.web import cli as stcli
+
+    app_path = os.path.abspath(__file__)
+    sys.argv = ["streamlit", "run", app_path, "--"] + sys.argv[1:]
+    sys.exit(stcli.main())
+
+
 if __name__ == "__main__":
-    main()
+    # Check if we're inside Streamlit runtime
+    try:
+        from streamlit.runtime.scriptrunner import get_script_run_ctx
+        if get_script_run_ctx() is not None:
+            # Running inside Streamlit - execute the app
+            _streamlit_app()
+        else:
+            # Running from command line - launch Streamlit
+            main()
+    except Exception:
+        # Fallback - launch Streamlit
+        main()
