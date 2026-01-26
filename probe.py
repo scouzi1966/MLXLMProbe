@@ -4356,12 +4356,15 @@ def plot_moe_expert_path(results: ProbeResults, token_position: int, tokenizer=N
                 if li > 0 and top_experts_per_layer[li-1]:
                     prev_expert, prev_weight = top_experts_per_layer[li-1][0]  # Connect to top-1
                     prev_x = prev_expert / num_experts
+                    # Thicker lines that are visible on both dark and light themes
+                    # Use cyan/teal color that contrasts well with warm markers
+                    line_width = 2 + weight * 4  # Base width 2, scales with weight
                     fig.add_trace(
                         go.Scatter(
                             x=[prev_x, x_pos],
                             y=[li-1, li],
                             mode='lines',
-                            line=dict(width=weight*3, color='rgba(100,100,100,0.3)'),
+                            line=dict(width=line_width, color='rgba(100,180,220,0.6)'),
                             hoverinfo='skip',
                             showlegend=False
                         ),
