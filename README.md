@@ -3,6 +3,8 @@
 ## TLDR install 
 brew install scouzi1966/afm/mlxlmprobe
 
+mlxlmprobe to run - That's it!
+
 A visual probing and interpretability tool for MLX language models on Apple Silicon.
 
 > **Status:** Work in Progress - Currently testing with GPT-OSS and other MoE models
