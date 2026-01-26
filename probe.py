@@ -6103,11 +6103,31 @@ def main():
             # Set true zeros (causal mask) to NaN so they render as transparent/background
             attn_display[attn_matrix == 0] = np.nan
 
+            # Custom colorscale optimized for attention patterns
+            # More color variation in the low range (0-0.5) where most values cluster
+            attention_colorscale = [
+                [0.0, '#000000'],   # Black at 0
+                [0.08, '#0d0887'],  # Dark blue
+                [0.16, '#3b0f8c'],  # Blue-purple
+                [0.24, '#5c179e'],  # Purple
+                [0.32, '#7c22a4'],  # Magenta-purple
+                [0.40, '#9b2a9f'],  # Magenta
+                [0.48, '#b93389'],  # Pink-magenta
+                [0.56, '#d44467'],  # Pink-red
+                [0.64, '#e8614c'],  # Red-orange
+                [0.72, '#f58438'],  # Orange
+                [0.80, '#fca736'],  # Yellow-orange
+                [0.90, '#f6d644'],  # Yellow
+                [1.0, '#f0f921'],   # Bright yellow
+            ]
+
             fig = go.Figure(data=go.Heatmap(
                 z=attn_display,
                 x=token_labels,
                 y=token_labels,
-                colorscale='Inferno',
+                colorscale=attention_colorscale,
+                zmin=0,
+                zmax=1,
                 colorbar=dict(
                     title="Weight",
                     tickvals=[0, 0.316, 0.447, 0.548, 0.707, 1.0],  # sqrt of 0, 0.1, 0.2, 0.3, 0.5, 1.0
