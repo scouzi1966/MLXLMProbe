@@ -771,6 +771,90 @@ class ProbeResults:
     n_attention_heads: int = 0
     n_kv_heads: int = 0
 
+    # Generation Replay timeline (for replay feature)
+    generation_timeline: Optional["GenerationTimeline"] = None
+
+
+# =============================================================================
+# Causal Tracing Data Structures (Knowledge Localization)
+# =============================================================================
+
+@dataclass
+class CausalTraceConfig:
+    """Configuration for causal tracing experiments."""
+    noise_multiplier: float = 3.0  # Noise scale relative to embedding std
+    subject_positions: Optional[List[int]] = None  # Positions to corrupt (auto-detect if None)
+    target_token_id: Optional[int] = None  # Token to measure probability for
+    sample_layers: bool = True  # Sample layers instead of all (for speed)
+    layer_sample_rate: int = 2  # Every Nth layer when sampling
+    sample_positions: bool = True  # Sample positions instead of all
+    position_sample_rate: int = 2  # Every Nth position when sampling
+
+
+@dataclass
+class CausalTraceResults:
+    """Results from causal tracing experiment."""
+    query_text: str = ""
+    subject_text: str = ""
+    target_token: str = ""
+    target_token_id: int = 0
+
+    # Core measurements
+    clean_prob: float = 0.0  # P(target) with no corruption
+    corrupted_prob: float = 0.0  # P(target) with subject corrupted
+    indirect_effects: Optional[np.ndarray] = None  # (num_layers, seq_len) recovery matrix
+
+    # Critical site (max recovery)
+    critical_layer: int = 0
+    critical_position: int = 0
+    max_recovery: float = 0.0
+
+    # Metadata
+    subject_positions: List[int] = field(default_factory=list)
+    layers_tested: List[int] = field(default_factory=list)
+    positions_tested: List[int] = field(default_factory=list)
+    num_forward_passes: int = 0
+
+
+# =============================================================================
+# Generation Replay Data Structures
+# =============================================================================
+
+@dataclass
+class GenerationStepState:
+    """State captured at a single generation step."""
+    step_index: int
+    token_id: int
+    token_text: str
+    logits: Optional[np.ndarray] = None  # Full logits at this step (optional, memory-intensive)
+    top_k_alternatives: List[Tuple[int, float, str]] = field(default_factory=list)  # (id, prob, text)
+    layer_outputs: Optional[Dict[int, np.ndarray]] = None  # Sampled layer outputs
+    cumulative_tokens: List[int] = field(default_factory=list)  # All tokens up to this point
+    probability: float = 0.0  # Probability of chosen token
+
+
+@dataclass
+class GenerationTimeline:
+    """Timeline of generation steps, supporting branching."""
+    timeline_id: str = ""
+    steps: List[GenerationStepState] = field(default_factory=list)
+    parent_timeline_id: Optional[str] = None  # For branches
+    branch_point_step: Optional[int] = None  # Step index where this branch diverged
+    input_tokens: List[int] = field(default_factory=list)
+    input_text: str = ""
+    debug_info: List[str] = field(default_factory=list)  # Debug information for branches
+
+
+@dataclass
+class ReplayCaptureConfig:
+    """Configuration for generation replay capture."""
+    mode: str = "minimal"  # minimal/standard/full
+    layer_sample_rate: int = 4  # Capture every Nth layer in standard mode
+    max_memory_mb: float = 100.0  # Memory limit for capture
+    capture_logits: bool = False  # Only in full mode
+    capture_layer_outputs: bool = False  # Only in standard/full mode
+    top_k_alternatives: int = 10  # Number of alternatives to capture
+
 
 # =============================================================================
 # Model Prober
@@ -1200,6 +1284,126 @@ def format_topology_display(topology: Dict[str, Any]) -> str:
         lines.append(" | ".join(tok_info))
 
     return "\n".join(lines)
+
+
+def calculate_transformer_flops(
+    topology: Dict[str, Any],
+    seq_len: int,
+    is_prefill: bool = True,
+    num_new_tokens: int = 1
+) -> Dict[str, int]:
+    """
+    Calculate FLOPs for transformer inference.
+
+    Args:
+        topology: Model topology dict with config
+        seq_len: Current sequence length (including KV cache)
+        is_prefill: True for initial prompt processing, False for generation
+        num_new_tokens: Number of new tokens being processed (1 for generation)
+
+    Returns:
+        Dict with breakdown of FLOPs by component
+    """
+    cfg = topology.get("config", {})
+
+    # Extract model dimensions
+    d_model = cfg.get("hidden_size", 4096)
+    n_layers = cfg.get("num_hidden_layers", 32)
+    n_heads = cfg.get("num_attention_heads", 32)
+    n_kv_heads = cfg.get("num_key_value_heads", n_heads)
+    d_head = cfg.get("head_dim", d_model // n_heads)
+    d_ff = cfg.get("intermediate_size", d_model * 4)
+    vocab_size = cfg.get("vocab_size", 32000)
+
+    # MoE parameters
+    is_moe = topology.get("is_moe", False)
+    num_experts = cfg.get("num_local_experts") or cfg.get("num_experts") or cfg.get("n_routed_experts") or 0
+    top_k = cfg.get("num_experts_per_tok") or cfg.get("num_selected_experts") or 2
+    moe_intermediate = cfg.get("moe_intermediate_size", d_ff)
+
+    flops = {
+        "attention_qkv": 0,
+        "attention_scores": 0,
+        "attention_output": 0,
+        "ffn": 0,
+        "router": 0,
+        "lm_head": 0,
+        "total": 0
+    }
+
+    # For prefill: process all tokens
+    # For generation: process only new token(s) but attention spans full seq_len
+    tokens_to_process = seq_len if is_prefill else num_new_tokens
+
+    # Per layer calculations
+    for _ in range(n_layers):
+        # QKV projections (2 for multiply-add)
+        # Q: always computed for new tokens
+        q_flops = 2 * tokens_to_process * d_model * (n_heads * d_head)
+
+        if is_prefill:
+            # K, V computed for all tokens
+            k_flops = 2 * tokens_to_process * d_model * (n_kv_heads * d_head)
+            v_flops = 2 * tokens_to_process * d_model * (n_kv_heads * d_head)
+        else:
+            # K, V only for new token (cached for previous)
+            k_flops = 2 * num_new_tokens * d_model * (n_kv_heads * d_head)
+            v_flops = 2 * num_new_tokens * d_model * (n_kv_heads * d_head)
+
+        flops["attention_qkv"] += q_flops + k_flops + v_flops
+
+        # Attention scores: Q @ K^T
+        # Shape: (tokens_to_process, n_heads, d_head) @ (n_heads, d_head, seq_len)
+        # Each query attends to all keys (full seq_len for KV cache)
+        attn_seq_len = seq_len  # Always attend to full sequence
+        flops["attention_scores"] += 2 * tokens_to_process * n_heads * d_head * attn_seq_len
+
+        # Attention output: attn_weights @ V
+        flops["attention_output"] += 2 * tokens_to_process * n_heads * attn_seq_len * d_head
+
+        # Output projection
+        flops["attention_output"] += 2 * tokens_to_process * (n_heads * d_head) * d_model
+
+        # FFN / MoE
+        if is_moe and num_experts > 0:
+            # Router: compute scores for all experts
+            flops["router"] += 2 * tokens_to_process * d_model * num_experts
+
+            # Only top_k experts are activated per token
+            # SwiGLU: gate, up, down projections
+            expert_flops = 2 * tokens_to_process * d_model * moe_intermediate  # gate
+            expert_flops += 2 * tokens_to_process * d_model * moe_intermediate  # up
+            expert_flops += 2 * tokens_to_process * moe_intermediate * d_model  # down
+            flops["ffn"] += expert_flops * top_k
+        else:
+            # Standard FFN (SwiGLU)
+            flops["ffn"] += 2 * tokens_to_process * d_model * d_ff  # gate
+            flops["ffn"] += 2 * tokens_to_process * d_model * d_ff  # up
+            flops["ffn"] += 2 * tokens_to_process * d_ff * d_model  # down
+
+    # LM head projection
+    flops["lm_head"] = 2 * tokens_to_process * d_model * vocab_size
+
+    # Total
+    flops["total"] = sum(flops.values())
+
+    return flops
+
+
+def format_flops(flops: int) -> str:
+    """Format FLOPs with appropriate unit."""
+    if flops >= 1e15:
+        return f"{flops/1e15:.2f} PFLOPs"
+    elif flops >= 1e12:
+        return f"{flops/1e12:.2f} TFLOPs"
+    elif flops >= 1e9:
+        return f"{flops/1e9:.2f} GFLOPs"
+    elif flops >= 1e6:
+        return f"{flops/1e6:.2f} MFLOPs"
+    elif flops >= 1e3:
+        return f"{flops/1e3:.2f} KFLOPs"
+    else:
+        return f"{flops} FLOPs"
 
 
 class ModelProber:
@@ -1943,6 +2147,804 @@ class ModelProber:
 
         return self.results
 
+    def probe_with_generation_replay(
+        self,
+        prompt: str,
+        max_tokens: int = 50,
+        temperature: float = 0.0,
+        capture_config: Optional["ReplayCaptureConfig"] = None
+    ) -> ProbeResults:
+        """
+        Run inference with generation, capturing per-step states for replay.
+
+        This method extends probe_with_generation to store detailed state
+        at each generation step, enabling timeline replay and branching.
+
+        Args:
+            prompt: Input prompt text
+            max_tokens: Maximum tokens to generate
+            temperature: Sampling temperature (0 = greedy)
+            capture_config: Configuration for what to capture
+
+        Returns:
+            ProbeResults with generation_timeline populated
+        """
+        import uuid
+
+        capture_config = capture_config or ReplayCaptureConfig()
+        self.reset_results()
+
+        # Tokenize input
+        if hasattr(self.tokenizer, 'encode'):
+            tokens = self.tokenizer.encode(prompt)
+        else:
+            tokens = self.tokenizer(prompt)
+
+        if isinstance(tokens, dict):
+            tokens = tokens['input_ids']
+
+        self.results.input_tokens = list(tokens)
+        self.results.input_text = prompt
+
+        # Initialize timeline
+        timeline = GenerationTimeline(
+            timeline_id=str(uuid.uuid4())[:8],
+            input_tokens=list(tokens),
+            input_text=prompt
+        )
+
+        try:
+            x = mx.array([tokens])
+
+            # Initial forward pass
+            logits = self.model(x)
+            mx.eval(logits)
+            vocab_size = logits.shape[-1]
+
+            # Create cache for efficient generation
+            cache = None
+            if hasattr(self.model, 'make_cache'):
+                cache = self.model.make_cache()
+                logits = self.model(x, cache=cache)
+                mx.eval(logits)
+
+            # Capture initial top-k predictions
+            initial_logits = logits[0, -1, :]
+            probs = mx.softmax(initial_logits, axis=-1)
+            mx.eval(probs)
+            probs_np = np.array(probs.astype(mx.float32).tolist(), dtype=np.float32)
+
+            # Store logits for results
+            self.results.logits = np.array(initial_logits.astype(mx.float32).tolist(), dtype=np.float32)
+            self.results.token_probs = probs_np
+
+            # Get top-k for results
+            top_indices = mx.argsort(probs)[-20:][::-1]
+            mx.eval(top_indices)
+            self.results.top_k_tokens = []
+            for idx in top_indices.tolist():
+                idx_int = int(idx)
+                if 0 <= idx_int < vocab_size:
+                    prob_val = float(probs_np[idx_int])
+                    tok_text = self.decode_token(idx_int)
+                    if not tok_text or tok_text.isspace():
+                        tok_text = f"<{idx_int}>"
+                    self.results.top_k_tokens.append((idx_int, prob_val, tok_text))
+
+            # Generate tokens step by step with state capture
+            generated = []
+            per_token_alts = []
+            current_tokens = list(tokens)
+
+            for gen_step in range(max_tokens):
+                # Get probabilities at current position
+                step_logits = logits[0, -1, :]
+                step_probs = mx.softmax(step_logits, axis=-1)
+                mx.eval(step_probs)
+                step_probs_np = np.array(step_probs.astype(mx.float32).tolist(), dtype=np.float32)
+
+                # Capture top-k alternatives
+                top_k_count = capture_config.top_k_alternatives
+                top_idx = mx.argsort(step_probs)[-top_k_count:][::-1]
+                mx.eval(top_idx)
+
+                alternatives = []
+                for idx in top_idx.tolist():
+                    idx_int = int(idx)
+                    if 0 <= idx_int < vocab_size:
+                        prob_val = float(step_probs_np[idx_int])
+                        tok_text = self.decode_token(idx_int)
+                        alternatives.append((idx_int, prob_val, tok_text))
+
+                per_token_alts.append(alternatives)
+
+                # Sample next token
+                if temperature == 0:
+                    next_token = mx.argmax(step_logits)
+                else:
+                    scaled_logits = step_logits / temperature
+                    next_token = mx.random.categorical(scaled_logits.reshape(1, -1))[0]
+
+                mx.eval(next_token)
+                next_token_int = int(next_token)
+
+                if next_token_int < 0 or next_token_int >= vocab_size:
+                    break
+
+                generated.append(next_token_int)
+                current_tokens.append(next_token_int)
+
+                # Create step state
+                step_state = GenerationStepState(
+                    step_index=gen_step,
+                    token_id=next_token_int,
+                    token_text=self.decode_token(next_token_int),
+                    top_k_alternatives=alternatives,
+                    cumulative_tokens=list(current_tokens),
+                    probability=float(step_probs_np[next_token_int])
+                )
+
+                # Capture layer outputs if in standard/full mode
+                if capture_config.capture_layer_outputs and capture_config.mode in ['standard', 'full']:
+                    # Sample layers based on config
+                    layer_outputs = {}
+                    for layer_idx in range(0, len(self.layers), capture_config.layer_sample_rate):
+                        if layer_idx in self.results.layer_outputs:
+                            # Take last position only to save memory
+                            layer_outputs[layer_idx] = self.results.layer_outputs[layer_idx][..., -1:, :]
+                    step_state.layer_outputs = layer_outputs if layer_outputs else None
+
+                # Capture logits if in full mode
+                if capture_config.capture_logits and capture_config.mode == 'full':
+                    step_state.logits = step_probs_np.copy()
+
+                timeline.steps.append(step_state)
+
+                # Check for EOS tokens
+                eos_tokens = []
+                if hasattr(self.tokenizer, 'eos_token_id'):
+                    eos_id = self.tokenizer.eos_token_id
+                    if isinstance(eos_id, int):
+                        eos_tokens.append(eos_id)
+                    elif isinstance(eos_id, list):
+                        eos_tokens.extend(eos_id)
+
+                if next_token_int in eos_tokens:
+                    break
+
+                # Check for reasoning model stop conditions
+                current_text = self._safe_decode(generated)
+                reasoning_fmt = detect_reasoning_format(current_text)
+                if reasoning_fmt and reasoning_fmt.should_stop(current_text):
+                    break
+
+                # Repetition detection
+                if len(generated) >= 10:
+                    last_5 = generated[-5:]
+                    prev_5 = generated[-10:-5]
+                    if last_5 == prev_5:
+                        break
+
+                # Next forward pass
+                next_x = next_token.reshape(1, 1)
+                if cache is not None:
+                    logits = self.model(next_x, cache=cache)
+                else:
+                    x = mx.concatenate([x, next_x], axis=1)
+                    logits = self.model(x)
+                mx.eval(logits)
+
+            # Store generation results
+            self.results.generated_tokens = generated
+            self.results.generated_text = self._safe_decode(generated)
+            self.results.per_token_alternatives = per_token_alts
+            self.results.generation_timeline = timeline
+
+            # Parse reasoning vs answer
+            reasoning, answer = parse_reasoning_output(self.results.generated_text)
+            self.results.reasoning_text = reasoning
+            self.results.answer_text = answer if answer else self.results.generated_text
+
+        except Exception as e:
+            import traceback
+            self.results.generated_text = f"(Generation error: {str(e)})"
+            self.results.reasoning_text = ""
+            self.results.answer_text = ""
+            self.results.generated_tokens = []
+
+        # Capture layer activations on full sequence
+        try:
+            saved_logits = self.results.logits
+            saved_token_probs = self.results.token_probs
+            saved_top_k_tokens = self.results.top_k_tokens
+            saved_timeline = self.results.generation_timeline
+
+            full_tokens = list(tokens) + self.results.generated_tokens
+            x = mx.array([full_tokens])
+            self._capture_activations(x)
+
+            self.results.logits = saved_logits
+            self.results.token_probs = saved_token_probs
+            self.results.top_k_tokens = saved_top_k_tokens
+            self.results.generation_timeline = saved_timeline
+        except:
+            pass
+
+        return self.results
+
+    def generate_from_branch(
+        self,
+        timeline: "GenerationTimeline",
+        branch_step: int,
+        alternative_token_id: int,
+        max_tokens: int = 50,
+        temperature: float = 0.0,
+        capture_config: Optional["ReplayCaptureConfig"] = None
+    ) -> "GenerationTimeline":
+        """
+        Generate a new timeline branch from a specific step with an alternative token.
+
+        Args:
+            timeline: The original timeline to branch from
+            branch_step: Step index where to branch
+            alternative_token_id: Alternative token to use instead of original
+            max_tokens: Maximum additional tokens to generate
+            temperature: Sampling temperature
+            capture_config: Capture configuration
+
+        Returns:
+            New GenerationTimeline representing the branch
+        """
+        import uuid
+
+        capture_config = capture_config or ReplayCaptureConfig()
+
+        # Build tokens up to branch point, then substitute
+        tokens_to_branch = timeline.input_tokens.copy()
+        for i, step in enumerate(timeline.steps):
+            if i < branch_step:
+                tokens_to_branch.append(step.token_id)
+            elif i == branch_step:
+                tokens_to_branch.append(alternative_token_id)
+                break
+
+        # Create new timeline
+        new_timeline = GenerationTimeline(
+            timeline_id=str(uuid.uuid4())[:8],
+            parent_timeline_id=timeline.timeline_id,
+            branch_point_step=branch_step,
+            input_tokens=timeline.input_tokens.copy(),
+            input_text=timeline.input_text
+        )
+
+        # Copy steps up to branch point
+        for i, step in enumerate(timeline.steps):
+            if i < branch_step:
+                new_timeline.steps.append(step)
+
+        # Add the branch step with alternative token
+        branch_step_state = GenerationStepState(
+            step_index=branch_step,
+            token_id=alternative_token_id,
+            token_text=self.decode_token(alternative_token_id),
+            cumulative_tokens=tokens_to_branch.copy()
+        )
+        new_timeline.steps.append(branch_step_state)
+
+        # Store debug info in the timeline for UI display
+        new_timeline.debug_info = []
+        new_timeline.debug_info.append(f"Branch step: {branch_step}")
+        new_timeline.debug_info.append(f"Original token: '{timeline.steps[branch_step].token_text}' (ID: {timeline.steps[branch_step].token_id})")
+        new_timeline.debug_info.append(f"Alternative token: '{self.decode_token(alternative_token_id)}' (ID: {alternative_token_id})")
+        new_timeline.debug_info.append(f"Full context length: {len(tokens_to_branch)} tokens")
+
+        # Verify the alternative token is in the context
+        if tokens_to_branch[-1] == alternative_token_id:
+            new_timeline.debug_info.append("✓ Alternative token correctly placed at end of context")
+        else:
+            new_timeline.debug_info.append(f"⚠️ Context ends with token ID {tokens_to_branch[-1]}, not {alternative_token_id}")
+
+        # Show last 5 tokens of context for debugging
+        last_tokens = tokens_to_branch[-5:] if len(tokens_to_branch) >= 5 else tokens_to_branch
+        last_tokens_text = [self.decode_token(t) for t in last_tokens]
+        new_timeline.debug_info.append(f"Last 5 context tokens: {last_tokens_text}")
+
+        # Show what the original had at this position vs what we're using
+        if branch_step < len(timeline.steps):
+            orig_tok = timeline.steps[branch_step].token_id
+            new_timeline.debug_info.append(f"Original context had: '{self.decode_token(orig_tok)}' (ID: {orig_tok})")
+            new_timeline.debug_info.append(f"Branch context now has: '{self.decode_token(alternative_token_id)}' (ID: {alternative_token_id})")
+
+        # Generate continuation - treat as FRESH inference with full context
+        try:
+            # Create fresh array - this is a NEW conversation context
+            x = mx.array([tokens_to_branch])
+
+            # Fresh forward pass on complete context (input + generated up to branch + alternative)
+            # No cache reuse - clean slate
+            logits = self.model(x)
+            mx.eval(logits)
+            vocab_size = logits.shape[-1]
+
+            # Create NEW cache for this branch's generation
+            cache = None
+            if hasattr(self.model, 'make_cache'):
+                cache = self.model.make_cache()
+                # Populate fresh cache with the branched context
+                logits = self.model(x, cache=cache)
+                mx.eval(logits)
+
+            # Debug: Show what model predicts for step N+1 (given injected token at step N)
+            first_pred = int(mx.argmax(logits[0, -1, :]))
+            first_pred_text = self.decode_token(first_pred)
+            new_timeline.debug_info.append(f"Step {branch_step}: INJECTED '{self.decode_token(alternative_token_id)}' (replacing '{timeline.steps[branch_step].token_text}')")
+            new_timeline.debug_info.append(f"Step {branch_step + 1}: Model predicts '{first_pred_text}' (ID: {first_pred})")
+
+            # Compare with what original timeline had at step N+1
+            if branch_step + 1 < len(timeline.steps):
+                orig_next = timeline.steps[branch_step + 1]
+                new_timeline.debug_info.append(f"Step {branch_step + 1} in original was: '{orig_next.token_text}' (ID: {orig_next.token_id})")
+                if first_pred == orig_next.token_id:
+                    new_timeline.debug_info.append("⚠️ Despite different input, model predicts SAME continuation")
+                else:
+                    new_timeline.debug_info.append("✓ Different input leads to DIFFERENT continuation")
+
+            current_tokens = tokens_to_branch.copy()
+
+            for gen_step in range(max_tokens):
+                step_logits = logits[0, -1, :]
+                step_probs = mx.softmax(step_logits, axis=-1)
+                mx.eval(step_probs)
+                step_probs_np = np.array(step_probs.astype(mx.float32).tolist(), dtype=np.float32)
+
+                # Get alternatives
+                top_idx = mx.argsort(step_probs)[-capture_config.top_k_alternatives:][::-1]
+                mx.eval(top_idx)
+                alternatives = []
+                for idx in top_idx.tolist():
+                    idx_int = int(idx)
+                    if 0 <= idx_int < vocab_size:
+                        alternatives.append((idx_int, float(step_probs_np[idx_int]), self.decode_token(idx_int)))
+
+                # Sample next token
+                if temperature == 0:
+                    next_token = mx.argmax(step_logits)
+                else:
+                    scaled_logits = step_logits / temperature
+                    next_token = mx.random.categorical(scaled_logits.reshape(1, -1))[0]
+
+                mx.eval(next_token)
+                next_token_int = int(next_token)
+
+                if next_token_int < 0 or next_token_int >= vocab_size:
+                    break
+
+                current_tokens.append(next_token_int)
+
+                step_state = GenerationStepState(
+                    step_index=branch_step + 1 + gen_step,
+                    token_id=next_token_int,
+                    token_text=self.decode_token(next_token_int),
+                    top_k_alternatives=alternatives,
+                    cumulative_tokens=current_tokens.copy(),
+                    probability=float(step_probs_np[next_token_int])
+                )
+                new_timeline.steps.append(step_state)
+
+                # Check for EOS
+                if hasattr(self.tokenizer, 'eos_token_id'):
+                    eos_id = self.tokenizer.eos_token_id
+                    if isinstance(eos_id, int) and next_token_int == eos_id:
+                        break
+                    elif isinstance(eos_id, list) and next_token_int in eos_id:
+                        break
+
+                # Next pass
+                next_x = next_token.reshape(1, 1)
+                if cache is not None:
+                    logits = self.model(next_x, cache=cache)
+                else:
+                    x = mx.concatenate([x, next_x], axis=1)
+                    logits = self.model(x)
+                mx.eval(logits)
+
+        except Exception as e:
+            new_timeline.debug_info.append(f"❌ ERROR during generation: {str(e)}")
+            import traceback
+            new_timeline.debug_info.append(traceback.format_exc())
+
+        # Add summary
+        gen_count = len(new_timeline.steps) - branch_step - 1
+        new_timeline.debug_info.append(f"Generated {gen_count} continuation tokens")
+
+        return new_timeline
+
+
+# =============================================================================
+# Causal Tracer (Knowledge Localization)
+# =============================================================================
+
+class CausalTracer:
+    """
+    Implements causal tracing for knowledge localization (ROME-style).
+
+    Given a factual query like "The capital of France is [MASK]", identifies
+    which layers and positions store that knowledge by:
+    1. Clean run: Get P(target) with no corruption
+    2. Corrupted run: Add noise to subject tokens, P(target) drops
+    3. Restore run: For each (layer, position), restore clean state and measure recovery
+
+    Reference: https://rome.baulab.info/
+    """
+
+    def __init__(self, model, tokenizer, topology: Optional[Dict] = None):
+        self.model = model
+        self.tokenizer = tokenizer
+        self.topology = topology or {}
+
+        # Get inner model
+        if hasattr(model, 'model'):
+            self.inner_model = model.model
+        else:
+            self.inner_model = model
+
+        # Get layers
+        if hasattr(self.inner_model, 'layers'):
+            self.layers = list(self.inner_model.layers)
+        else:
+            self.layers = []
+
+        # Get embedding
+        if hasattr(self.inner_model, 'embed_tokens'):
+            self.embedding = self.inner_model.embed_tokens
+        elif hasattr(self.inner_model, 'wte'):
+            self.embedding = self.inner_model.wte
+        else:
+            self.embedding = None
+
+        # Get output norm
+        if hasattr(self.inner_model, 'norm'):
+            self.output_norm = self.inner_model.norm
+        elif hasattr(self.inner_model, 'ln_f'):
+            self.output_norm = self.inner_model.ln_f
+        else:
+            self.output_norm = None
+
+        self.num_layers = len(self.layers)
+
+    def _tokenize(self, text: str) -> List[int]:
+        """Tokenize text."""
+        if hasattr(self.tokenizer, 'encode'):
+            tokens = self.tokenizer.encode(text)
+        else:
+            tokens = self.tokenizer(text)
+        if isinstance(tokens, dict):
+            tokens = tokens['input_ids']
+        return list(tokens)
+
+    def _decode(self, token_id: int) -> str:
+        """Decode single token."""
+        try:
+            if hasattr(self.tokenizer, 'decode'):
+                return self.tokenizer.decode([token_id])
+            return f"[{token_id}]"
+        except:
+            return f"[{token_id}]"
+
+    def _get_embedding_std(self) -> float:
+        """Get standard deviation of embeddings for noise calibration."""
+        if self.embedding is None:
+            return 1.0
+        try:
+            weight = self.embedding.weight
+            mx.eval(weight)
+            # Sample a subset of embeddings for efficiency
+            sample_indices = mx.arange(0, min(1000, weight.shape[0]))
+            sample = weight[sample_indices]
+            std = float(mx.std(sample.astype(mx.float32)))
+            return std if std > 0 else 1.0
+        except:
+            return 1.0
+
+    def _forward_with_intervention(
+        self,
+        tokens: mx.array,
+        clean_embeddings: mx.array,
+        corrupted_embeddings: mx.array,
+        restore_layer: Optional[int] = None,
+        restore_positions: Optional[List[int]] = None
+    ) -> mx.array:
+        """
+        Run forward pass with optional intervention.
+
+        If restore_layer/positions specified, start with corrupted embeddings
+        but restore clean activations at specified layer and positions.
+        """
+        # Start with corrupted or clean embeddings
+        if restore_layer is not None:
+            h = corrupted_embeddings
+        else:
+            h = clean_embeddings
+
+        # Process through layers
+        for i, layer in enumerate(self.layers):
+            # At the restore layer, blend in clean activations for specific positions
+            if restore_layer is not None and i == restore_layer and restore_positions:
+                # We need the clean activation at this layer
+                # Run clean path up to this layer
+                h_clean = clean_embeddings
+                for j in range(i):
+                    try:
+                        h_clean = self.layers[j](h_clean, mask=None, cache=None)
+                    except TypeError:
+                        try:
+                            h_clean = self.layers[j](h_clean)
+                        except:
+                            pass
+                    if isinstance(h_clean, tuple):
+                        h_clean = h_clean[0]
+                mx.eval(h_clean)
+
+                # Restore clean activations at specified positions
+                for pos in restore_positions:
+                    if pos < h.shape[1]:
+                        # h[:, pos, :] = h_clean[:, pos, :]
+                        h = mx.concatenate([
+                            h[:, :pos, :],
+                            h_clean[:, pos:pos+1, :],
+                            h[:, pos+1:, :]
+                        ], axis=1)
+                mx.eval(h)
+
+            # Forward through layer
+            try:
+                h = layer(h, mask=None, cache=None)
+            except TypeError:
+                try:
+                    h = layer(h)
+                except:
+                    continue
+
+            if isinstance(h, tuple):
+                h = h[0]
+            mx.eval(h)
+
+        # Output normalization
+        if self.output_norm is not None:
+            h = self.output_norm(h)
+            mx.eval(h)
+
+        # Get logits
+        if hasattr(self.embedding, 'as_linear'):
+            logits = self.embedding.as_linear(h)
+        elif hasattr(self.model, 'lm_head'):
+            logits = self.model.lm_head(h)
+        else:
+            logits = h
+
+        mx.eval(logits)
+        return logits
+
+    def _get_target_prob(self, logits: mx.array, target_token_id: int, position: int = -1) -> float:
+        """Get probability of target token at specified position."""
+        # Get logits at position (default: last)
+        if position == -1:
+            step_logits = logits[0, -1, :]
+        else:
+            step_logits = logits[0, position, :]
+
+        # Softmax to get probabilities
+        probs = mx.softmax(step_logits, axis=-1)
+        mx.eval(probs)
+
+        # Get target probability
+        target_prob = float(probs[target_token_id])
+        return target_prob
+
+    def detect_subject_positions(self, text: str, subject: str) -> List[int]:
+        """Auto-detect subject token positions in the text."""
+        # Tokenize full text and subject
+        full_tokens = self._tokenize(text)
+        subject_tokens = self._tokenize(subject)
+
+        # Find subject tokens in full sequence
+        positions = []
+        for i in range(len(full_tokens) - len(subject_tokens) + 1):
+            if full_tokens[i:i+len(subject_tokens)] == subject_tokens:
+                positions.extend(range(i, i + len(subject_tokens)))
+                break
+
+        # If no exact match, try to find partial overlap
+        if not positions:
+            # Look for individual subject tokens
+            for i, tok in enumerate(full_tokens):
+                tok_text = self._decode(tok).lower().strip()
+                if subject.lower() in tok_text or tok_text in subject.lower():
+                    positions.append(i)
+
+        return positions
+
+    def run_causal_trace(
+        self,
+        query_text: str,
+        subject: str,
+        target_token: Optional[str] = None,
+        config: Optional[CausalTraceConfig] = None,
+        progress_callback: Optional[callable] = None
+    ) -> CausalTraceResults:
+        """
+        Run causal tracing experiment.
+
+        Args:
+            query_text: The factual query (e.g., "The capital of France is")
+            subject: The subject to corrupt (e.g., "France")
+            target_token: Expected answer token (e.g., "Paris"), auto-detect if None
+            config: Tracing configuration
+            progress_callback: Optional callback(current, total) for progress updates
+        """
+        config = config or CausalTraceConfig()
+        results = CausalTraceResults()
+        results.query_text = query_text
+        results.subject_text = subject
+
+        # Tokenize
+        tokens = self._tokenize(query_text)
+        x = mx.array([tokens])
+
+        # Detect subject positions
+        if config.subject_positions:
+            subject_positions = config.subject_positions
+        else:
+            subject_positions = self.detect_subject_positions(query_text, subject)
+
+        if not subject_positions:
+            # Fallback: corrupt middle positions
+            mid = len(tokens) // 2
+            subject_positions = list(range(max(0, mid-2), min(len(tokens), mid+2)))
+
+        results.subject_positions = subject_positions
+
+        # Get clean embeddings
+        if self.embedding is None:
+            return results
+
+        clean_embeddings = self.embedding(x)
+        mx.eval(clean_embeddings)
+
+        # Create corrupted embeddings (add noise to subject positions)
+        embedding_std = self._get_embedding_std()
+        noise_scale = config.noise_multiplier * embedding_std
+
+        # Generate noise
+        noise_shape = clean_embeddings.shape
+        noise = mx.random.normal(noise_shape) * noise_scale
+        mx.eval(noise)
+
+        # Apply noise only to subject positions
+        corrupted_embeddings = clean_embeddings.astype(mx.float32)
+        for pos in subject_positions:
+            if pos < corrupted_embeddings.shape[1]:
+                # Add noise to this position
+                corrupted_embeddings = mx.concatenate([
+                    corrupted_embeddings[:, :pos, :],
+                    corrupted_embeddings[:, pos:pos+1, :] + noise[:, pos:pos+1, :],
+                    corrupted_embeddings[:, pos+1:, :]
+                ], axis=1)
+        mx.eval(corrupted_embeddings)
+
+        # Step 1: Clean run - get P(target)
+        clean_logits = self._forward_with_intervention(
+            x, clean_embeddings, corrupted_embeddings,
+            restore_layer=None, restore_positions=None
+        )
+
+        # Determine target token
+        if config.target_token_id is not None:
+            target_token_id = config.target_token_id
+        elif target_token:
+            # Try both with and without leading space - use whichever has higher prob
+            target_tokens_no_space = self._tokenize(target_token)
+            target_tokens_with_space = self._tokenize(" " + target_token)
+
+            candidates = []
+            if target_tokens_no_space:
+                tid = target_tokens_no_space[0]
+                prob = self._get_target_prob(clean_logits, tid)
+                candidates.append((tid, prob))
+            if target_tokens_with_space:
+                tid = target_tokens_with_space[0]
+                prob = self._get_target_prob(clean_logits, tid)
+                candidates.append((tid, prob))
+
+            # Pick the one with higher probability
+            if candidates:
+                candidates.sort(key=lambda x: x[1], reverse=True)
+                target_token_id = candidates[0][0]
+            else:
+                target_token_id = 0
+        else:
+            # Auto-detect: use argmax of clean logits
+            target_token_id = int(mx.argmax(clean_logits[0, -1, :]))
+
+        results.target_token_id = target_token_id
+        results.target_token = self._decode(target_token_id)
+        results.clean_prob = self._get_target_prob(clean_logits, target_token_id)
+
+        # Step 2: Corrupted run - P(target) should drop
+        corrupted_logits = self._forward_with_intervention(
+            x, corrupted_embeddings, corrupted_embeddings,
+            restore_layer=None, restore_positions=None
+        )
+        results.corrupted_prob = self._get_target_prob(corrupted_logits, target_token_id)
+
+        # Step 3: Restore runs - for each (layer, position), restore and measure recovery
+        seq_len = len(tokens)
+
+        # Determine which layers and positions to test
+        if config.sample_layers and self.num_layers > 10:
+            layers_to_test = list(range(0, self.num_layers, config.layer_sample_rate))
+            if self.num_layers - 1 not in layers_to_test:
+                layers_to_test.append(self.num_layers - 1)
+        else:
+            layers_to_test = list(range(self.num_layers))
+
+        if config.sample_positions and seq_len > 10:
+            positions_to_test = list(range(0, seq_len, config.position_sample_rate))
+            # Always include subject positions
+            for pos in subject_positions:
+                if pos not in positions_to_test:
+                    positions_to_test.append(pos)
+            positions_to_test = sorted(positions_to_test)
+            # Always include last position
+            if seq_len - 1 not in positions_to_test:
+                positions_to_test.append(seq_len - 1)
+        else:
+            positions_to_test = list(range(seq_len))
+
+        results.layers_tested = layers_to_test
+        results.positions_tested = positions_to_test
+
+        # Initialize indirect effects matrix
+        indirect_effects = np.zeros((len(layers_to_test), len(positions_to_test)))
+
+        total_passes = len(layers_to_test) * len(positions_to_test)
+        pass_count = 0
+
+        for li, layer_idx in enumerate(layers_to_test):
+            for pi, pos in enumerate(positions_to_test):
+                # Restore clean activation at this (layer, position)
+                restored_logits = self._forward_with_intervention(
+                    x, clean_embeddings, corrupted_embeddings,
+                    restore_layer=layer_idx, restore_positions=[pos]
+                )
+                restored_prob = self._get_target_prob(restored_logits, target_token_id)
+
+                # Indirect effect = recovery relative to corruption damage
+                # IE = (restored - corrupted) / (clean - corrupted)
+                damage = results.clean_prob - results.corrupted_prob
+                if abs(damage) > 1e-6:
+                    recovery = restored_prob - results.corrupted_prob
+                    ie = recovery / damage
+                else:
+                    ie = 0.0
+
+                indirect_effects[li, pi] = ie
+
+                pass_count += 1
+                if progress_callback:
+                    progress_callback(pass_count, total_passes)
+
+        results.indirect_effects = indirect_effects
+        results.num_forward_passes = 2 + total_passes  # clean + corrupted + restore runs
+
+        # Find critical site (max recovery)
+        max_idx = np.unravel_index(np.argmax(indirect_effects), indirect_effects.shape)
+        results.critical_layer = layers_to_test[max_idx[0]]
+        results.critical_position = positions_to_test[max_idx[1]]
+        results.max_recovery = float(indirect_effects[max_idx])
+
+        return results
+
 
 # =============================================================================
 # AI Interpretation Functions
@@ -2679,6 +3681,169 @@ def plot_layer_similarity(results: ProbeResults) -> go.Figure:
     return fig
 
 
+def plot_causal_trace_heatmap(
+    trace_results: CausalTraceResults,
+    tokenizer=None,
+    tokens: Optional[List[int]] = None
+) -> go.Figure:
+    """
+    Plot causal trace indirect effects heatmap.
+
+    Shows recovery of target probability when restoring clean activations
+    at each (layer, position) combination.
+
+    Args:
+        trace_results: Results from CausalTracer.run_causal_trace()
+        tokenizer: Optional tokenizer for position labels
+        tokens: Optional token list for position labels
+    """
+    if trace_results.indirect_effects is None:
+        fig = go.Figure()
+        fig.add_annotation(text="No causal trace data available", showarrow=False)
+        return fig
+
+    ie = trace_results.indirect_effects
+    layers_tested = trace_results.layers_tested
+    positions_tested = trace_results.positions_tested
+
+    # Create position labels
+    if tokenizer and tokens:
+        pos_labels = []
+        for pos in positions_tested:
+            if pos < len(tokens):
+                try:
+                    tok_text = tokenizer.decode([tokens[pos]])[:8]
+                    # Mark subject positions
+                    if pos in trace_results.subject_positions:
+                        pos_labels.append(f"{pos}:*{tok_text}*")
+                    else:
+                        pos_labels.append(f"{pos}:{tok_text}")
+                except:
+                    pos_labels.append(f"Pos {pos}")
+            else:
+                pos_labels.append(f"Pos {pos}")
+    else:
+        pos_labels = [f"Pos {p}" for p in positions_tested]
+
+    layer_labels = [f"L{l}" for l in layers_tested]
+
+    # Create heatmap
+    fig = go.Figure(data=go.Heatmap(
+        z=ie,
+        x=pos_labels,
+        y=layer_labels,
+        colorscale='RdYlBu_r',  # Red=high recovery, Blue=low
+        zmid=0.5,
+        zmin=0,
+        zmax=1,
+        colorbar=dict(title="Recovery"),
+        hovertemplate='Layer %{y}, %{x}<br>Recovery: %{z:.2%}<extra></extra>'
+    ))
+
+    # Add marker for critical site
+    crit_layer_idx = layers_tested.index(trace_results.critical_layer) if trace_results.critical_layer in layers_tested else 0
+    crit_pos_idx = positions_tested.index(trace_results.critical_position) if trace_results.critical_position in positions_tested else 0
+
+    fig.add_trace(go.Scatter(
+        x=[pos_labels[crit_pos_idx]],
+        y=[layer_labels[crit_layer_idx]],
+        mode='markers',
+        marker=dict(
+            size=20,
+            color='lime',
+            symbol='star',
+            line=dict(color='black', width=2)
+        ),
+        name=f'Critical Site ({trace_results.max_recovery:.1%})',
+        showlegend=True
+    ))
+
+    fig.update_layout(
+        title=f"Causal Trace: '{trace_results.subject_text}' → '{trace_results.target_token}'",
+        xaxis_title="Token Position (* = subject)",
+        yaxis_title="Layer",
+        height=max(400, len(layers_tested) * 25),
+        yaxis=dict(autorange='reversed')  # Layer 0 at top
+    )
+
+    return fig
+
+
+def plot_causal_trace_summary(trace_results: CausalTraceResults) -> go.Figure:
+    """
+    Plot summary statistics for causal trace results.
+
+    Shows clean vs corrupted probabilities and layer-wise max recovery.
+    """
+    if trace_results.indirect_effects is None:
+        fig = go.Figure()
+        fig.add_annotation(text="No causal trace data available", showarrow=False)
+        return fig
+
+    fig = make_subplots(
+        rows=1, cols=2,
+        subplot_titles=(
+            "Probability Comparison",
+            "Max Recovery by Layer"
+        ),
+        column_widths=[0.3, 0.7]
+    )
+
+    # Left: Bar chart of clean vs corrupted probability
+    fig.add_trace(
+        go.Bar(
+            x=['Clean', 'Corrupted'],
+            y=[trace_results.clean_prob * 100, trace_results.corrupted_prob * 100],
+            marker_color=['#2E86AB', '#E94F37'],
+            text=[f"{trace_results.clean_prob:.1%}", f"{trace_results.corrupted_prob:.1%}"],
+            textposition='auto'
+        ),
+        row=1, col=1
+    )
+
+    # Right: Line plot of max recovery per layer
+    ie = trace_results.indirect_effects
+    layers_tested = trace_results.layers_tested
+    max_recovery_per_layer = np.max(ie, axis=1)  # Max across positions
+
+    fig.add_trace(
+        go.Scatter(
+            x=[f"L{l}" for l in layers_tested],
+            y=max_recovery_per_layer * 100,
+            mode='lines+markers',
+            line=dict(color='#28A745'),
+            marker=dict(size=8),
+            name='Max Recovery'
+        ),
+        row=1, col=2
+    )
+
+    # Mark critical layer
+    crit_layer_idx = layers_tested.index(trace_results.critical_layer) if trace_results.critical_layer in layers_tested else 0
+    fig.add_trace(
+        go.Scatter(
+            x=[f"L{trace_results.critical_layer}"],
+            y=[trace_results.max_recovery * 100],
+            mode='markers',
+            marker=dict(size=15, color='gold', symbol='star', line=dict(color='black', width=2)),
+            name=f'Critical Layer'
+        ),
+        row=1, col=2
+    )
+
+    fig.update_yaxes(title_text="Probability (%)", row=1, col=1)
+    fig.update_yaxes(title_text="Recovery (%)", row=1, col=2)
+    fig.update_xaxes(title_text="Layer", row=1, col=2)
+
+    fig.update_layout(
+        height=350,
+        showlegend=True,
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+    )
+
+    return fig
+
+
 def plot_residual_stream(results: ProbeResults) -> go.Figure:
     """Plot residual stream norms and deltas."""
     if not results.residual_stream_norms:
@@ -3032,6 +4197,244 @@ def plot_moe_topk_weights(results: ProbeResults, layer_idx: int, tokenizer=None,
         )
 
     return fig
+
+
+def plot_moe_expert_path(results: ProbeResults, token_position: int, tokenizer=None) -> go.Figure:
+    """
+    Plot the expert activation path for a specific token across all MoE layers.
+    Shows which experts are activated at each layer, revealing the token's "pathway" through the network.
+    """
+    if not results.moe_router_outputs:
+        return go.Figure().add_annotation(text="No MoE routing data available", showarrow=False)
+
+    moe_layers = sorted(results.moe_router_outputs.keys())
+    if not moe_layers:
+        return go.Figure().add_annotation(text="No MoE layers found", showarrow=False)
+
+    # Get token text if available - try multiple sources
+    token_text = ""
+
+    # Try results.all_tokens first
+    if tokenizer and hasattr(results, 'all_tokens') and results.all_tokens:
+        if token_position < len(results.all_tokens):
+            try:
+                token_text = tokenizer.decode([results.all_tokens[token_position]])
+            except:
+                pass
+
+    # Try generation_timeline if available
+    if not token_text and hasattr(results, 'generation_timeline') and results.generation_timeline:
+        timeline = results.generation_timeline
+        if token_position < len(timeline.input_tokens):
+            try:
+                token_text = tokenizer.decode([timeline.input_tokens[token_position]])
+            except:
+                pass
+        elif timeline.steps:
+            gen_idx = token_position - len(timeline.input_tokens)
+            if 0 <= gen_idx < len(timeline.steps):
+                token_text = timeline.steps[gen_idx].token_text
+
+    # Clean up for display
+    if token_text:
+        token_text = token_text.replace('\n', '↵').replace('\t', '→')
+        if len(token_text) > 30:
+            token_text = token_text[:27] + "..."
+
+    # Collect expert activations for this token at each layer
+    num_experts = results.num_experts or 64
+    top_k = results.num_experts_per_tok or 2
+
+    # Build heatmap data: layers x experts
+    activation_matrix = np.zeros((len(moe_layers), num_experts))
+    layer_labels = []
+    top_experts_per_layer = []
+
+    for li, layer_idx in enumerate(moe_layers):
+        router_data = results.moe_router_outputs[layer_idx]
+        probs = router_data["probs"]
+
+        # Handle shape
+        if len(probs.shape) == 3:
+            probs = probs[0]  # Remove batch dim
+
+        if token_position < probs.shape[0]:
+            token_probs = probs[token_position]  # (num_experts,)
+            if hasattr(token_probs, 'tolist'):
+                token_probs = np.array(token_probs.tolist())
+
+            # Store in matrix
+            activation_matrix[li, :len(token_probs)] = token_probs
+
+            # Get top-K experts for this layer
+            top_indices = np.argsort(token_probs)[-top_k:][::-1]
+            top_experts_per_layer.append([(int(idx), float(token_probs[idx])) for idx in top_indices])
+        else:
+            top_experts_per_layer.append([])
+
+        layer_labels.append(f"L{layer_idx}")
+
+    # Create figure with two subplots: heatmap and path diagram
+    fig = make_subplots(
+        rows=1, cols=2,
+        column_widths=[0.55, 0.45],
+        subplot_titles=["Expert Activation Heatmap", "Top-K Expert Path"],
+        horizontal_spacing=0.15
+    )
+
+    # Left: Heatmap of all expert activations
+    fig.add_trace(
+        go.Heatmap(
+            z=activation_matrix,
+            x=[f"E{e}" for e in range(num_experts)],
+            y=layer_labels,
+            colorscale="YlOrRd",
+            showscale=True,
+            colorbar_x=0.52,
+            colorbar_len=0.8,
+            colorbar_thickness=15,
+            colorbar_title_text="Weight",
+            hovertemplate="Layer %{y}<br>Expert %{x}<br>Weight: %{z:.3f}<extra></extra>"
+        ),
+        row=1, col=1
+    )
+
+    # Right: Path diagram showing top-K experts at each layer
+    # Draw connections between layers
+    for li in range(len(moe_layers)):
+        if li < len(top_experts_per_layer) and top_experts_per_layer[li]:
+            for rank, (expert_id, weight) in enumerate(top_experts_per_layer[li]):
+                # Position: x = expert_id normalized, y = layer index
+                x_pos = expert_id / num_experts
+                y_pos = li
+
+                # Color based on rank (top-1 = red, top-2 = orange, etc.)
+                colors = ['#ff4444', '#ff8844', '#ffaa44', '#ffcc44', '#ffee44']
+                color = colors[min(rank, len(colors)-1)]
+
+                # Size based on weight
+                size = 10 + weight * 30
+
+                fig.add_trace(
+                    go.Scatter(
+                        x=[x_pos],
+                        y=[y_pos],
+                        mode='markers+text',
+                        marker=dict(size=size, color=color, line=dict(width=1, color='white')),
+                        text=[f"E{expert_id}"],
+                        textposition="middle center",
+                        textfont=dict(size=8, color='white'),
+                        hovertemplate=f"Layer {moe_layers[li]}<br>Expert {expert_id}<br>Weight: {weight:.3f}<br>Rank: {rank+1}<extra></extra>",
+                        showlegend=False
+                    ),
+                    row=1, col=2
+                )
+
+                # Draw line to previous layer's top expert if exists
+                if li > 0 and top_experts_per_layer[li-1]:
+                    prev_expert, prev_weight = top_experts_per_layer[li-1][0]  # Connect to top-1
+                    prev_x = prev_expert / num_experts
+                    fig.add_trace(
+                        go.Scatter(
+                            x=[prev_x, x_pos],
+                            y=[li-1, li],
+                            mode='lines',
+                            line=dict(width=weight*3, color='rgba(100,100,100,0.3)'),
+                            hoverinfo='skip',
+                            showlegend=False
+                        ),
+                        row=1, col=2
+                    )
+
+    # Update layout
+    title_text = f"Expert Activation Path for Token {token_position}"
+    if token_text:
+        title_text += f": '{token_text}'"
+
+    fig.update_layout(
+        title=dict(text=title_text, font=dict(size=14)),
+        height=400 + len(moe_layers) * 20,
+        showlegend=False
+    )
+
+    # Update axes for heatmap
+    fig.update_xaxes(title_text="Expert ID", row=1, col=1, tickangle=45)
+    fig.update_yaxes(title_text="MoE Layer", row=1, col=1, autorange="reversed")
+
+    # Update axes for path diagram
+    fig.update_xaxes(
+        title_text=f"Expert Position (0-{num_experts-1})",
+        row=1, col=2,
+        range=[-0.05, 1.05],
+        tickvals=[0, 0.25, 0.5, 0.75, 1.0],
+        ticktext=['E0', f'E{num_experts//4}', f'E{num_experts//2}', f'E{3*num_experts//4}', f'E{num_experts-1}']
+    )
+    fig.update_yaxes(
+        title_text="MoE Layer",
+        row=1, col=2,
+        tickvals=list(range(len(moe_layers))),
+        ticktext=layer_labels,
+        autorange="reversed"
+    )
+
+    return fig
+
+
+def get_expert_path_summary(results: ProbeResults, token_position: int) -> Dict[str, Any]:
+    """
+    Get summary statistics about a token's expert activation path.
+    """
+    if not results.moe_router_outputs:
+        return {}
+
+    moe_layers = sorted(results.moe_router_outputs.keys())
+    num_experts = results.num_experts or 64
+    top_k = results.num_experts_per_tok or 2
+
+    # Track which experts are used
+    all_top1_experts = []
+    all_topk_experts = set()
+    total_weight_per_expert = {e: 0.0 for e in range(num_experts)}
+
+    for layer_idx in moe_layers:
+        router_data = results.moe_router_outputs[layer_idx]
+        probs = router_data["probs"]
+
+        if len(probs.shape) == 3:
+            probs = probs[0]
+
+        if token_position < probs.shape[0]:
+            token_probs = probs[token_position]
+            if hasattr(token_probs, 'tolist'):
+                token_probs = np.array(token_probs.tolist())
+
+            top_indices = np.argsort(token_probs)[-top_k:][::-1]
+            all_top1_experts.append(int(top_indices[0]))
+            for idx in top_indices:
+                all_topk_experts.add(int(idx))
+                total_weight_per_expert[int(idx)] += float(token_probs[idx])
+
+    # Calculate statistics
+    unique_top1 = len(set(all_top1_experts))
+    unique_topk = len(all_topk_experts)
+
+    # Most used experts
+    sorted_experts = sorted(total_weight_per_expert.items(), key=lambda x: x[1], reverse=True)
+    top_5_experts = sorted_experts[:5]
+
+    # Path consistency (do same experts appear across layers?)
+    from collections import Counter
+    top1_counts = Counter(all_top1_experts)
+    most_common_top1 = top1_counts.most_common(3)
+
+    return {
+        'num_moe_layers': len(moe_layers),
+        'unique_top1_experts': unique_top1,
+        'unique_topk_experts': unique_topk,
+        'top_5_by_total_weight': top_5_experts,
+        'most_common_top1': most_common_top1,
+        'path_concentration': unique_top1 / len(moe_layers) if moe_layers else 0,  # Lower = more concentrated
+    }
 
 
 def plot_moe_expert_weights_table(results: ProbeResults, layer_idx: int, tokenizer=None) -> pd.DataFrame:
@@ -4651,6 +6054,97 @@ Different attention heads learn different patterns:
 - Do different heads specialize differently?
 - How does attention change across layers?
 - Are there clear syntactic or semantic patterns?"""
+    },
+    "knowledge_localization": {
+        "name": "Knowledge Localization",
+        "short": "Find where facts are stored using causal tracing",
+        "full": """**Knowledge Localization** uses causal tracing to identify where factual knowledge is stored in the model.
+
+**The Method (ROME paper):**
+1. **Clean run**: Get P(target) for a factual query (e.g., P("Paris") for "The capital of France is")
+2. **Corrupted run**: Add noise to subject tokens ("France"), probability drops
+3. **Restore runs**: For each (layer, position), restore clean activations and measure recovery
+
+---
+
+**📊 Indirect Effect Heatmap**
+- **X-axis (Position):** Token positions in the sequence (* marks subject tokens)
+- **Y-axis (Layer):** Model layer index (0 at top)
+- **Color:** Recovery percentage (blue=low, yellow/red=high)
+- **Star:** Critical site with maximum recovery
+
+---
+
+**Interpreting Results:**
+| Pattern | Meaning |
+|---------|---------|
+| **High recovery at subject position** | Facts stored where subject appears (typical) |
+| **High recovery in middle layers** | MLPs store factual associations |
+| **Distributed recovery** | Knowledge spread across multiple sites |
+| **Low max recovery** | Fact may be compositional or not stored here |
+
+---
+
+**Key Metrics:**
+- **Clean P(target):** Model's confidence before corruption
+- **Corrupted P(target):** Confidence with subject corrupted (should drop)
+- **Max Recovery:** Best recovery achieved by restoring a single site
+- **Critical Site:** Layer and position with maximum effect
+
+---
+
+**Why This Matters:**
+- Understand where specific facts are "stored"
+- Essential for model editing (ROME, MEMIT)
+- Reveals how knowledge is encoded
+- Helps diagnose factual errors"""
+    },
+    "generation_replay": {
+        "name": "Generation Replay",
+        "short": "Step through token generation with playback controls",
+        "full": """**Generation Replay** lets you step through token-by-token generation like a video player.
+
+**Features:**
+- **Timeline Scrubber:** Navigate to any point in generation
+- **Playback Controls:** Step forward/backward through tokens
+- **Alternatives View:** See what other tokens the model considered
+- **Branching:** Select an alternative and see what would have happened
+
+---
+
+**📊 Alternatives Bar Chart**
+- **X-axis (Token):** Top candidate tokens at this step
+- **Y-axis (Probability):** Model's confidence for each token
+- **Green:** Selected token
+- **Gray:** Alternative tokens
+
+---
+
+**Controls:**
+| Button | Function |
+|--------|----------|
+| ⏮ | Jump to first step |
+| ⏪ | Previous step |
+| ▶ | Play (manual stepping) |
+| ⏩ | Next step |
+| ⏭ | Jump to last step |
+| 🌿 | Create branch from this step |
+
+---
+
+**Branching:**
+1. Navigate to a step where you want to explore alternatives
+2. Click "Branch" button
+3. Select an alternative token from the dropdown
+4. Click "Generate Branch" to see what would have happened
+
+---
+
+**Use Cases:**
+- Debug unexpected outputs (where did it go wrong?)
+- Explore alternative continuations
+- Understand model confidence at each step
+- Educational tool for understanding LLM generation"""
     }
 }
 
@@ -4985,11 +6479,12 @@ def main():
                 # Get topology for MoE info
                 topology = st.session_state.get('topology', {})
                 prober = ModelProber(model, tokenizer, probe_config, topology)
-                # Use probe_with_generation to actually generate text
-                results = prober.probe_with_generation(
+                # Use probe_with_generation_replay to capture timeline for replay
+                results = prober.probe_with_generation_replay(
                     prompt,
                     max_tokens=gen_max_tokens,
-                    temperature=gen_temperature
+                    temperature=gen_temperature,
+                    capture_config=ReplayCaptureConfig(mode="minimal")
                 )
                 st.session_state.results = results
                 st.session_state.prober = prober
@@ -5095,11 +6590,21 @@ def main():
     if results.is_moe:
         tab_names.append("MoE Routing")
 
+    # Always add new feature tabs
+    tab_names.append("Knowledge Localization")
+    tab_names.append("Generation Replay")
+
     tabs = st.tabs(tab_names)
 
     # Unpack tabs (handle both MoE and non-MoE cases)
     tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab_attn = tabs[:9]
-    tab_moe = tabs[9] if results.is_moe else None
+    tab_idx = 9
+    tab_moe = tabs[tab_idx] if results.is_moe else None
+    if results.is_moe:
+        tab_idx += 1
+    tab_knowledge = tabs[tab_idx]
+    tab_idx += 1
+    tab_replay = tabs[tab_idx]
 
     # Get interpretation settings from session state
     ai_interpret = st.session_state.get('use_ai_interpretation', False)
@@ -6529,11 +8034,114 @@ def main():
                     fig_load = plot_moe_expert_load(results)
                     st.plotly_chart(fig_load, use_container_width=True)
 
+                    # Expert Path Analysis (cross-layer view)
+                    st.markdown("---")
+                    st.markdown("### Expert Activation Path")
+                    st.caption("Track which experts are activated for a specific token across ALL MoE layers. This reveals the token's 'pathway' through the network.")
+
+                    moe_layers = sorted(results.moe_router_outputs.keys())
+
+                    if moe_layers and results.moe_router_outputs:
+                        # Get sequence length from first layer's router data
+                        first_layer_data = results.moe_router_outputs[moe_layers[0]]
+                        first_probs = first_layer_data["probs"]
+                        if len(first_probs.shape) == 3:
+                            first_probs = first_probs[0]
+                        seq_len = first_probs.shape[0]
+
+                        # Token selector
+                        col_path_sel, col_path_info = st.columns([2, 1])
+                        with col_path_sel:
+                            # Build token options - try multiple sources for token text
+                            path_token_options = []
+                            for i in range(seq_len):
+                                tok_text = None
+
+                                # Try results.all_tokens first
+                                if tokenizer and hasattr(results, 'all_tokens') and results.all_tokens:
+                                    if i < len(results.all_tokens):
+                                        try:
+                                            tok_text = tokenizer.decode([results.all_tokens[i]])
+                                        except:
+                                            pass
+
+                                # Try generation_timeline if available
+                                if tok_text is None and hasattr(results, 'generation_timeline') and results.generation_timeline:
+                                    timeline = results.generation_timeline
+                                    # Check input tokens
+                                    if i < len(timeline.input_tokens):
+                                        try:
+                                            tok_text = tokenizer.decode([timeline.input_tokens[i]])
+                                        except:
+                                            pass
+                                    # Check generated steps
+                                    elif timeline.steps:
+                                        gen_idx = i - len(timeline.input_tokens)
+                                        if 0 <= gen_idx < len(timeline.steps):
+                                            tok_text = timeline.steps[gen_idx].token_text
+
+                                # Fallback
+                                if tok_text is None:
+                                    tok_text = f"[pos {i}]"
+                                else:
+                                    # Clean up token text for display
+                                    tok_text = tok_text.replace('\n', '↵').replace('\t', '→')
+                                    if len(tok_text) > 25:
+                                        tok_text = tok_text[:22] + "..."
+
+                                path_token_options.append(f"{i}: {tok_text}")
+
+                            selected_path_token = st.selectbox(
+                                "Select token to trace",
+                                range(len(path_token_options)),
+                                format_func=lambda i: path_token_options[i],
+                                key="expert_path_token_select"
+                            )
+
+                        # Get path summary
+                        path_summary = get_expert_path_summary(results, selected_path_token)
+
+                        with col_path_info:
+                            if path_summary:
+                                st.metric(
+                                    "Unique Top-1 Experts",
+                                    f"{path_summary['unique_top1_experts']} / {path_summary['num_moe_layers']}",
+                                    help="How many different experts were selected as Top-1 across layers"
+                                )
+
+                        # Show path visualization
+                        fig_path = plot_moe_expert_path(results, selected_path_token, tokenizer)
+                        st.plotly_chart(fig_path, use_container_width=True)
+
+                        # Path summary statistics
+                        if path_summary:
+                            with st.expander("📊 Path Statistics", expanded=False):
+                                col_stat1, col_stat2 = st.columns(2)
+
+                                with col_stat1:
+                                    st.markdown("**Most Frequently Selected (Top-1):**")
+                                    for expert_id, count in path_summary.get('most_common_top1', []):
+                                        pct = count / path_summary['num_moe_layers'] * 100
+                                        st.text(f"  Expert {expert_id}: {count} layers ({pct:.0f}%)")
+
+                                with col_stat2:
+                                    st.markdown("**Highest Total Weight:**")
+                                    for expert_id, weight in path_summary.get('top_5_by_total_weight', [])[:5]:
+                                        if weight > 0.01:
+                                            st.text(f"  Expert {expert_id}: {weight:.2f} total")
+
+                                # Interpretation
+                                concentration = path_summary.get('path_concentration', 1.0)
+                                if concentration < 0.3:
+                                    st.success("🎯 **Concentrated path**: This token consistently uses a few experts across layers")
+                                elif concentration < 0.6:
+                                    st.info("↔️ **Moderate path diversity**: Token uses different experts in different layers")
+                                else:
+                                    st.warning("🌐 **Highly distributed**: Token activates many different experts")
+
                     # Layer selector for detailed view
                     st.markdown("---")
                     st.markdown("### Per-Layer Analysis")
-
-                    moe_layers = sorted(results.moe_router_outputs.keys())
                     if moe_layers:
                         selected_moe_layer = st.selectbox(
                             "Select MoE layer to analyze",
@@ -6843,6 +8451,936 @@ Top 5 Most Active Experts:
                     st.info("No MoE routing data captured. Enable 'Capture Layer Outputs' and ensure the model is MoE.")
             else:
                 st.info("This model is not a Mixture of Experts (MoE) model.")
+
+    # Knowledge Localization tab
+    with tab_knowledge:
+        st.subheader("Knowledge Localization (Causal Tracing)")
+
+        with st.expander("ℹ️ What is this? (click to learn)", expanded=False):
+            st.markdown("""
+**Knowledge Localization** uses causal tracing to identify where facts are stored in the model.
+
+**How it works:**
+1. **Clean run**: Get probability of target answer (e.g., P("Paris") for "The capital of France is...")
+2. **Corrupted run**: Add noise to subject tokens ("France"), probability drops
+3. **Restore run**: For each (layer, position), restore clean activations and measure recovery
+
+**Interpreting results:**
+- **High recovery** (yellow/red) indicates information critical to the answer flows through that site
+- **Critical site** (star) shows where restoring activations has maximum effect
+- Facts are typically stored in middle-to-late MLP layers at the last subject token position
+
+**Reference:** [ROME: Locating and Editing Factual Associations](https://rome.baulab.info/)
+            """)
+
+        # Initialize causal trace state
+        if 'causal_trace_results' not in st.session_state:
+            st.session_state.causal_trace_results = None
+        if 'causal_tracer' not in st.session_state:
+            st.session_state.causal_tracer = None
+
+        # Query configuration
+        st.markdown("### Query Configuration")
+
+        col_query1, col_query2 = st.columns([2, 1])
+        with col_query1:
+            ct_query = st.text_input(
+                "Query text",
+                value="The capital of France is",
+                help="The factual query to analyze",
+                key="ct_query"
+            )
+        with col_query2:
+            ct_subject = st.text_input(
+                "Subject",
+                value="France",
+                help="The subject tokens to corrupt",
+                key="ct_subject"
+            )
+
+        col_target, col_noise = st.columns(2)
+        with col_target:
+            ct_target = st.text_input(
+                "Expected answer (optional)",
+                value="Paris",
+                help="Leave empty to auto-detect from model's prediction",
+                key="ct_target"
+            )
+        with col_noise:
+            ct_noise = st.slider(
+                "Noise multiplier",
+                min_value=1.0,
+                max_value=10.0,
+                value=3.0,
+                step=0.5,
+                help="How much noise to add (relative to embedding std)",
+                key="ct_noise"
+            )
+
+        # Advanced options
+        with st.expander("Advanced Options", expanded=False):
+            col_adv1, col_adv2 = st.columns(2)
+            with col_adv1:
+                ct_sample_layers = st.checkbox(
+                    "Sample layers (faster)",
+                    value=True,
+                    help="Test every Nth layer instead of all",
+                    key="ct_sample_layers"
+                )
+                ct_layer_rate = st.slider(
+                    "Layer sample rate",
+                    min_value=1,
+                    max_value=4,
+                    value=2,
+                    disabled=not ct_sample_layers,
+                    key="ct_layer_rate"
+                )
+            with col_adv2:
+                ct_sample_pos = st.checkbox(
+                    "Sample positions (faster)",
+                    value=True,
+                    help="Test every Nth position instead of all",
+                    key="ct_sample_pos"
+                )
+                ct_pos_rate = st.slider(
+                    "Position sample rate",
+                    min_value=1,
+                    max_value=4,
+                    value=2,
+                    disabled=not ct_sample_pos,
+                    key="ct_pos_rate"
+                )
+
+        # Run button
+        if st.button("Run Causal Trace", type="primary", key="run_causal_trace"):
+            if not ct_query or not ct_subject:
+                st.error("Please provide both query text and subject.")
+            else:
+                # Create tracer if needed
+                if st.session_state.causal_tracer is None:
+                    st.session_state.causal_tracer = CausalTracer(
+                        model, tokenizer,
+                        topology=st.session_state.get('model_topology', {})
+                    )
+
+                tracer = st.session_state.causal_tracer
+
+                # Configure
+                config = CausalTraceConfig(
+                    noise_multiplier=ct_noise,
+                    sample_layers=ct_sample_layers,
+                    layer_sample_rate=ct_layer_rate,
+                    sample_positions=ct_sample_pos,
+                    position_sample_rate=ct_pos_rate
+                )
+
+                # Estimate forward passes
+                num_layers = tracer.num_layers
+                tokens = tracer._tokenize(ct_query)
+                seq_len = len(tokens)
+
+                layers_count = num_layers // ct_layer_rate if ct_sample_layers else num_layers
+                pos_count = seq_len // ct_pos_rate if ct_sample_pos else seq_len
+                estimated_passes = 2 + layers_count * pos_count
+
+                # Run with progress
+                progress_bar = st.progress(0, text="Running causal trace...")
+                status_text = st.empty()
+
+                def update_progress(current, total):
+                    progress_bar.progress(current / total, text=f"Forward pass {current}/{total}")
+
+                status_text.text(f"Estimated ~{estimated_passes} forward passes")
+
+                try:
+                    trace_results = tracer.run_causal_trace(
+                        query_text=ct_query,
+                        subject=ct_subject,
+                        target_token=ct_target if ct_target else None,
+                        config=config,
+                        progress_callback=update_progress
+                    )
+                    st.session_state.causal_trace_results = trace_results
+                    progress_bar.progress(1.0, text="Complete!")
+                    status_text.text(f"Completed {trace_results.num_forward_passes} forward passes")
+
+                except Exception as e:
+                    st.error(f"Causal trace failed: {str(e)}")
+                    import traceback
+                    st.code(traceback.format_exc())
+
+        # Display results
+        if st.session_state.causal_trace_results is not None:
+            trace_results = st.session_state.causal_trace_results
+
+            st.markdown("---")
+            st.markdown("### Results")
+
+            # Summary metrics
+            col_m1, col_m2, col_m3, col_m4 = st.columns(4)
+            with col_m1:
+                st.metric(
+                    "Clean P(target)",
+                    f"{trace_results.clean_prob:.1%}",
+                    help="Probability of target token without corruption"
+                )
+            with col_m2:
+                st.metric(
+                    "Corrupted P(target)",
+                    f"{trace_results.corrupted_prob:.1%}",
+                    delta=f"{trace_results.corrupted_prob - trace_results.clean_prob:.1%}",
+                    delta_color="inverse"
+                )
+            with col_m3:
+                st.metric(
+                    "Max Recovery",
+                    f"{trace_results.max_recovery:.1%}",
+                    help="Maximum recovery when restoring clean activation"
+                )
+            with col_m4:
+                st.metric(
+                    "Critical Site",
+                    f"L{trace_results.critical_layer}, Pos {trace_results.critical_position}",
+                    help="Layer and position with maximum recovery"
+                )
+
+            # Target token info with diagnostics
+            st.info(f"Target token: **{trace_results.target_token}** (ID: {trace_results.target_token_id})")
+
+            # Show diagnostic if clean_prob is very low
+            if trace_results.clean_prob < 0.01:
+                with st.expander("⚠️ Low clean probability - Diagnostics", expanded=True):
+                    st.warning("Clean probability is very low. The model may not predict this token.")
+
+                    # Show what the model actually predicts
+                    if 'causal_tracer' in st.session_state and st.session_state.causal_tracer:
+                        tracer = st.session_state.causal_tracer
+                        try:
+                            # Run clean forward pass
+                            tokens = tracer._tokenize(trace_results.query_text)
+                            x = mx.array([tokens])
+                            clean_emb = tracer.embedding(x)
+                            mx.eval(clean_emb)
+                            clean_logits = tracer._forward_with_intervention(x, clean_emb, clean_emb, None, None)
+
+                            # Get top 5 predictions
+                            probs = mx.softmax(clean_logits[0, -1, :], axis=-1)
+                            mx.eval(probs)
+                            top_indices = mx.argsort(probs)[-5:][::-1]
+                            mx.eval(top_indices)
+
+                            st.markdown("**Model's top 5 predictions:**")
+                            for idx in top_indices.tolist():
+                                tok_text = tracer._decode(idx)
+                                tok_prob = float(probs[idx])
+                                is_target = "← target" if idx == trace_results.target_token_id else ""
+                                st.text(f"  {tok_prob:6.2%}  '{tok_text}' (ID: {idx}) {is_target}")
+
+                            # Suggest alternatives
+                            st.markdown("**Tip:** Try these alternatives for Expected answer:")
+                            for idx in top_indices.tolist()[:3]:
+                                tok_text = tracer._decode(idx)
+                                st.text(f"  '{tok_text.strip()}'  or  '{tok_text}'")
+                        except Exception as e:
+                            st.error(f"Could not get model predictions: {e}")
+
+            # Summary plot
+            st.markdown("#### Probability & Layer Recovery")
+            fig_summary = plot_causal_trace_summary(trace_results)
+            st.plotly_chart(fig_summary, use_container_width=True)
+
+            # Heatmap
+            st.markdown("#### Indirect Effect Heatmap")
+            st.caption("Shows recovery of target probability when restoring clean activations at each (layer, position). Star marks critical site.")
+
+            # Get tokens for labels
+            if st.session_state.causal_tracer:
+                tokens = st.session_state.causal_tracer._tokenize(trace_results.query_text)
+            else:
+                tokens = None
+
+            fig_heatmap = plot_causal_trace_heatmap(trace_results, tokenizer, tokens)
+            st.plotly_chart(fig_heatmap, use_container_width=True)
+
+            # Interpretation
+            st.markdown("#### Interpretation")
+
+            # Check if MoE and critical layer is MoE
+            if results.is_moe and trace_results.critical_layer in results.moe_router_outputs:
+                st.markdown("**MoE Expert Analysis at Critical Site:**")
+
+                router_data = results.moe_router_outputs[trace_results.critical_layer]
+                probs_arr = router_data["probs"][0]  # (seq, num_experts)
+                selected_arr = router_data["selected"][0]  # (seq, top_k)
+
+                if trace_results.critical_position < probs_arr.shape[0]:
+                    pos = trace_results.critical_position
+                    selected_experts = selected_arr[pos]
+                    expert_probs = probs_arr[pos]
+
+                    st.write(f"At position {pos}, layer {trace_results.critical_layer}:")
+                    for i, exp_id in enumerate(selected_experts[::-1]):  # Reverse for top-1 first
+                        exp_id = int(exp_id)
+                        prob = float(expert_probs[exp_id])
+                        st.write(f"  - **Expert {exp_id}**: {prob:.1%} router weight (Top-{i+1})")
+
+            # General interpretation based on critical position
+            if trace_results.subject_positions:
+                last_subject = max(trace_results.subject_positions)
+                if trace_results.critical_position == last_subject:
+                    st.success("The critical site is at the **last subject token position**, consistent with ROME findings that facts are localized at subject positions.")
+                elif trace_results.critical_position in trace_results.subject_positions:
+                    st.info("The critical site is within the **subject token span**.")
+                else:
+                    st.info(f"The critical site is at position {trace_results.critical_position} (subject positions: {trace_results.subject_positions}).")
+
+            # Layer interpretation
+            mid_layer = trace_results.layers_tested[len(trace_results.layers_tested) // 2] if trace_results.layers_tested else 0
+            if trace_results.critical_layer >= mid_layer:
+                st.info(f"The critical layer ({trace_results.critical_layer}) is in the **latter half** of the network, where factual associations are typically stored in MLP layers.")
+            else:
+                st.info(f"The critical layer ({trace_results.critical_layer}) is in the **earlier half** of the network, which may indicate information is propagated early.")
+
+    # Generation Replay tab
+    with tab_replay:
+        st.subheader("Generation Replay")
+
+        with st.expander("ℹ️ What is this? (click to learn)", expanded=False):
+            st.markdown("""
+**Generation Replay** lets you step through token generation with VCR-style controls.
+
+**Features:**
+- **Timeline scrubber**: Navigate to any point in generation
+- **Playback controls**: Step forward/backward through tokens
+- **Alternatives view**: See what other tokens the model considered at each step
+- **Branching**: Select an alternative token and see what happens
+
+**How to use:**
+1. Generate text using "Run Inference" above (Generation Replay will capture the timeline)
+2. Use the scrubber or controls to navigate
+3. Click "Branch" to explore alternative continuations
+            """)
+
+        # Check if we have a timeline
+        original_timeline = results.generation_timeline if hasattr(results, 'generation_timeline') else None
+
+        if original_timeline is None or not original_timeline.steps:
+            st.info("No generation timeline available. Run inference with generation to capture a timeline.")
+            st.markdown("""
+**To enable Generation Replay:**
+1. Enter a prompt in the sidebar
+2. Set **Max tokens** > 0
+3. Click **Run Inference**
+
+The timeline will be captured automatically during generation.
+            """)
+        else:
+            # Initialize replay state
+            if 'replay_branches' not in st.session_state:
+                st.session_state.replay_branches = {}  # {branch_id: timeline}
+            if 'viewing_branch_id' not in st.session_state:
+                st.session_state.viewing_branch_id = None
+
+            # Select which timeline to view (original or branch)
+            viewing_branch_id = st.session_state.get('viewing_branch_id')
+            if viewing_branch_id and viewing_branch_id in st.session_state.replay_branches:
+                timeline = st.session_state.replay_branches[viewing_branch_id]
+                is_viewing_branch = True
+            else:
+                timeline = original_timeline
+                is_viewing_branch = False
+                st.session_state.viewing_branch_id = None
+
+            num_steps = len(timeline.steps)
+
+            # Timeline header
+            if is_viewing_branch:
+                st.markdown(f"**🌿 Branch Timeline:** {num_steps} steps | ID: `{timeline.timeline_id}`")
+                if st.button("← Back to Original", key="back_to_original"):
+                    st.session_state.viewing_branch_id = None
+                    st.session_state.replay_scrubber = 0
+                    st.rerun()
+            else:
+                st.markdown(f"**Timeline:** {num_steps} steps | ID: `{timeline.timeline_id}`")
+
+            # Show parent info if this is a branch
+            if timeline.parent_timeline_id:
+                bp = timeline.branch_point_step
+                if bp is not None and bp < len(timeline.steps):
+                    branch_tok = timeline.steps[bp].token_text
+                    orig_tok = original_timeline.steps[bp].token_text if bp < len(original_timeline.steps) else "?"
+                    st.caption(f"Branched at step {bp}: `{orig_tok}` → `{branch_tok}`")
+
+            # Initialize slider state if needed
+            if 'replay_scrubber' not in st.session_state:
+                st.session_state.replay_scrubber = 0
+
+            # Clamp to valid range
+            st.session_state.replay_scrubber = min(st.session_state.replay_scrubber, num_steps - 1)
+
+            # Playback controls (BEFORE slider so they can update state before slider renders)
+            col_ctrl1, col_ctrl2, col_ctrl3, col_ctrl4, col_ctrl5, col_spacer, col_branch = st.columns([1, 1, 1, 1, 1, 2, 2])
+
+            with col_ctrl1:
+                if st.button("⏮", help="First step", key="replay_first"):
+                    st.session_state.replay_scrubber = 0
+
+            with col_ctrl2:
+                if st.button("⏪", help="Previous step", key="replay_prev"):
+                    if st.session_state.replay_scrubber > 0:
+                        st.session_state.replay_scrubber -= 1
+
+            with col_ctrl3:
+                # Play/pause would require auto-refresh which Streamlit doesn't support natively
+                st.button("▶", help="Play (manual stepping)", disabled=True, key="replay_play")
+
+            with col_ctrl4:
+                if st.button("⏩", help="Next step", key="replay_next"):
+                    if st.session_state.replay_scrubber < num_steps - 1:
+                        st.session_state.replay_scrubber += 1
+
+            with col_ctrl5:
+                if st.button("⏭", help="Last step", key="replay_last"):
+                    st.session_state.replay_scrubber = num_steps - 1
+
+            with col_branch:
+                # Use session state to keep dialog open across reruns
+                if 'show_branch_dialog' not in st.session_state:
+                    st.session_state.show_branch_dialog = False
+
+                if st.button("🌿 Branch", help="Create alternative timeline from this step", key="replay_branch"):
+                    st.session_state.show_branch_dialog = True
+                    # Reset any pending selections when opening dialog
+                    st.session_state.branch_selection_confirmed = False
+                    st.session_state.pending_branch_token_id = None
+                    st.session_state.pending_branch_token_text = None
+                    st.session_state.pending_branch_step = None
+                    st.rerun()
+
+            # Check for pending scrubber update (set by branch generation before rerun)
+            if 'pending_scrubber_value' in st.session_state and st.session_state.pending_scrubber_value is not None:
+                st.session_state.replay_scrubber = st.session_state.pending_scrubber_value
+                st.session_state.pending_scrubber_value = None
+
+            # Scrubber (after buttons so it reflects updated state)
+            current_step = st.slider(
+                "Step",
+                min_value=0,
+                max_value=num_steps - 1,
+                key="replay_scrubber",
+                help="Drag to navigate through generation"
+            )
+
+            st.markdown("---")
+
+            # Current step display
+            step = timeline.steps[current_step]
+
+            col_step_info, col_response = st.columns([1, 2])
+
+            with col_step_info:
+                st.markdown(f"### Step {current_step + 1} of {num_steps}")
+                st.markdown(f"**Token:** `{step.token_text}`")
+                st.markdown(f"**Token ID:** {step.token_id}")
+                st.markdown(f"**Probability:** {step.probability:.2%}")
+
+                # FLOPs calculations
+                topology = st.session_state.get('topology', {})
+                if topology.get("config"):
+                    input_len = len(timeline.input_tokens)
+                    current_seq_len = input_len + current_step + 1
+
+                    # FLOPs for this token (generation step)
+                    this_token_flops = calculate_transformer_flops(
+                        topology, seq_len=current_seq_len, is_prefill=False, num_new_tokens=1
+                    )
+
+                    # Cumulative FLOPs: prefill + all generation steps up to current
+                    prefill_flops = calculate_transformer_flops(
+                        topology, seq_len=input_len, is_prefill=True
+                    )
+
+                    # Sum generation FLOPs for each step (seq_len increases each step)
+                    cumulative_gen_flops = 0
+                    for s in range(current_step + 1):
+                        step_seq_len = input_len + s + 1
+                        step_flops = calculate_transformer_flops(
+                            topology, seq_len=step_seq_len, is_prefill=False, num_new_tokens=1
+                        )
+                        cumulative_gen_flops += step_flops["total"]
+
+                    total_flops = prefill_flops["total"] + cumulative_gen_flops
+
+                    st.markdown("---")
+                    st.markdown("**FLOPs:**")
+                    st.caption(f"This token: {format_flops(this_token_flops['total'])}")
+                    st.caption(f"Input ({input_len} tok): {format_flops(prefill_flops['total'])}")
+                    st.caption(f"**Total: {format_flops(total_flops)}**")
+
+                # Show alternatives as compact bar chart
+                st.markdown("**Alternatives:**")
+                if step.top_k_alternatives:
+                    alt_df_data = []
+                    for i, (tok_id, prob, tok_text) in enumerate(step.top_k_alternatives[:6]):
+                        is_selected = tok_id == step.token_id
+                        display_text = tok_text.replace('\n', '\\n')[:12]
+                        alt_df_data.append({
+                            'Token': display_text,
+                            'Probability': prob * 100,
+                            'Selected': 'Selected' if is_selected else 'Alternative',
+                        })
+
+                    alt_df = pd.DataFrame(alt_df_data)
+                    fig_alts = go.Figure()
+                    selected_df = alt_df[alt_df['Selected'] == 'Selected']
+                    fig_alts.add_trace(go.Bar(
+                        x=selected_df['Token'],
+                        y=selected_df['Probability'],
+                        name='Selected',
+                        marker_color='#28A745',
+                        text=[f"{p:.0f}%" for p in selected_df['Probability']],
+                        textposition='auto'
+                    ))
+                    alt_only_df = alt_df[alt_df['Selected'] == 'Alternative']
+                    fig_alts.add_trace(go.Bar(
+                        x=alt_only_df['Token'],
+                        y=alt_only_df['Probability'],
+                        name='Alt',
+                        marker_color='#6C757D',
+                        text=[f"{p:.0f}%" for p in alt_only_df['Probability']],
+                        textposition='auto'
+                    ))
+                    fig_alts.update_layout(
+                        height=200,
+                        margin=dict(l=0, r=0, t=10, b=0),
+                        showlegend=False,
+                        xaxis_title="",
+                        yaxis_title=""
+                    )
+                    st.plotly_chart(fig_alts, use_container_width=True)
+                else:
+                    st.caption("No alternatives captured")
+
+            with col_response:
+                # Get reasoning and answer from results
+                reasoning_text = results.reasoning_text if hasattr(results, 'reasoning_text') else ""
+                answer_text = results.answer_text if hasattr(results, 'answer_text') else ""
+
+                # Jump to token selector
+                st.markdown("**Click token to jump:** *(or use selector)*")
+
+                # Build token options for dropdown
+                token_options = []
+                for i, s in enumerate(timeline.steps):
+                    # Truncate and clean token text for display
+                    tok_display = s.token_text.replace('\n', '↵').replace('\t', '→')
+                    if len(tok_display) > 20:
+                        tok_display = tok_display[:17] + "..."
+                    token_options.append(f"{i}: {tok_display}")
+
+                # Token selector that jumps to position (uses callback to avoid state conflict)
+                # Include timeline_id in key to force refresh when switching timelines
+                selector_key = f"token_jump_selector_{timeline.timeline_id}"
+
+                def make_on_token_select(key):
+                    def on_token_select():
+                        selected = st.session_state[key]
+                        st.session_state.replay_scrubber = selected
+                    return on_token_select
+
+                st.selectbox(
+                    "Jump to token",
+                    range(len(token_options)),
+                    index=current_step,
+                    format_func=lambda i: token_options[i],
+                    key=selector_key,
+                    label_visibility="collapsed",
+                    on_change=make_on_token_select(selector_key)
+                )
+
+                # Build clickable token display using columns of buttons
+                st.markdown("**Response tokens:** *(click to jump)*")
+
+                def render_clickable_tokens(timeline, current_step, tokens_per_row=10):
+                    """Render tokens as clickable buttons in a flow layout."""
+                    num_tokens = len(timeline.steps)
+
+                    # Use HTML + CSS for a flow layout with visual styling
+                    # Since we can't use JS clicks, we'll use the visual display
+                    # and rely on the dropdown above for clicking
+
+                    html_parts = []
+                    html_parts.append("""
+                    <style>
+                    .token-flow { display: flex; flex-wrap: wrap; gap: 2px; padding: 8px; background: #0e1117; border-radius: 5px; max-height: 350px; overflow-y: auto; }
+                    .tok { padding: 2px 6px; border-radius: 3px; font-family: monospace; font-size: 12px; cursor: pointer; display: inline-block; margin: 1px; }
+                    .tok-past { background: #3d1515; color: #ff6b6b; }
+                    .tok-current { background: #ff3333; color: white; font-weight: bold; box-shadow: 0 0 8px #ff3333; }
+                    .tok-future { background: #1a1a2e; color: #666666; }
+                    .tok:hover { opacity: 0.8; transform: scale(1.05); }
+                    .tok-idx { font-size: 9px; color: #888; vertical-align: super; margin-left: 1px; }
+                    </style>
+                    <div class="token-flow">
+                    """)
+
+                    for i, s in enumerate(timeline.steps):
+                        tok_text = s.token_text
+                        # Escape and format
+                        tok_text = tok_text.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+                        tok_text = tok_text.replace('\n', '↵').replace(' ', '·').replace('\t', '→')
+                        if len(tok_text) > 15:
+                            tok_text = tok_text[:12] + "…"
+
+                        if i < current_step:
+                            css_class = "tok tok-past"
+                        elif i == current_step:
+                            css_class = "tok tok-current"
+                        else:
+                            css_class = "tok tok-future"
+
+                        # Add title for hover tooltip
+                        full_text = s.token_text.replace('"', '&quot;').replace('\n', '↵')
+                        html_parts.append(f'<span class="{css_class}" title="Step {i}: {full_text}">{tok_text}<span class="tok-idx">{i}</span></span>')
+
+                    html_parts.append('</div>')
+                    return ''.join(html_parts)
+
+                # Render the clickable token display
+                token_html = render_clickable_tokens(timeline, current_step)
+                st.markdown(token_html, unsafe_allow_html=True)
+
+                st.caption("🔴 Past tokens | ⬜ Current | ⚫ Future — Use dropdown above to jump")
+
+                # Show content based on whether viewing original or branch
+                if is_viewing_branch:
+                    # For branches, show the generated text from the branch timeline
+                    with st.expander("🌿 Branch Generated Text", expanded=True):
+                        if timeline.steps:
+                            last_step = timeline.steps[-1]
+                            if last_step.cumulative_tokens and tokenizer:
+                                branch_text = tokenizer.decode(last_step.cumulative_tokens)
+                                # Try to extract just the generated part (after input)
+                                if timeline.input_tokens:
+                                    input_text = tokenizer.decode(timeline.input_tokens)
+                                    if branch_text.startswith(input_text):
+                                        branch_text = branch_text[len(input_text):]
+                                st.text(branch_text[:1500] + ("..." if len(branch_text) > 1500 else ""))
+                            else:
+                                # Fallback: concatenate token texts
+                                branch_text = "".join(s.token_text for s in timeline.steps)
+                                st.text(branch_text[:1500] + ("..." if len(branch_text) > 1500 else ""))
+                        else:
+                            st.caption("No tokens generated")
+
+                        # Show branch info
+                        if timeline.branch_point_step is not None:
+                            bp = timeline.branch_point_step
+                            branch_tok = timeline.steps[bp].token_text if bp < len(timeline.steps) else "?"
+                            orig_tok = original_timeline.steps[bp].token_text if bp < len(original_timeline.steps) else "?"
+                            st.caption(f"Branched at step {bp}: `{orig_tok}` → `{branch_tok}`")
+                else:
+                    # Show original reasoning section if present
+                    if reasoning_text:
+                        with st.expander("🧠 Reasoning", expanded=False):
+                            st.text(reasoning_text[:1000] + ("..." if len(reasoning_text) > 1000 else ""))
+
+                    # Show original final answer section if present
+                    if answer_text and answer_text != results.generated_text:
+                        with st.expander("📝 Final Answer", expanded=True):
+                            st.markdown(answer_text[:500] + ("..." if len(answer_text) > 500 else ""))
+
+            # Show last branch debug info if available
+            if 'branch_debug_log' in st.session_state and st.session_state.branch_debug_log:
+                with st.expander("🔍 Last Branch Debug Log", expanded=True):
+                    for line in st.session_state.branch_debug_log:
+                        st.text(line)
+                    if st.button("Clear Log", key="clear_branch_log"):
+                        st.session_state.branch_debug_log = []
+                        st.rerun()
+
+            # Branch dialog - controlled by session state to persist across reruns
+            if st.session_state.get('show_branch_dialog') and not is_viewing_branch:
+                st.markdown("---")
+                col_title, col_close = st.columns([4, 1])
+                with col_title:
+                    st.markdown("### Create Branch")
+                with col_close:
+                    if st.button("✕ Close", key="close_branch_dialog"):
+                        st.session_state.show_branch_dialog = False
+                        st.session_state.branch_selection_confirmed = False
+                        st.session_state.pending_branch_token_id = None
+                        st.session_state.pending_branch_token_text = None
+                        st.session_state.pending_branch_step = None
+                        st.rerun()
+
+                # Show what we're replacing
+                st.markdown(f"**Step {current_step}:** Original token = `{step.token_text}` (ID: {step.token_id})")
+
+                # Initialize branch selection state if needed
+                if 'branch_selection_confirmed' not in st.session_state:
+                    st.session_state.branch_selection_confirmed = False
+
+                # Two modes: select from alternatives OR search vocabulary
+                branch_mode = st.radio(
+                    "Select replacement token:",
+                    ["From alternatives", "Search vocabulary"],
+                    horizontal=True,
+                    key="branch_mode"
+                )
+
+                selected_tok_id = None
+                selected_tok_text = None
+
+                if branch_mode == "From alternatives":
+                    if step.top_k_alternatives:
+                        branch_options = [(tok_id, prob, tok_text) for tok_id, prob, tok_text in step.top_k_alternatives if tok_id != step.token_id]
+
+                        if branch_options:
+                            option_labels = [f"`{tok_text}` (ID:{tok_id}, {prob:.1%})" for tok_id, prob, tok_text in branch_options[:8]]
+                            selected_option = st.selectbox(
+                                "Alternative token",
+                                range(len(option_labels)),
+                                format_func=lambda i: option_labels[i],
+                                key="branch_token_select"
+                            )
+                            selected_tok_id, _, selected_tok_text = branch_options[selected_option]
+                        else:
+                            st.warning("No alternatives available")
+                    else:
+                        st.warning("No alternatives captured for this step")
+
+                else:  # Search vocabulary
+                    search_text = st.text_input(
+                        "Enter token text to search:",
+                        placeholder="e.g., 'hello', ' the', 'Paris'",
+                        key="vocab_search"
+                    )
+
+                    if search_text:
+                        # Try to encode the search text
+                        try:
+                            if hasattr(tokenizer, 'encode'):
+                                found_tokens = tokenizer.encode(search_text)
+                            else:
+                                found_tokens = tokenizer(search_text)
+                            if isinstance(found_tokens, dict):
+                                found_tokens = found_tokens.get('input_ids', [])
+
+                            if found_tokens:
+                                # Show found tokens
+                                st.write(f"Found {len(found_tokens)} token(s):")
+                                token_choices = []
+                                for tid in found_tokens[:10]:
+                                    try:
+                                        ttext = tokenizer.decode([tid])
+                                        token_choices.append((tid, ttext))
+                                        st.caption(f"  ID {tid}: `{ttext}`")
+                                    except:
+                                        token_choices.append((tid, f"[{tid}]"))
+
+                                if token_choices:
+                                    selected_vocab = st.selectbox(
+                                        "Select token:",
+                                        range(len(token_choices)),
+                                        format_func=lambda i: f"ID {token_choices[i][0]}: `{token_choices[i][1]}`",
+                                        key="vocab_token_select"
+                                    )
+                                    selected_tok_id, selected_tok_text = token_choices[selected_vocab]
+                            else:
+                                st.warning("No tokens found for that text")
+                        except Exception as e:
+                            st.error(f"Error encoding: {e}")
+
+                # STEP 1: User must click "Confirm Selection" to lock in their choice
+                st.markdown("---")
+                if selected_tok_id is not None:
+                    st.info(f"Preview: `{step.token_text}` → `{selected_tok_text}` (ID: {selected_tok_id})")
+
+                    if st.button("✓ Confirm Selection", key="confirm_branch_selection"):
+                        st.session_state.pending_branch_token_id = selected_tok_id
+                        st.session_state.pending_branch_token_text = selected_tok_text
+                        st.session_state.pending_branch_step = current_step
+                        st.session_state.branch_selection_confirmed = True
+                        st.rerun()
+
+                # STEP 2: Show generate button only after selection is confirmed
+                # Also verify pending_step matches current_step (in case user navigated)
+                pending_step = st.session_state.get('pending_branch_step')
+                if (st.session_state.get('branch_selection_confirmed') and
+                    st.session_state.get('pending_branch_token_id') is not None and
+                    pending_step == current_step):
+
+                    pending_id = st.session_state.pending_branch_token_id
+                    pending_text = st.session_state.pending_branch_token_text
+
+                    st.success(f"**Confirmed:** Step {pending_step}, replace `{original_timeline.steps[pending_step].token_text}` with `{pending_text}` (ID: {pending_id})")
+
+                    col_branch_btn, col_branch_cancel = st.columns(2)
+                    with col_branch_btn:
+                        generate_clicked = st.button("🌿 Generate Branch Now", type="primary", key="do_branch_final")
+
+                    with col_branch_cancel:
+                        if st.button("Cancel", key="cancel_branch"):
+                            st.session_state.show_branch_dialog = False
+                            st.session_state.pending_branch_token_id = None
+                            st.session_state.pending_branch_token_text = None
+                            st.session_state.pending_branch_step = None
+                            st.session_state.branch_selection_confirmed = False
+                            st.rerun()
+
+                    # Only execute if button was actually clicked this run
+                    if generate_clicked:
+                        debug_log = []
+                        debug_log.append(f"=== Branch Generation ===")
+                        debug_log.append(f"Step: {pending_step}")
+                        debug_log.append(f"Original: '{original_timeline.steps[pending_step].token_text}' (ID: {original_timeline.steps[pending_step].token_id})")
+                        debug_log.append(f"Alternative: '{pending_text}' (ID: {pending_id})")
+
+                        with st.spinner(f"Generating branch with `{pending_text}`..."):
+                            try:
+                                prober = st.session_state.get('prober')
+                                if prober:
+                                    # Use same max_tokens as the initial generation (from sidebar)
+                                    branch_max_tokens = gen_max_tokens
+                                    debug_log.append(f"Generating up to {branch_max_tokens} tokens (same as initial)")
+
+                                    new_timeline = prober.generate_from_branch(
+                                        timeline=original_timeline,
+                                        branch_step=pending_step,
+                                        alternative_token_id=pending_id,
+                                        max_tokens=branch_max_tokens
+                                    )
+
+                                    debug_log.append(f"Branch created: {len(new_timeline.steps)} steps")
+
+                                    # Add internal debug info from the branch generation
+                                    if hasattr(new_timeline, 'debug_info') and new_timeline.debug_info:
+                                        debug_log.append("--- Internal Branch Debug ---")
+                                        debug_log.extend(new_timeline.debug_info)
+
+                                    # Compare tokens
+                                    branch_toks = []
+                                    orig_toks = []
+                                    if new_timeline.steps and pending_step < len(new_timeline.steps):
+                                        branch_toks = [s.token_text for s in new_timeline.steps[pending_step:min(pending_step+10, len(new_timeline.steps))]]
+                                        debug_log.append(f"Branch tokens: {branch_toks}")
+
+                                    if pending_step < len(original_timeline.steps):
+                                        orig_toks = [s.token_text for s in original_timeline.steps[pending_step:min(pending_step+10, len(original_timeline.steps))]]
+                                        debug_log.append(f"Original tokens: {orig_toks}")
+
+                                    # Check if different
+                                    if branch_toks and orig_toks:
+                                        if branch_toks == orig_toks:
+                                            debug_log.append("⚠️ WARNING: Branch tokens IDENTICAL to original!")
+                                        else:
+                                            debug_log.append("✓ OK: Branch tokens differ from original")
+
+                                    st.session_state.branch_debug_log = debug_log
+                                    st.session_state.replay_branches[new_timeline.timeline_id] = new_timeline
+                                    st.session_state.viewing_branch_id = new_timeline.timeline_id
+                                    # Use pending value to update scrubber on next rerun (can't modify after widget rendered)
+                                    st.session_state.pending_scrubber_value = pending_step
+
+                                    # Clear pending, confirmation, and close dialog
+                                    st.session_state.show_branch_dialog = False
+                                    st.session_state.pending_branch_token_id = None
+                                    st.session_state.pending_branch_token_text = None
+                                    st.session_state.pending_branch_step = None
+                                    st.session_state.branch_selection_confirmed = False
+
+                                    st.rerun()
+                                else:
+                                    debug_log.append("ERROR: Prober not available")
+                                    st.session_state.branch_debug_log = debug_log
+                                    st.error("Prober not available. Please run inference first.")
+                            except Exception as e:
+                                import traceback
+                                debug_log.append(f"ERROR: {str(e)}")
+                                debug_log.append(traceback.format_exc())
+                                st.session_state.branch_debug_log = debug_log
+                                st.error(f"Branch generation failed: {str(e)}")
+
+            # Timeline selector (original vs branches)
+            st.markdown("---")
+
+            # Check if we're viewing a branch
+            viewing_branch = st.session_state.get('viewing_branch_id', None)
+
+            if viewing_branch or st.session_state.replay_branches:
+                st.markdown("### Timeline Selection")
+
+                # Build timeline options
+                timeline_options = {"original": "Original Timeline"}
+                for bid, bt in st.session_state.replay_branches.items():
+                    branch_token = bt.steps[bt.branch_point_step].token_text if bt.steps and bt.branch_point_step < len(bt.steps) else "?"
+                    timeline_options[bid] = f"Branch {bid}: '{branch_token}' at step {bt.branch_point_step}"
+
+                col_timeline, col_clear = st.columns([3, 1])
+
+                with col_timeline:
+                    selected_timeline = st.selectbox(
+                        "View timeline",
+                        list(timeline_options.keys()),
+                        index=0 if viewing_branch is None else list(timeline_options.keys()).index(viewing_branch) if viewing_branch in timeline_options else 0,
+                        format_func=lambda k: timeline_options[k],
+                        key="timeline_selector"
+                    )
+
+                    # Switch timeline if changed
+                    if selected_timeline == "original" and viewing_branch is not None:
+                        st.session_state.viewing_branch_id = None
+                        st.session_state.pending_scrubber_value = 0
+                        st.rerun()
+                    elif selected_timeline != "original" and selected_timeline != viewing_branch:
+                        st.session_state.viewing_branch_id = selected_timeline
+                        st.session_state.pending_scrubber_value = 0
+                        st.rerun()
+
+                with col_clear:
+                    if st.session_state.replay_branches:
+                        if st.button("🗑️ Clear branches", key="clear_branches"):
+                            st.session_state.replay_branches = {}
+                            st.session_state.viewing_branch_id = None
+                            st.rerun()
+
+            # Show branches info
+            if st.session_state.replay_branches:
+                with st.expander(f"📂 Branches ({len(st.session_state.replay_branches)})", expanded=False):
+                    for branch_id, branch_timeline in st.session_state.replay_branches.items():
+                        st.markdown(f"**Branch `{branch_id}`**")
+
+                        # Show branch point info
+                        if branch_timeline.steps and branch_timeline.branch_point_step is not None:
+                            bp = branch_timeline.branch_point_step
+                            branch_token = branch_timeline.steps[bp].token_text if bp < len(branch_timeline.steps) else "?"
+
+                            # Find original token at same position
+                            original_token = timeline.steps[bp].token_text if bp < len(timeline.steps) else "?"
+
+                            st.caption(f"Step {bp}: `{original_token}` → `{branch_token}`")
+
+                        # Show generated text
+                        if branch_timeline.steps:
+                            last_step = branch_timeline.steps[-1]
+                            if last_step.cumulative_tokens:
+                                branch_text = tokenizer.decode(last_step.cumulative_tokens) if tokenizer else f"[{len(last_step.cumulative_tokens)} tokens]"
+                                st.text(branch_text[-200:] if len(branch_text) > 200 else branch_text)
+
+                        col_view, col_del = st.columns(2)
+                        with col_view:
+                            if st.button(f"View", key=f"view_{branch_id}"):
+                                st.session_state.viewing_branch_id = branch_id
+                                st.session_state.pending_scrubber_value = 0
+                                st.rerun()
+                        with col_del:
+                            if st.button(f"Delete", key=f"del_{branch_id}"):
+                                del st.session_state.replay_branches[branch_id]
+                                if st.session_state.get('viewing_branch_id') == branch_id:
+                                    st.session_state.viewing_branch_id = None
+                                st.rerun()
+
+                        st.markdown("---")
 
     # Export section (not a tab, like AFM7)
     st.header("💾 Export")
