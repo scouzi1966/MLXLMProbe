@@ -6,7 +6,7 @@ A visual probing and interpretability tool for MLX language models on Apple Sili
 
 ## Features
 
-- **Universal MLX-LM Support**: Works with any model supported by mlx-lm (Llama, Mistral, Phi, Qwen, Gemma, Mixtral, etc.)
+- **Universal MLX-LM Support**: TESTED ONLY on GPT-OSS so far
 - **MoE Analysis**: Mixture-of-Experts routing visualization, expert load distribution, top-k selection patterns
 - **Layer Analysis**: Visualize activation norms and patterns across all layers
 - **FFN Analysis**: Gate sparsity and activation patterns in feed-forward networks
