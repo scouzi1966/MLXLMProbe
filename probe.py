@@ -4299,6 +4299,28 @@ def plot_moe_expert_path(results: ProbeResults, token_position: int, tokenizer=N
         row=1, col=1
     )
 
+    # Add bounding boxes around selected experts (top-K) with contrasting colors
+    # Colors chosen to stand out against warm heatmap (yellow/orange/red)
+    rank_colors = ['#00ff00', '#00bfff', '#000000', '#ffffff']  # Top-1: lime green, Top-2: deep sky blue, Top-3: black, Top-4: white
+    rank_widths = [3.5, 3, 2.5, 2]  # Thicker border for higher rank
+
+    for li, layer_idx in enumerate(moe_layers):
+        if li < len(top_experts_per_layer) and top_experts_per_layer[li]:
+            for rank, (expert_id, weight) in enumerate(top_experts_per_layer[li]):
+                if rank < len(rank_colors):  # Only show top-4
+                    # Add rectangle shape around the heatmap cell
+                    # x coordinates are expert indices, y coordinates are layer indices
+                    fig.add_shape(
+                        type="rect",
+                        x0=expert_id - 0.5,
+                        x1=expert_id + 0.5,
+                        y0=li - 0.5,
+                        y1=li + 0.5,
+                        line=dict(color=rank_colors[rank], width=rank_widths[rank]),
+                        fillcolor="rgba(0,0,0,0)",  # Transparent fill
+                        row=1, col=1
+                    )
+
     # Right: Path diagram showing top-K experts at each layer
     # Draw connections between layers
     for li in range(len(moe_layers)):
@@ -4375,6 +4397,16 @@ def plot_moe_expert_path(results: ProbeResults, token_position: int, tokenizer=N
         tickvals=list(range(len(moe_layers))),
         ticktext=layer_labels,
         autorange="reversed"
+    )
+
+    # Add legend annotation for border colors at top of chart (prominent position)
+    fig.add_annotation(
+        text="<b>Selected Expert Borders:</b>  🟢 Top-1  🔵 Top-2  ⬛ Top-3  ⬜ Top-4",
+        xref="paper", yref="paper",
+        x=0.5, y=1.12,
+        showarrow=False,
+        font=dict(size=12),
+        align="center"
     )
 
     return fig
