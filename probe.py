@@ -5253,11 +5253,22 @@ def main():
                             })
 
                     if section_data:
-                        # Limit display with show more
+                        # Limit display with show more button
                         max_show = 30
-                        if len(section_data) > max_show:
+                        show_all_key = f"show_all_input_{sub_name}"
+                        show_all = st.session_state.get(show_all_key, False)
+
+                        if len(section_data) > max_show and not show_all:
                             st.dataframe(pd.DataFrame(section_data[:max_show]), hide_index=True, use_container_width=True)
-                            st.caption(f"... and {len(section_data) - max_show} more tokens")
+                            remaining = len(section_data) - max_show
+                            if st.button(f"📋 Load {remaining} more tokens", key=f"load_more_input_{sub_name}"):
+                                st.session_state[show_all_key] = True
+                                st.rerun()
+                        elif len(section_data) > max_show and show_all:
+                            st.dataframe(pd.DataFrame(section_data), hide_index=True, use_container_width=True)
+                            if st.button(f"📋 Show less", key=f"show_less_input_{sub_name}"):
+                                st.session_state[show_all_key] = False
+                                st.rerun()
                         else:
                             st.dataframe(pd.DataFrame(section_data), hide_index=True, use_container_width=True)
                     st.markdown("---")
