@@ -659,6 +659,7 @@ class ProbeConfig:
     capture_logits: bool = True
     capture_residual_stream: bool = True
     capture_token_probs: bool = True
+    capture_attention: bool = True  # Capture attention patterns
     layer_indices: Optional[List[int]] = None
     max_sequence_positions: int = 512
 
@@ -763,6 +764,12 @@ class ProbeResults:
     moe_expert_load: Dict[int, Dict[int, int]] = field(default_factory=dict)
     # Expert token assignments: {expert_idx: [(token_id, position, layer_idx, router_prob), ...]}
     moe_expert_tokens: Dict[int, List[Tuple[int, int, int, float]]] = field(default_factory=dict)
+
+    # Attention patterns
+    # Per-layer attention weights: {layer_idx: np.array of shape (n_heads, seq_len, seq_len)}
+    attention_patterns: Dict[int, np.ndarray] = field(default_factory=dict)
+    n_attention_heads: int = 0
+    n_kv_heads: int = 0
 
 
 # =============================================================================
@@ -1480,6 +1487,100 @@ class ModelProber:
             # MoE capture failed - not critical
             pass
 
+    def _capture_attention_patterns(self, layer_idx: int, layer, hidden_state: mx.array):
+        """Capture attention patterns for a layer by computing Q @ K^T."""
+        try:
+            # Find the attention module
+            attn = None
+            for name in ['self_attn', 'attention', 'attn']:
+                if hasattr(layer, name):
+                    attn = getattr(layer, name)
+                    break
+
+            if attn is None:
+                return
+
+            # Get Q, K projections
+            q_proj = getattr(attn, 'q_proj', None)
+            k_proj = getattr(attn, 'k_proj', None)
+
+            if q_proj is None or k_proj is None:
+                return
+
+            # Get attention config - check multiple attribute names used by different model architectures
+            n_heads = (getattr(attn, 'n_heads', None) or
+                       getattr(attn, 'num_heads', None) or
+                       getattr(attn, 'num_attention_heads', None) or 8)
+            n_kv_heads = (getattr(attn, 'n_kv_heads', None) or
+                          getattr(attn, 'num_kv_heads', None) or
+                          getattr(attn, 'num_key_value_heads', None) or n_heads)
+            scale = (getattr(attn, 'scale', None) or
+                     getattr(attn, 'sm_scale', None))
+            head_dim_attr = getattr(attn, 'head_dim', None)
+
+            # Store head counts in results
+            if self.results.n_attention_heads == 0:
+                self.results.n_attention_heads = n_heads
+                self.results.n_kv_heads = n_kv_heads
+
+            # Apply input layernorm if present (attention expects normalized input)
+            h = hidden_state
+            if hasattr(layer, 'input_layernorm'):
+                h = layer.input_layernorm(h)
+            elif hasattr(layer, 'ln_1'):
+                h = layer.ln_1(h)
+
+            # Compute Q and K
+            batch_size, seq_len, hidden_dim = h.shape
+            q = q_proj(h)  # (batch, seq, n_heads * head_dim)
+            k = k_proj(h)  # (batch, seq, n_kv_heads * head_dim)
+            mx.eval(q)
+            mx.eval(k)
+
+            # Compute head_dim (use attribute if available, otherwise calculate)
+            head_dim = head_dim_attr if head_dim_attr else q.shape[-1] // n_heads
+
+            # Reshape for multi-head attention
+            # Q: (batch, seq, n_heads, head_dim) -> (batch, n_heads, seq, head_dim)
+            q = q.reshape(batch_size, seq_len, n_heads, head_dim).transpose(0, 2, 1, 3)
+            # K: (batch, seq, n_kv_heads, head_dim) -> (batch, n_kv_heads, seq, head_dim)
+            k = k.reshape(batch_size, seq_len, n_kv_heads, head_dim).transpose(0, 2, 1, 3)
+
+            # Handle GQA (Grouped Query Attention) - repeat K for each group
+            if n_kv_heads < n_heads:
+                n_rep = n_heads // n_kv_heads
+                k = mx.repeat(k, n_rep, axis=1)  # (batch, n_heads, seq, head_dim)
+
+            # Compute attention scores: Q @ K^T / sqrt(d_k)
+            if scale is None:
+                scale = 1.0 / (head_dim ** 0.5)
+
+            # (batch, n_heads, seq, head_dim) @ (batch, n_heads, head_dim, seq) -> (batch, n_heads, seq, seq)
+            attn_scores = (q @ k.transpose(0, 1, 3, 2)) * scale
+            mx.eval(attn_scores)
+
+            # Apply causal mask
+            mask = mx.triu(mx.full((seq_len, seq_len), float('-inf')), k=1)
+            attn_scores = attn_scores + mask
+
+            # Softmax to get attention weights
+            attn_weights = mx.softmax(attn_scores, axis=-1)
+            mx.eval(attn_weights)
+
+            # Store attention patterns (average across batch, keep heads)
+            # Shape: (n_heads, seq_len, seq_len)
+            attn_np = self._to_numpy(attn_weights[0], None)  # Take first batch item
+            self.results.attention_patterns[layer_idx] = attn_np
+
+        except Exception as e:
+            # Attention capture failed - store error for debugging
+            if not hasattr(self.results, '_attention_error'):
+                self.results._attention_error = f"Layer {layer_idx}: {type(e).__name__}: {e}"
+            import sys
+            print(f"Attention capture failed for layer {layer_idx}: {type(e).__name__}: {e}", file=sys.stderr)
+            import traceback
+            traceback.print_exc()
+
     def _capture_activations(self, x: mx.array):
         """Run forward pass and capture activations."""
         max_pos = self.config.max_sequence_positions
@@ -1506,6 +1607,9 @@ class ModelProber:
 
         # 2. Transformer layers
         for i, layer in enumerate(self.layers):
+            # Save pre-layer hidden state for attention capture
+            h_pre_layer = h
+
             try:
                 h = layer(h, mask=None, cache=None)
             except TypeError:
@@ -1541,6 +1645,10 @@ class ModelProber:
             # MoE router capturing
             if i in self.moe_modules and self._should_capture_layer(i):
                 self._capture_moe_router(i, layer, h)
+
+            # Attention pattern capturing (uses pre-layer hidden state)
+            if self.config.capture_attention and self._should_capture_layer(i):
+                self._capture_attention_patterns(i, layer, h_pre_layer)
 
         # 3. Output normalization
         if self.output_norm is not None:
@@ -4505,6 +4613,44 @@ Shows which actual tokens each expert prefers to process:
 - Helps identify load balancing issues
 - Can show if experts are being utilized effectively
 - Indicates potential training instabilities or router collapse"""
+    },
+    "attention_patterns": {
+        "name": "Attention Patterns",
+        "short": "Visualize which tokens attend to which other tokens",
+        "full": """**Attention patterns** show how each token "attends to" (looks at) other tokens when processing.
+
+**The Heatmap:**
+- **Rows (Y-axis):** Query tokens - the tokens that are "looking"
+- **Columns (X-axis):** Key tokens - the tokens being "looked at"
+- **Color intensity:** Attention weight (brighter = stronger attention)
+
+**Common Patterns:**
+| Pattern | Meaning |
+|---------|---------|
+| **Diagonal** | Tokens attending to themselves |
+| **Vertical stripes** | Important tokens that many others attend to |
+| **Triangular shape** | Causal mask - tokens can only see past tokens |
+| **Horizontal bands** | Some tokens attend broadly to everything |
+
+**Multi-Head Attention:**
+Different attention heads learn different patterns:
+- **Positional heads:** Attend to nearby tokens (local context)
+- **Syntactic heads:** Track grammar (subject-verb agreement)
+- **Semantic heads:** Connect related concepts
+- **Induction heads:** Pattern matching and copying
+
+**Statistics:**
+| Metric | Meaning |
+|--------|---------|
+| **Entropy** | How spread vs focused attention is (low = focused, high = diffuse) |
+| **Self-attention** | % of attention on the token itself |
+| **First token attention** | Often high for BOS/system tokens |
+
+**What to Look For:**
+- Which tokens are "important" (receive most attention)?
+- Do different heads specialize differently?
+- How does attention change across layers?
+- Are there clear syntactic or semantic patterns?"""
     }
 }
 
@@ -4694,6 +4840,7 @@ def main():
     capture_layers = st.sidebar.checkbox("Capture Layer Outputs", value=True)
     capture_ffn = st.sidebar.checkbox("Capture FFN Activations", value=True)
     capture_logits = st.sidebar.checkbox("Capture Logits", value=True)
+    capture_attention = st.sidebar.checkbox("Capture Attention Patterns", value=True)
     capture_token_probs = st.sidebar.checkbox("Capture Token Probabilities", value=True)
     capture_residual = st.sidebar.checkbox("Capture Residual Stream", value=True)
 
@@ -4712,6 +4859,7 @@ def main():
         capture_logits=capture_logits,
         capture_token_probs=capture_token_probs,
         capture_residual_stream=capture_residual,
+        capture_attention=capture_attention,
         max_sequence_positions=max_seq_positions
     )
 
@@ -4834,6 +4982,7 @@ def main():
                 )
                 st.session_state.results = results
                 st.session_state.prober = prober
+                st.session_state.probe_config = probe_config
                 st.session_state.use_ai_interpretation = use_ai_interpretation
 
                 # Store settings for on-demand interpretation generation
@@ -4928,7 +5077,8 @@ def main():
         "Embeddings",
         "Logits",
         "Layer Similarity",
-        "Residual Stream"
+        "Residual Stream",
+        "Attention"
     ]
 
     if results.is_moe:
@@ -4937,8 +5087,8 @@ def main():
     tabs = st.tabs(tab_names)
 
     # Unpack tabs (handle both MoE and non-MoE cases)
-    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = tabs[:8]
-    tab_moe = tabs[8] if results.is_moe else None
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab_attn = tabs[:9]
+    tab_moe = tabs[9] if results.is_moe else None
 
     # Get interpretation settings from session state
     ai_interpret = st.session_state.get('use_ai_interpretation', False)
@@ -5427,14 +5577,179 @@ def main():
 
         st.markdown("---")
 
-        # Generated tokens with decoded text and alternatives
-        st.markdown("**Generated Tokens** *(with top-10 alternatives at each step)*")
-
+        # Generated tokens section - matching input tokens style
+        st.markdown("**Generated Tokens**")
         if results.generated_tokens:
             # Check if we have per-token alternatives
             has_alternatives = (hasattr(results, 'per_token_alternatives') and
                                 results.per_token_alternatives and
                                 len(results.per_token_alternatives) > 0)
+
+            # Create table matching input tokens style
+            gen_token_data = []
+            for i, tok_id in enumerate(results.generated_tokens):
+                tok_text = tokenizer.decode([tok_id])
+                display_text = repr(tok_text)[1:-1]
+
+                # Get probability of selected token
+                selected_prob = "N/A"
+                if has_alternatives and i < len(results.per_token_alternatives):
+                    alts = results.per_token_alternatives[i]
+                    for alt_id, alt_prob, _ in alts:
+                        if alt_id == tok_id:
+                            selected_prob = f"{alt_prob:.2%}"
+                            break
+
+                gen_token_data.append({
+                    "Position": i,
+                    "Seq Pos": len(results.input_tokens) + i,  # Position in full sequence
+                    "Token ID": tok_id,
+                    "Text": tok_text,
+                    "Display": display_text,
+                    "Prob": selected_prob
+                })
+            gen_df = pd.DataFrame(gen_token_data)
+            st.dataframe(gen_df, hide_index=True, use_container_width=True)
+
+            # MoE Expert Routing Inspector for generated tokens
+            if results.is_moe and results.moe_router_outputs:
+                with st.expander("🔀 MoE Expert Routing Inspector (Generated Tokens)", expanded=False):
+                    st.caption("Select a generated token position to see which experts processed it")
+
+                    # Position selector
+                    max_gen_pos = len(results.generated_tokens) - 1
+                    selected_gen_pos = st.slider("Generated Token Position", 0, max_gen_pos, 0, key="gen_token_moe_pos")
+
+                    # Show token info
+                    tok_id = results.generated_tokens[selected_gen_pos]
+                    tok_text = tokenizer.decode([tok_id])
+                    seq_pos = len(results.input_tokens) + selected_gen_pos
+                    st.markdown(f"**Generated Position {selected_gen_pos}** (Sequence Position {seq_pos}): `{tok_text}` (ID: {tok_id})")
+
+                    # Show routing for each MoE layer
+                    moe_layers = sorted(results.moe_router_outputs.keys())
+
+                    # Layer selector
+                    if len(moe_layers) > 1:
+                        selected_layer = st.selectbox(
+                            "MoE Layer",
+                            moe_layers,
+                            format_func=lambda x: f"Layer {x}",
+                            key="gen_token_moe_layer"
+                        )
+                    else:
+                        selected_layer = moe_layers[0]
+
+                    router_data = results.moe_router_outputs[selected_layer]
+                    probs = router_data["probs"][0]  # (seq, num_experts)
+                    selected_experts = router_data["selected"][0]  # (seq, top_k)
+
+                    if seq_pos < len(probs):
+                        expert_probs = probs[seq_pos]
+                        expert_selected = selected_experts[seq_pos]
+                        top_k = len(expert_selected)
+                        num_experts = len(expert_probs)
+
+                        # Create expert routing visualization
+                        col_info, col_chart = st.columns([1, 2])
+
+                        with col_info:
+                            st.markdown(f"**Top-{top_k} Experts Selected:**")
+                            expert_data = []
+                            # Note: argsort returns ascending order, so expert_selected[-1] is highest prob (Top-1)
+                            for rank in range(1, top_k + 1):
+                                sel_idx = top_k - rank  # Top-1 → last index
+                                exp_id = int(expert_selected[sel_idx])
+                                exp_prob = float(expert_probs[exp_id])
+                                expert_data.append({
+                                    "Rank": f"Top-{rank}",
+                                    "Expert": f"E{exp_id}",
+                                    "Weight": f"{exp_prob:.2%}",
+                                })
+                            expert_df = pd.DataFrame(expert_data)
+                            st.dataframe(expert_df, hide_index=True)
+
+                            # Routing summary - Top-1 is at index -1 (last)
+                            dominant = int(expert_selected[-1])
+                            dominant_w = float(expert_probs[dominant])
+                            if dominant_w > 0.5:
+                                st.info(f"⚡ **Dominant routing** to Expert {dominant}")
+                            elif dominant_w > 0.3:
+                                st.info(f"🔄 **Balanced routing** across experts")
+                            else:
+                                st.info(f"🌐 **Distributed routing** - no clear dominant")
+
+                        with col_chart:
+                            # Bar chart of all expert weights
+                            fig = go.Figure(go.Bar(
+                                x=list(range(num_experts)),
+                                y=[float(expert_probs[e]) * 100 for e in range(num_experts)],
+                                marker_color=['#EF553B' if e in expert_selected else '#636EFA'
+                                             for e in range(num_experts)],
+                                text=[f"E{e}" if e in expert_selected else "" for e in range(num_experts)],
+                                textposition='outside'
+                            ))
+                            fig.update_layout(
+                                title=f"Router Weights - All {num_experts} Experts",
+                                xaxis_title="Expert ID",
+                                yaxis_title="Weight (%)",
+                                height=250,
+                                margin=dict(l=40, r=20, t=40, b=40)
+                            )
+                            st.plotly_chart(fig, use_container_width=True)
+                            st.caption("🔴 Red = Selected experts | 🔵 Blue = Not selected")
+                    else:
+                        st.warning(f"Position {seq_pos} not captured in router outputs (captured up to position {len(probs)-1})")
+
+            # Token alternatives inspector
+            if has_alternatives:
+                with st.expander("🎯 Token Alternatives Inspector", expanded=False):
+                    st.caption("See what other tokens the model considered at each generation step")
+
+                    alt_pos = st.slider("Generated Token Position", 0, max_gen_pos, 0, key="gen_token_alt_pos")
+
+                    tok_id = results.generated_tokens[alt_pos]
+                    tok_text = tokenizer.decode([tok_id])
+                    st.markdown(f"**Position {alt_pos}:** Selected `{tok_text}` (ID: {tok_id})")
+
+                    if alt_pos < len(results.per_token_alternatives):
+                        alts = results.per_token_alternatives[alt_pos]
+                        alt_data = []
+                        for rank, (alt_id, alt_prob, alt_text) in enumerate(alts):
+                            is_selected = "✓" if alt_id == tok_id else ""
+                            # Confidence indicator
+                            if alt_prob > 0.5:
+                                conf = "🟢"
+                            elif alt_prob > 0.1:
+                                conf = "🟡"
+                            else:
+                                conf = "🔴"
+                            alt_data.append({
+                                "Rank": rank + 1,
+                                "Sel": is_selected,
+                                "Conf": conf,
+                                "Token ID": alt_id,
+                                "Token": alt_text,
+                                "Probability": f"{alt_prob:.4f}",
+                                "Percent": f"{alt_prob:.2%}"
+                            })
+                        alt_df = pd.DataFrame(alt_data)
+                        st.dataframe(alt_df, hide_index=True, use_container_width=True)
+
+                        # Certainty analysis
+                        top_prob = alts[0][1] if alts else 0
+                        if top_prob > 0.9:
+                            st.success(f"🎯 **High certainty** - model was {top_prob:.0%} confident")
+                        elif top_prob > 0.5:
+                            st.info(f"✓ **Moderate certainty** - {top_prob:.0%} confident in top choice")
+                        elif top_prob > 0.2:
+                            st.warning(f"⚖️ **Uncertain** - only {top_prob:.0%} confident, multiple alternatives")
+                        else:
+                            st.error(f"❓ **Very uncertain** - {top_prob:.0%} confidence, high entropy")
+
+            # Detailed per-token output with alternatives (original format)
+            st.markdown("---")
+            st.markdown("**Generated Tokens Detail** *(with top-10 alternatives at each step)*")
 
             for i, tok_id in enumerate(results.generated_tokens):
                 tok_text = tokenizer.decode([tok_id])
@@ -5548,7 +5863,6 @@ def main():
                                 st.markdown("---")
                                 st.caption(f"💡 Router data not captured for position {seq_pos}")
 
-            # Summary statistics
             st.markdown("---")
             st.markdown(f"**Total generated:** {len(results.generated_tokens)} tokens")
         else:
@@ -5708,7 +6022,285 @@ def main():
         else:
             st.info("Enable 'Capture Residual Stream' to see this visualization.")
 
-    # Tab 9: MoE Routing (only if model is MoE)
+    # Tab 9: Attention Patterns
+    with tab_attn:
+        st.subheader("Attention Pattern Analysis")
+
+        with st.expander("ℹ️ What is this? (click to learn)", expanded=False):
+            st.markdown("""
+**Attention patterns** show how each token "attends to" (looks at) other tokens when processing.
+
+- **Heatmap**: Rows = query tokens (the one looking), Columns = key tokens (being looked at)
+- **Bright cells** = high attention weight (strong influence)
+- **Dark cells** = low attention weight (weak/no influence)
+- **Diagonal pattern**: Tokens attending to themselves
+- **Vertical stripes**: Important tokens that many others attend to (often punctuation, key words)
+- **Triangular shape**: Causal mask - tokens can only see previous tokens, not future ones
+
+**Multi-head attention**: Different heads learn different patterns:
+- Some heads track syntax (subject-verb agreement)
+- Some track position (nearby tokens)
+- Some track semantics (related concepts)
+- Some are "induction heads" (pattern matching)
+
+**What to look for**:
+- 🔍 Which tokens are "important" (vertical stripes)?
+- 🔍 Are there clear syntactic patterns?
+- 🔍 Do different heads specialize differently?
+- 🔍 How does attention change across layers?
+            """)
+
+        if results.attention_patterns:
+            # Layer selector
+            available_layers = sorted(results.attention_patterns.keys())
+            n_heads = results.n_attention_heads or results.attention_patterns[available_layers[0]].shape[0]
+
+            col1, col2 = st.columns([1, 1])
+            with col1:
+                selected_layer = st.selectbox(
+                    "Layer",
+                    available_layers,
+                    format_func=lambda x: f"Layer {x}",
+                    key="attn_layer_select"
+                )
+            with col2:
+                head_options = ["Average (all heads)"] + [f"Head {i}" for i in range(n_heads)]
+                selected_head = st.selectbox(
+                    "Attention Head",
+                    head_options,
+                    key="attn_head_select"
+                )
+
+            # Get attention weights for selected layer
+            attn_weights = results.attention_patterns[selected_layer]  # (n_heads, seq, seq)
+            seq_len = attn_weights.shape[1]
+
+            # Select head or average
+            if selected_head == "Average (all heads)":
+                attn_matrix = attn_weights.mean(axis=0)  # (seq, seq)
+                head_label = "Average"
+            else:
+                head_idx = int(selected_head.split()[-1])
+                attn_matrix = attn_weights[head_idx]  # (seq, seq)
+                head_label = f"Head {head_idx}"
+
+            # Create token labels
+            all_tokens = list(results.input_tokens) + results.generated_tokens
+            token_labels = []
+            for i, tok_id in enumerate(all_tokens[:seq_len]):
+                tok_text = tokenizer.decode([tok_id])
+                # Truncate long tokens
+                if len(tok_text) > 10:
+                    tok_text = tok_text[:8] + ".."
+                # Escape special chars
+                tok_text = tok_text.replace("\n", "\\n").replace("\t", "\\t")
+                token_labels.append(f"{i}:{tok_text}")
+
+            # Attention heatmap - apply sqrt transform to expand low-value contrast
+            # Most attention values are low, so sqrt spreads them out better
+            attn_display = np.sqrt(attn_matrix.copy())
+
+            # Set true zeros (causal mask) to NaN so they render as transparent/background
+            attn_display[attn_matrix == 0] = np.nan
+
+            fig = go.Figure(data=go.Heatmap(
+                z=attn_display,
+                x=token_labels,
+                y=token_labels,
+                colorscale='Inferno',
+                colorbar=dict(
+                    title="Weight",
+                    tickvals=[0, 0.316, 0.447, 0.548, 0.707, 1.0],  # sqrt of 0, 0.1, 0.2, 0.3, 0.5, 1.0
+                    ticktext=["0", "0.1", "0.2", "0.3", "0.5", "1.0"]  # Original values
+                ),
+                customdata=attn_matrix,  # Store original values for hover
+                hovertemplate="<b>FROM:</b> %{y}<br><b>TO:</b> %{x}<br><b>Weight:</b> %{customdata:.4f}<extra></extra>",
+                hoverongaps=False  # Don't show hover for NaN/masked cells
+            ))
+
+            fig.update_layout(
+                title=f"Attention Pattern - Layer {selected_layer}, {head_label}",
+                xaxis_title="Key (attending TO)",
+                yaxis_title="Query (attending FROM)",
+                height=600,
+                xaxis=dict(tickangle=45, tickfont=dict(size=8)),
+                yaxis=dict(tickfont=dict(size=8), autorange="reversed")
+            )
+
+            st.plotly_chart(fig, use_container_width=True)
+
+            # Attention statistics
+            st.markdown("---")
+            st.markdown("### Attention Statistics")
+
+            col1, col2, col3 = st.columns(3)
+
+            # Entropy of attention (how spread out vs focused)
+            entropy = -np.sum(attn_matrix * np.log(attn_matrix + 1e-10), axis=-1).mean()
+            max_entropy = np.log(seq_len)
+            normalized_entropy = entropy / max_entropy
+
+            with col1:
+                st.metric("Attention Entropy", f"{entropy:.2f}")
+                if normalized_entropy > 0.7:
+                    st.caption("🌐 Diffuse attention (looks at many tokens)")
+                elif normalized_entropy > 0.3:
+                    st.caption("⚖️ Balanced attention")
+                else:
+                    st.caption("🎯 Focused attention (few key tokens)")
+
+            # Self-attention strength (diagonal)
+            diag_attn = np.diag(attn_matrix).mean()
+            with col2:
+                st.metric("Self-Attention", f"{diag_attn:.2%}")
+                st.caption("How much tokens attend to themselves")
+
+            # Attention to first token (often special/important)
+            first_token_attn = attn_matrix[:, 0].mean()
+            with col3:
+                st.metric("First Token Attention", f"{first_token_attn:.2%}")
+                st.caption("Often high for BOS/system tokens")
+
+            # Top attended positions
+            st.markdown("---")
+            st.markdown("### Most Attended Tokens")
+            st.caption("Which tokens receive the most attention overall")
+
+            # Filter options
+            n_input = len(results.input_tokens)
+            filter_col1, filter_col2 = st.columns([1, 3])
+            with filter_col1:
+                token_filter = st.radio(
+                    "Show tokens from:",
+                    ["All", "Input Sequence", "Generated"],
+                    horizontal=True,
+                    key="attn_token_filter",
+                    label_visibility="collapsed"
+                )
+
+            # Sum attention received by each position (column sums)
+            attn_received = attn_matrix.sum(axis=0)
+
+            # Filter positions based on selection
+            if token_filter == "Input Sequence":
+                valid_positions = [i for i in range(min(n_input, len(attn_received)))]
+            elif token_filter == "Generated":
+                valid_positions = [i for i in range(n_input, len(attn_received))]
+            else:  # All
+                valid_positions = list(range(len(attn_received)))
+
+            # Sort by attention received within filtered positions
+            if valid_positions:
+                filtered_attn = [(pos, attn_received[pos]) for pos in valid_positions]
+                filtered_attn.sort(key=lambda x: x[1], reverse=True)
+                sorted_positions = [pos for pos, _ in filtered_attn]
+            else:
+                sorted_positions = []
+
+            # Load more state
+            attn_show_key = "attn_tokens_show_count"
+            if attn_show_key not in st.session_state:
+                st.session_state[attn_show_key] = 10
+
+            show_count = st.session_state[attn_show_key]
+            top_attended = sorted_positions[:show_count]
+
+            attended_data = []
+            for pos in top_attended:
+                if pos < len(all_tokens):
+                    tok_id = all_tokens[pos]
+                    tok_text = tokenizer.decode([tok_id])
+                    section = "Input" if pos < n_input else "Generated"
+                    attended_data.append({
+                        "Position": int(pos),
+                        "Section": section,
+                        "Token": tok_text,
+                        "Attention Received": f"{attn_received[pos]:.3f}",
+                        "% of Total": f"{attn_received[pos] / attn_received.sum() * 100:.1f}%"
+                    })
+            attended_df = pd.DataFrame(attended_data)
+            st.dataframe(attended_df, hide_index=True, use_container_width=True)
+
+            # Load more button
+            remaining = len(sorted_positions) - show_count
+            if remaining > 0:
+                if st.button(f"Load more ({remaining} remaining)", key="attn_load_more"):
+                    st.session_state[attn_show_key] = min(show_count + 20, len(sorted_positions))
+                    st.rerun()
+
+            # Head comparison (if showing average)
+            if selected_head == "Average (all heads)" and n_heads > 1:
+                st.markdown("---")
+                st.markdown("### Head Specialization")
+                st.caption("How different attention heads behave")
+
+                # Load more state for heads
+                head_show_key = "attn_heads_show_count"
+                if head_show_key not in st.session_state:
+                    st.session_state[head_show_key] = 16
+
+                heads_to_show = min(st.session_state[head_show_key], n_heads)
+
+                head_stats = []
+                for h in range(heads_to_show):
+                    h_attn = attn_weights[h]
+                    h_entropy = -np.sum(h_attn * np.log(h_attn + 1e-10), axis=-1).mean()
+                    h_diag = np.diag(h_attn).mean()
+                    h_first = h_attn[:, 0].mean()
+
+                    head_stats.append({
+                        "Head": h,
+                        "Entropy": f"{h_entropy:.2f}",
+                        "Self-Attn": f"{h_diag:.1%}",
+                        "First-Tok": f"{h_first:.1%}",
+                        "Pattern": "🎯 Focused" if h_entropy < 2 else ("🌐 Diffuse" if h_entropy > 3 else "⚖️ Mixed")
+                    })
+
+                head_df = pd.DataFrame(head_stats)
+                st.dataframe(head_df, hide_index=True, use_container_width=True)
+
+                # Load more button for heads
+                remaining_heads = n_heads - heads_to_show
+                if remaining_heads > 0:
+                    if st.button(f"Load more heads ({remaining_heads} remaining)", key="head_load_more"):
+                        st.session_state[head_show_key] = min(heads_to_show + 16, n_heads)
+                        st.rerun()
+
+        else:
+            st.info("No attention patterns captured. This may happen if attention capture is disabled or the model architecture is not supported.")
+
+            # Debug info
+            with st.expander("Debug Info"):
+                saved_config = st.session_state.get('probe_config')
+                st.write(f"capture_attention config: {saved_config.capture_attention if saved_config else 'N/A'}")
+                st.write(f"n_attention_heads: {results.n_attention_heads}")
+                st.write(f"n_kv_heads: {results.n_kv_heads}")
+                st.write(f"Layer count: {results.num_layers}")
+
+                # Show error if any
+                if hasattr(results, '_attention_error'):
+                    st.error(f"Attention capture error: {results._attention_error}")
+
+                # Check layer structure
+                if 'prober' in st.session_state:
+                    prober = st.session_state.prober
+                    if prober.layers:
+                        layer = prober.layers[0]
+                        st.write(f"Layer type: {type(layer).__name__}")
+                        for attr in ['self_attn', 'attention', 'attn']:
+                            if hasattr(layer, attr):
+                                attn = getattr(layer, attr)
+                                st.write(f"Found {attr}: {type(attn).__name__}")
+                                st.write(f"Has q_proj: {hasattr(attn, 'q_proj')}")
+                                st.write(f"Has k_proj: {hasattr(attn, 'k_proj')}")
+                                st.write(f"n_heads attr: {getattr(attn, 'n_heads', 'N/A')}")
+                                st.write(f"n_kv_heads attr: {getattr(attn, 'n_kv_heads', 'N/A')}")
+                                break
+                        else:
+                            st.write(f"No self_attn/attention/attn found")
+                            st.write(f"Layer keys: {list(layer.keys()) if hasattr(layer, 'keys') else 'N/A'}")
+
+    # MoE Routing tab (only if model is MoE)
     if tab_moe is not None:
         with tab_moe:
             st.subheader("Mixture of Experts Routing Analysis")
