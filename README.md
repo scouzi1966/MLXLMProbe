@@ -98,6 +98,8 @@ The app will open at `http://localhost:8501`
 **Option A: Use the sidebar to enter a HuggingFace model ID**
 
 Popular MLX models from [mlx-community](https://huggingface.co/mlx-community):
+
+- `mlx-community/gpt-oss-20b-MXFP4-Q8` (TESTED)
 - `mlx-community/Llama-3.2-3B-Instruct-4bit` (small, fast)
 - `mlx-community/Mistral-7B-Instruct-v0.3-4bit` (good quality)
 - `mlx-community/Mixtral-8x7B-Instruct-v0.1-4bit` (MoE model)
