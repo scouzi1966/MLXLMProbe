@@ -1,6 +1,6 @@
 [project]
 name = "mlxlmprobe"
-version = "0.1.1"
+version = "0.1.2"
 description = "Visual probing and interpretability tool for MLX language models"
 readme = "README.md"
 license = {text = "MIT"}
