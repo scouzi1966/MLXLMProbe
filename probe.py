@@ -6286,6 +6286,170 @@ def main():
                         st.session_state[head_show_key] = min(heads_to_show + 16, n_heads)
                         st.rerun()
 
+            # Attention vs Distance Analysis (RoPE effect)
+            st.markdown("---")
+            st.markdown("### Attention vs Distance (RoPE Effect)")
+            st.caption("How attention weight changes with token distance - reveals positional encoding effects")
+
+            # Compute attention vs distance for each head
+            seq_len = attn_weights.shape[1]
+            max_distance = min(seq_len - 1, 100)  # Cap at 100 for readability
+
+            # Create distance matrix
+            distances = np.abs(np.arange(seq_len)[:, None] - np.arange(seq_len)[None, :])
+
+            # Compute average attention at each distance for each head
+            distance_attn_per_head = []
+            for h in range(n_heads):
+                h_attn = attn_weights[h]
+                distance_attn = []
+                for d in range(max_distance + 1):
+                    # Get all attention values at this distance (only from lower triangle - causal)
+                    mask = (distances == d) & (np.triu(np.ones((seq_len, seq_len)), k=1) == 0)
+                    if mask.sum() > 0:
+                        avg_attn = h_attn[mask].mean()
+                        distance_attn.append(avg_attn)
+                    else:
+                        distance_attn.append(0)
+                distance_attn_per_head.append(distance_attn)
+
+            distance_attn_per_head = np.array(distance_attn_per_head)
+
+            # Average across all heads
+            avg_distance_attn = distance_attn_per_head.mean(axis=0)
+
+            # Plot distance-attention curve
+            fig_dist = go.Figure()
+
+            # Add average line (thick)
+            fig_dist.add_trace(go.Scatter(
+                x=list(range(max_distance + 1)),
+                y=avg_distance_attn,
+                mode='lines',
+                name='Average (all heads)',
+                line=dict(color='#00ff00', width=3)
+            ))
+
+            # Add individual head lines (thin, semi-transparent)
+            # Let user choose how many heads to show
+            head_plot_options = ["Average only", "8 heads", "16 heads", "32 heads", "All heads"]
+            head_plot_choice = st.radio(
+                "Show individual heads:",
+                head_plot_options,
+                index=1,  # Default to 8 heads
+                horizontal=True,
+                key="rope_heads_choice"
+            )
+
+            if head_plot_choice == "Average only":
+                heads_to_plot = 0
+            elif head_plot_choice == "All heads":
+                heads_to_plot = n_heads
+            else:
+                heads_to_plot = min(n_heads, int(head_plot_choice.split()[0]))
+
+            # Extended color palette for many heads
+            colors = [
+                '#ff6b6b', '#4ecdc4', '#45b7d1', '#96ceb4', '#ffeaa7', '#dfe6e9', '#fd79a8', '#a29bfe',
+                '#ff9f43', '#10ac84', '#5f27cd', '#ee5a24', '#0abde3', '#f368e0', '#1dd1a1', '#ff6b81',
+                '#7bed9f', '#70a1ff', '#eccc68', '#ff7f50', '#00d2d3', '#ff9ff3', '#54a0ff', '#5f27cd',
+                '#c8d6e5', '#8395a7', '#576574', '#222f3e', '#f5cd79', '#78e08f', '#e77f67', '#cf6a87'
+            ]
+
+            for h in range(heads_to_plot):
+                fig_dist.add_trace(go.Scatter(
+                    x=list(range(max_distance + 1)),
+                    y=distance_attn_per_head[h],
+                    mode='lines',
+                    name=f'Head {h}',
+                    line=dict(color=colors[h % len(colors)], width=1),
+                    opacity=0.6 if heads_to_plot <= 16 else 0.3
+                ))
+
+            fig_dist.update_layout(
+                title="Attention Weight vs Token Distance",
+                xaxis_title="Distance (tokens back)",
+                yaxis_title="Average Attention Weight",
+                height=400,
+                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+                hovermode='x unified'
+            )
+            st.plotly_chart(fig_dist, use_container_width=True)
+
+            # Head locality classification
+            st.markdown("#### Head Locality Analysis")
+            st.caption("Classifies heads by their effective attention range")
+
+            # Compute metrics for each head
+            locality_data = []
+            for h in range(n_heads):
+                h_dist_attn = distance_attn_per_head[h]
+
+                # Compute effective range (distance at which cumulative attention reaches 50% and 90%)
+                cumsum = np.cumsum(h_dist_attn)
+                if cumsum[-1] > 0:
+                    cumsum_norm = cumsum / cumsum[-1]
+                    range_50 = np.searchsorted(cumsum_norm, 0.5)
+                    range_90 = np.searchsorted(cumsum_norm, 0.9)
+                else:
+                    range_50 = range_90 = 0
+
+                # Compute locality score (higher = more local)
+                # Weight attention by distance, normalize
+                if h_dist_attn.sum() > 0:
+                    weighted_dist = np.sum(h_dist_attn * np.arange(len(h_dist_attn))) / h_dist_attn.sum()
+                    locality_score = 1.0 / (1.0 + weighted_dist / 10)  # Normalize to 0-1ish
+                else:
+                    weighted_dist = 0
+                    locality_score = 0
+
+                # Classify
+                if range_50 <= 3:
+                    pattern = "🎯 Very Local"
+                elif range_50 <= 10:
+                    pattern = "📍 Local"
+                elif range_50 <= 30:
+                    pattern = "⚖️ Mixed"
+                else:
+                    pattern = "🌐 Global"
+
+                locality_data.append({
+                    "Head": h,
+                    "50% Range": range_50,
+                    "90% Range": range_90,
+                    "Avg Dist": f"{weighted_dist:.1f}",
+                    "Pattern": pattern
+                })
+
+            # Show first 16 heads (with load more)
+            locality_show_key = "locality_show_count"
+            if locality_show_key not in st.session_state:
+                st.session_state[locality_show_key] = 16
+
+            locality_show = min(st.session_state[locality_show_key], n_heads)
+            locality_df = pd.DataFrame(locality_data[:locality_show])
+            st.dataframe(locality_df, hide_index=True, use_container_width=True)
+
+            if locality_show < n_heads:
+                if st.button(f"Load more ({n_heads - locality_show} remaining)", key="locality_load_more"):
+                    st.session_state[locality_show_key] = min(locality_show + 16, n_heads)
+                    st.rerun()
+
+            # Summary stats
+            col1, col2, col3, col4 = st.columns(4)
+            local_count = sum(1 for d in locality_data if "Local" in d["Pattern"])
+            global_count = sum(1 for d in locality_data if "Global" in d["Pattern"])
+            mixed_count = sum(1 for d in locality_data if "Mixed" in d["Pattern"])
+
+            with col1:
+                st.metric("Very Local Heads", sum(1 for d in locality_data if "Very Local" in d["Pattern"]))
+            with col2:
+                st.metric("Local Heads", sum(1 for d in locality_data if d["Pattern"] == "📍 Local"))
+            with col3:
+                st.metric("Mixed Heads", mixed_count)
+            with col4:
+                st.metric("Global Heads", global_count)
+
         else:
             st.info("No attention patterns captured. This may happen if attention capture is disabled or the model architecture is not supported.")
 
