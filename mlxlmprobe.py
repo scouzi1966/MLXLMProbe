@@ -7490,7 +7490,16 @@ def _streamlit_app():
         formatted = format_prompt_for_model(system_prompt, user_prompt, tokenizer)
         st.code(formatted, language=None)
 
-    run_probe = st.button("🚀 Run Inference with Probing", type="primary")
+    # Inference options
+    col_run, col_option = st.columns([2, 2])
+    with col_run:
+        run_probe = st.button("🚀 Run Inference with Probing", type="primary")
+    with col_option:
+        capture_final_only = st.checkbox(
+            "Capture final response only",
+            value=False,
+            help="Skip reasoning tokens - only probe the final answer portion. Reduces data for reasoning models."
+        )
 
     # Run probe
     if run_probe:
@@ -7520,10 +7529,47 @@ def _streamlit_app():
                     temperature=gen_temperature,
                     capture_config=ReplayCaptureConfig(mode="minimal")
                 )
+
+                # If "capture final response only" is enabled and reasoning was detected,
+                # re-probe on just the final answer portion
+                if capture_final_only and results.reasoning_text and results.answer_text:
+                    st.info("Re-probing on final response only (skipping reasoning tokens)...")
+
+                    # Build prompt that includes original prompt + full generated text up to answer
+                    # Then probe just the answer portion
+                    full_context = prompt + results.generated_text
+
+                    # Find where the answer starts in the generated text
+                    answer_start_idx = results.generated_text.find(results.answer_text)
+                    if answer_start_idx > 0:
+                        # Context is: original prompt + reasoning portion
+                        context_with_reasoning = prompt + results.generated_text[:answer_start_idx]
+
+                        # Re-probe with context, capturing only the answer tokens
+                        # We'll probe the full context but the activations will reflect
+                        # the model's state when processing the answer
+                        answer_prober = ModelProber(model, tokenizer, probe_config, topology)
+                        answer_results = answer_prober.probe(context_with_reasoning + results.answer_text)
+
+                        # Preserve the original generation info but use answer-only probe data
+                        answer_results.generated_text = results.generated_text
+                        answer_results.reasoning_text = results.reasoning_text
+                        answer_results.answer_text = results.answer_text
+                        answer_results.generated_tokens = results.generated_tokens
+                        answer_results.generation_timeline = results.generation_timeline
+
+                        # Mark that this is final-response-only capture
+                        answer_results._final_response_only = True
+                        answer_results._reasoning_tokens_skipped = answer_start_idx
+
+                        results = answer_results
+                        st.success(f"Captured probing data for final response only ({len(results.answer_text)} chars)")
+
                 st.session_state.results = results
                 st.session_state.prober = prober
                 st.session_state.probe_config = probe_config
                 st.session_state.use_ai_interpretation = use_ai_interpretation
+                st.session_state.capture_final_only = capture_final_only
 
                 # Store settings for on-demand interpretation generation
                 st.session_state.use_ai_interpretation = use_ai_interpretation
@@ -7548,6 +7594,11 @@ def _streamlit_app():
 
     # Generated Output section
     st.header("📝 Generated Output")
+
+    # Show indicator if final-response-only mode was used
+    if hasattr(results, '_final_response_only') and results._final_response_only:
+        st.info("📊 **Probing Mode:** Final response only (reasoning tokens excluded from analysis)")
+
     if results.generated_text:
         # Check if there's reasoning to display separately
         if results.reasoning_text:
