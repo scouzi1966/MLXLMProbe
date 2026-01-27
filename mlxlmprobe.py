@@ -9449,26 +9449,74 @@ This shows how much each component pushes toward the predicted token.
                 layers_available = sorted(results.logit_lens_by_position[positions[0]].keys()) if positions else []
 
                 if positions and layers_available:
-                    # Position selector
+                    # Build position labels and token lookup
+                    all_tokens = list(results.input_tokens) + results.generated_tokens
+                    pos_labels = {}
+                    token_to_positions = {}  # Map token text -> list of positions
+
+                    for pos in positions:
+                        if pos < len(all_tokens):
+                            tok_text = tokenizer.decode([all_tokens[pos]]) if tokenizer else f"[{all_tokens[pos]}]"
+                            tok_text_display = tok_text[:15].replace('\n', '↵')
+                            pos_labels[pos] = f"Pos {pos}: {tok_text_display}"
+
+                            # Build reverse lookup (normalized for search)
+                            tok_normalized = tok_text.strip().lower()
+                            if tok_normalized not in token_to_positions:
+                                token_to_positions[tok_normalized] = []
+                            token_to_positions[tok_normalized].append((pos, tok_text))
+                        else:
+                            pos_labels[pos] = f"Pos {pos}"
+
+                    # Token search feature
+                    col_search, col_results = st.columns([1, 2])
+                    with col_search:
+                        search_query = st.text_input(
+                            "🔍 Search Token",
+                            placeholder="Type to search...",
+                            key="logit_lens_token_search"
+                        )
+
+                    # Handle search results
+                    search_matches = []
+                    if search_query:
+                        query_lower = search_query.strip().lower()
+                        # Find all positions with matching tokens (partial match)
+                        for tok_normalized, pos_list in token_to_positions.items():
+                            if query_lower in tok_normalized:
+                                search_matches.extend(pos_list)
+                        # Sort by position
+                        search_matches.sort(key=lambda x: x[0])
+
+                    with col_results:
+                        if search_query:
+                            if search_matches:
+                                st.success(f"Found {len(search_matches)} occurrence(s)")
+                            else:
+                                st.warning("No matches found")
+
+                    # Position selector - use search results if available
                     col_pos_sel, col_pos_info = st.columns([1, 2])
                     with col_pos_sel:
-                        # Build position labels with token text
-                        all_tokens = list(results.input_tokens) + results.generated_tokens
-                        pos_labels = {}
-                        for pos in positions:
-                            if pos < len(all_tokens):
-                                tok_text = tokenizer.decode([all_tokens[pos]]) if tokenizer else f"[{all_tokens[pos]}]"
-                                tok_text = tok_text[:15].replace('\n', '↵')
-                                pos_labels[pos] = f"Pos {pos}: {tok_text}"
-                            else:
-                                pos_labels[pos] = f"Pos {pos}"
+                        if search_matches:
+                            # Show filtered dropdown with only matching positions
+                            match_positions = [pos for pos, _ in search_matches]
+                            match_labels = {pos: f"Pos {pos}: {tok}" for pos, tok in search_matches}
 
-                        selected_pos = st.selectbox(
-                            "Select Position",
-                            positions,
-                            format_func=lambda x: pos_labels.get(x, f"Pos {x}"),
-                            key="logit_lens_pos_select"
-                        )
+                            selected_pos = st.selectbox(
+                                f"Select Position ({len(search_matches)} matches)",
+                                match_positions,
+                                format_func=lambda x: match_labels.get(x, f"Pos {x}"),
+                                key="logit_lens_pos_select_filtered"
+                            )
+                        else:
+                            # Show all positions
+                            selected_pos = st.selectbox(
+                                "Select Position",
+                                positions,
+                                format_func=lambda x: pos_labels.get(x, f"Pos {x}"),
+                                key="logit_lens_pos_select"
+                            )
 
                     with col_pos_info:
                         if selected_pos < len(all_tokens):
