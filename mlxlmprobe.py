@@ -2174,21 +2174,9 @@ class ModelProber:
             h = x
             prev_h = None
 
-        # Create causal attention mask - CRITICAL for correct logit lens behavior
-        # Without this, position P can see position P+1, breaking next-token prediction
-        # Must be created AFTER embedding to match dtype (e.g., bfloat16)
-        seq_len = x.shape[1]
-        model_dtype = h.dtype  # Match the model's dtype
-        try:
-            from mlx.nn import MultiHeadAttention
-            causal_mask = MultiHeadAttention.create_additive_causal_mask(seq_len, dtype=model_dtype)
-            mx.eval(causal_mask)
-        except Exception:
-            # Fallback: create mask manually with matching dtype
-            # 0 where can attend, -inf where blocked
-            causal_mask = mx.full((seq_len, seq_len), -1e9, dtype=model_dtype)
-            causal_mask = mx.triu(causal_mask, k=1)  # Upper triangle (excluding diagonal) = -inf
-            mx.eval(causal_mask)
+        # Use "causal" string mask - MLX-LM models handle this internally
+        # This ensures proper causal attention without explicit mask array
+        causal_mask = "causal"
 
         # 2. Transformer layers
         for i, layer in enumerate(self.layers):
@@ -2196,14 +2184,15 @@ class ModelProber:
             h_pre_layer = h
 
             try:
-                # Pass causal mask to ensure proper next-token prediction behavior
+                # Pass "causal" mask to ensure proper next-token prediction behavior
                 h = layer(h, mask=causal_mask, cache=None)
-            except TypeError:
+            except (TypeError, ValueError):
                 try:
-                    h = layer(h, attention_mask=causal_mask)
+                    # Some models might not accept string mask - try None
+                    # (model may have internal causal masking)
+                    h = layer(h, mask=None, cache=None)
                 except TypeError:
                     try:
-                        # Some layers don't accept mask - fall back
                         h = layer(h)
                     except:
                         continue
@@ -3101,17 +3090,8 @@ class CausalTracer:
         on each call, making actual cost O(L^2 * positions) rather than O(L * positions).
         A future optimization could cache per-layer activations to avoid recomputation.
         """
-        # Create causal attention mask with matching dtype
-        seq_len = clean_embeddings.shape[1]
-        model_dtype = clean_embeddings.dtype
-        try:
-            from mlx.nn import MultiHeadAttention
-            causal_mask = MultiHeadAttention.create_additive_causal_mask(seq_len, dtype=model_dtype)
-            mx.eval(causal_mask)
-        except Exception:
-            causal_mask = mx.full((seq_len, seq_len), -1e9, dtype=model_dtype)
-            causal_mask = mx.triu(causal_mask, k=1)
-            mx.eval(causal_mask)
+        # Use "causal" string mask - MLX-LM models handle this internally
+        causal_mask = "causal"
 
         # Start with corrupted or clean embeddings
         if restore_layer is not None:
