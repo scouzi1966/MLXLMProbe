@@ -24,6 +24,10 @@ mlxlmprobe
 - **AI Interpretation**: Optional AI-powered analysis using local model or Claude
 - **Export**: PDF reports and interactive HTML exports
 
+### Now with Logit Lens
+
+![Logit Lens](docs/images/logit-lens.png)
+
 ### Deep token MoE tracing
 
 ![Deep token MoE tracing](docs/images/deep-token-tracing.png)
