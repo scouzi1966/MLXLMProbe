@@ -4426,15 +4426,15 @@ def plot_logit_lens(results: ProbeResults, tokenizer=None) -> go.Figure:
         hovertemplate="Layer %{x}<br>Rank: %{y}<br>Token: %{customdata[0]}<br>Prob: %{customdata[1]}<br>ID: %{customdata[2]}<extra></extra>"
     ))
 
-    # Add text annotations for token names
+    # Add text annotations for token names (ALL cells to show labels across layers)
     annotations = []
     for row_idx in range(max_rank):
         for col_idx in range(num_layers):
             text = token_texts[row_idx][col_idx]
             prob = probs[row_idx, col_idx]
-            if text and prob > 0.01:  # Only show if probability is meaningful
-                # Use contrasting color based on probability
-                text_color = 'white' if prob > 0.5 else 'black'
+            if text:  # Show all token labels
+                # Fixed contrast: dark text on light colors (high prob), light text on dark colors (low prob)
+                text_color = 'black' if prob > 0.4 else 'white'
                 annotations.append(dict(
                     x=col_idx,
                     y=row_idx,
@@ -9483,6 +9483,19 @@ This shows how much each component pushes toward the predicted token.
                     layers = sorted(pos_data.keys())
                     max_rank = 5
 
+                    # Layer selection dropdown BEFORE heatmap so we can highlight selected layer
+                    col_ll_layer, col_ll_preds = st.columns([1, 2])
+                    with col_ll_layer:
+                        ll_layer = st.selectbox(
+                            "Layer",
+                            layers,
+                            format_func=lambda x: f"Layer {x}",
+                            key="logit_lens_pos_layer_select"
+                        )
+
+                    # Find the column index for the selected layer
+                    selected_col_idx = layers.index(ll_layer) if ll_layer in layers else 0
+
                     probs_matrix = np.zeros((max_rank, len(layers)))
                     token_texts = [['' for _ in range(len(layers))] for _ in range(max_rank)]
 
@@ -9507,46 +9520,65 @@ This shows how much each component pushes toward the predicted token.
                         hovertemplate="Layer %{x}<br>Rank: %{y}<br>Token: %{customdata}<br>Prob: %{z:.2%}<extra></extra>"
                     ))
 
-                    # Add text annotations
+                    # Add text annotations for ALL cells (token labels across layers)
                     annotations = []
                     for row_idx in range(max_rank):
                         for col_idx in range(len(layers)):
                             text = token_texts[row_idx][col_idx]
                             prob = probs_matrix[row_idx, col_idx]
-                            if text and prob > 0.01:
-                                text_color = 'white' if prob > 0.5 else 'black'
+                            if text:
+                                # Fixed contrast: dark text on light colors (high prob), light text on dark colors (low prob)
+                                text_color = 'black' if prob > 0.4 else 'white'
                                 annotations.append(dict(
                                     x=col_idx, y=row_idx, text=text[:8],
                                     showarrow=False, font=dict(size=9, color=text_color),
                                     xref='x', yref='y'
                                 ))
 
+                    # Highlight the selected layer column with a red rectangle
+                    shapes = []
+                    # Red vertical highlight for selected layer (spans all ranks)
+                    shapes.append(dict(
+                        type="rect",
+                        x0=selected_col_idx - 0.5,
+                        x1=selected_col_idx + 0.5,
+                        y0=-0.5,
+                        y1=max_rank - 0.5,
+                        line=dict(color="red", width=3),
+                        fillcolor="rgba(255, 0, 0, 0.1)",
+                        layer="above"
+                    ))
+                    # Special border on Top-1 cell for selected layer
+                    shapes.append(dict(
+                        type="rect",
+                        x0=selected_col_idx - 0.5,
+                        x1=selected_col_idx + 0.5,
+                        y0=-0.5,
+                        y1=0.5,
+                        line=dict(color="red", width=4),
+                        fillcolor="rgba(0, 0, 0, 0)",
+                        layer="above"
+                    ))
+
                     fig_pos_lens.update_layout(
                         title=f"Logit Lens at Position {selected_pos}",
                         xaxis_title="Layer",
                         yaxis_title="Prediction Rank",
-                        height=300,
-                        annotations=annotations
+                        height=350,
+                        annotations=annotations,
+                        shapes=shapes,
+                        yaxis=dict(autorange="reversed")  # Top-1 at top
                     )
 
                     st.plotly_chart(fig_pos_lens, use_container_width=True)
 
                     # Show top predictions at selected position for selected layer
-                    if selected_pos in results.logit_lens_by_position:
-                        col_ll_layer, col_ll_preds = st.columns([1, 2])
-                        with col_ll_layer:
-                            ll_layer = st.selectbox(
-                                "Layer",
-                                layers,
-                                format_func=lambda x: f"Layer {x}",
-                                key="logit_lens_pos_layer_select"
-                            )
-                        with col_ll_preds:
-                            if ll_layer in pos_data:
-                                preds = pos_data[ll_layer]
-                                pred_data = [{"Rank": i+1, "Token": t, "Probability": f"{p:.2%}"}
-                                             for i, (_, p, t) in enumerate(preds)]
-                                st.dataframe(pd.DataFrame(pred_data), hide_index=True, use_container_width=True)
+                    with col_ll_preds:
+                        if ll_layer in pos_data:
+                            preds = pos_data[ll_layer]
+                            pred_data = [{"Rank": i+1, "Token": t, "Probability": f"{p:.2%}"}
+                                         for i, (_, p, t) in enumerate(preds)]
+                            st.dataframe(pd.DataFrame(pred_data), hide_index=True, use_container_width=True)
 
                     # Memory usage indicator
                     total_entries = len(positions) * len(layers_available) * 5
