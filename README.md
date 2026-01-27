@@ -61,6 +61,15 @@ To upgrade:
 pip install --upgrade mlxlmprobe
 ```
 
+### Switching from Homebrew
+
+If you previously installed via Homebrew, switch to pip for easier updates:
+
+```bash
+brew uninstall mlxlmprobe
+pip install mlxlmprobe
+```
+
 ### From Source
 
 ```bash
