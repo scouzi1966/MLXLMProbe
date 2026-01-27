@@ -2148,6 +2148,20 @@ class ModelProber:
         def compute_norm(arr: np.ndarray) -> float:
             return float(np.linalg.norm(arr, axis=-1).mean())
 
+        # Create causal attention mask - CRITICAL for correct logit lens behavior
+        # Without this, position P can see position P+1, breaking next-token prediction
+        seq_len = x.shape[1]
+        try:
+            from mlx.nn import MultiHeadAttention
+            causal_mask = MultiHeadAttention.create_additive_causal_mask(seq_len)
+            mx.eval(causal_mask)
+        except Exception:
+            # Fallback: create mask manually
+            # 0 where can attend, -inf where blocked
+            causal_mask = mx.full((seq_len, seq_len), -1e9, dtype=mx.float32)
+            causal_mask = mx.triu(causal_mask, k=1)  # Upper triangle (excluding diagonal) = -inf
+            mx.eval(causal_mask)
+
         # 1. Embedding
         if self.embedding is not None:
             h = self.embedding(x)
@@ -2171,12 +2185,14 @@ class ModelProber:
             h_pre_layer = h
 
             try:
-                h = layer(h, mask=None, cache=None)
+                # Pass causal mask to ensure proper next-token prediction behavior
+                h = layer(h, mask=causal_mask, cache=None)
             except TypeError:
                 try:
-                    h = layer(h, attention_mask=None)
+                    h = layer(h, attention_mask=causal_mask)
                 except TypeError:
                     try:
+                        # Some layers don't accept mask - fall back
                         h = layer(h)
                     except:
                         continue
@@ -3037,6 +3053,17 @@ class CausalTracer:
         on each call, making actual cost O(L^2 * positions) rather than O(L * positions).
         A future optimization could cache per-layer activations to avoid recomputation.
         """
+        # Create causal attention mask
+        seq_len = clean_embeddings.shape[1]
+        try:
+            from mlx.nn import MultiHeadAttention
+            causal_mask = MultiHeadAttention.create_additive_causal_mask(seq_len)
+            mx.eval(causal_mask)
+        except Exception:
+            causal_mask = mx.full((seq_len, seq_len), -1e9, dtype=mx.float32)
+            causal_mask = mx.triu(causal_mask, k=1)
+            mx.eval(causal_mask)
+
         # Start with corrupted or clean embeddings
         if restore_layer is not None:
             h = corrupted_embeddings
@@ -3052,7 +3079,7 @@ class CausalTracer:
                 h_clean = clean_embeddings
                 for j in range(i):
                     try:
-                        h_clean = self.layers[j](h_clean, mask=None, cache=None)
+                        h_clean = self.layers[j](h_clean, mask=causal_mask, cache=None)
                     except TypeError:
                         try:
                             h_clean = self.layers[j](h_clean)
@@ -3062,21 +3089,20 @@ class CausalTracer:
                         h_clean = h_clean[0]
                 mx.eval(h_clean)
 
-                # Restore clean activations at specified positions using mask
+                # Restore clean activations at specified positions using blend mask
                 # More efficient than repeated concatenation
-                seq_len = h.shape[1]
-                mask = mx.zeros((1, seq_len, 1))
+                blend_mask = mx.zeros((1, seq_len, 1))
                 for pos in restore_positions:
                     if pos < seq_len:
-                        mask = mask.at[:, pos:pos+1, :].add(mx.ones((1, 1, 1)))
-                mx.eval(mask)
-                # Blend: h = h * (1 - mask) + h_clean * mask
-                h = h * (1 - mask) + h_clean * mask
+                        blend_mask = blend_mask.at[:, pos:pos+1, :].add(mx.ones((1, 1, 1)))
+                mx.eval(blend_mask)
+                # Blend: h = h * (1 - blend_mask) + h_clean * blend_mask
+                h = h * (1 - blend_mask) + h_clean * blend_mask
                 mx.eval(h)
 
-            # Forward through layer
+            # Forward through layer with causal mask
             try:
-                h = layer(h, mask=None, cache=None)
+                h = layer(h, mask=causal_mask, cache=None)
             except TypeError:
                 try:
                     h = layer(h)
