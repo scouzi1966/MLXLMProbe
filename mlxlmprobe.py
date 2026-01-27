@@ -5,6 +5,8 @@ MLXLMProbe - Universal probing tool for MLX language models.
 A visual interpretability tool that works with any mlx-lm compatible model.
 Supports Llama, Mistral, Phi, Qwen, Gemma, and other architectures.
 
+GitHub: https://github.com/scouzi1966/MLXLMProbe
+
 Features:
     - Layer activation analysis
     - FFN gate patterns
@@ -12,12 +14,14 @@ Features:
     - Embedding visualization (PCA)
     - Layer similarity heatmaps
     - Residual stream tracking
+    - Mechanistic interpretability (Logit Lens, Causal Tracing, Steering Vectors)
     - AI interpretation
     - PDF and HTML export
 
 Usage:
-    streamlit run probe.py
-    streamlit run probe.py -- --model mlx-community/Llama-3.2-1B-Instruct-4bit
+    mlxlmprobe                    # Launch the Streamlit UI
+    mlxlmprobe --help             # Show help
+    mlxlmprobe --model <path>     # Launch with a specific model
 """
 
 import argparse
@@ -1831,12 +1835,15 @@ class ModelProber:
             mx.eval(h_normed)
 
             # Project through LM head to get logits
-            if hasattr(self.embedding, 'as_linear'):
-                layer_logits = self.embedding.as_linear(h_normed)
-            elif hasattr(self.model, 'lm_head'):
+            # IMPORTANT: Prefer explicit lm_head over as_linear (tied embeddings)
+            # Models like GPT-OSS-20B have untied embeddings where lm_head != embed.as_linear
+            if hasattr(self.model, 'lm_head'):
                 layer_logits = self.model.lm_head(h_normed)
             elif hasattr(self.inner_model, 'lm_head'):
                 layer_logits = self.inner_model.lm_head(h_normed)
+            elif hasattr(self.embedding, 'as_linear'):
+                # Fallback to tied embeddings
+                layer_logits = self.embedding.as_linear(h_normed)
             else:
                 return  # No LM head available
 
@@ -1908,15 +1915,25 @@ class ModelProber:
         """
         Analyze captured attention patterns to detect specialized head types.
 
+        Uses TransformerLens-inspired detection with actual token matching.
+
         Head types detected:
-        - Induction heads: Copy patterns (A...B seen before, when A appears, predict B)
+        - Induction heads: When token A appears again, attend to token after previous A
+        - Duplicate Token heads: Attend to positions with same token
         - Previous token heads: Attend primarily to position-1
-        - Copy suppression heads: Strong diagonal patterns
-        - Positional heads: Strong positional bias patterns
-        - First token heads: Strong attention to position 0
+        - Self-attention heads: Strong diagonal patterns
+        - First token heads: Strong attention to position 0 (BOS sink)
+        - Recent context heads: Focus on local window
+        - Global heads: Attend to distant/early context
+        - Diffuse heads: Broad attention distribution
         """
         if not self.results.attention_patterns:
             return
+
+        # Get tokens for token-aware detection
+        tokens = self.results.input_tokens
+        if self.results.generated_tokens:
+            tokens = list(tokens) + list(self.results.generated_tokens)
 
         for layer_idx, attn_weights in self.results.attention_patterns.items():
             # attn_weights shape: (n_heads, seq_len, seq_len)
@@ -1926,77 +1943,129 @@ class ModelProber:
             if seq_len < 3:
                 continue
 
+            # Build detection patterns (TransformerLens approach)
+            # 1. Previous token pattern: diagonal shifted by -1
+            prev_token_pattern = np.zeros((seq_len, seq_len))
+            for i in range(1, seq_len):
+                prev_token_pattern[i, i-1] = 1.0
+
+            # 2. Duplicate token pattern: mask[i,j] = 1 if tokens[i] == tokens[j] and i != j
+            duplicate_pattern = np.zeros((seq_len, seq_len))
+            if tokens and len(tokens) >= seq_len:
+                for i in range(seq_len):
+                    for j in range(i):  # Only look at positions before i (causal)
+                        if tokens[i] == tokens[j]:
+                            duplicate_pattern[i, j] = 1.0
+
+            # 3. Induction pattern: shift duplicate pattern right by 1
+            # (attend to token AFTER previous occurrence of current token)
+            induction_pattern = np.zeros((seq_len, seq_len))
+            if tokens and len(tokens) >= seq_len:
+                for i in range(seq_len):
+                    for j in range(1, i):  # j+1 must be < i
+                        if tokens[i] == tokens[j] and j + 1 < i:
+                            induction_pattern[i, j + 1] = 1.0
+
             head_labels = {}
 
             for head_idx in range(n_heads):
                 h_attn = attn_weights[head_idx]  # (seq_len, seq_len)
 
-                # Compute various metrics for head classification
+                # Compute metrics using TransformerLens-style pattern matching
+                # "mul" metric: (attn * pattern).sum() / attn.sum() - fraction matching
                 labels = []
                 scores = {}
 
-                # 1. Previous Token Head: Strong attention to position i-1
-                prev_token_scores = []
-                for i in range(1, seq_len):
-                    prev_token_scores.append(h_attn[i, i-1])
-                prev_token_score = np.mean(prev_token_scores) if prev_token_scores else 0
+                def pattern_match_score(attn, pattern):
+                    """Compute fraction of attention matching expected pattern."""
+                    if pattern.sum() == 0:
+                        return 0.0
+                    # Only consider positions where pattern expects attention
+                    return (attn * pattern).sum() / (attn.sum() + 1e-10)
+
+                # 1. Previous Token Head (pattern-based)
+                prev_token_score = pattern_match_score(h_attn, prev_token_pattern)
                 scores['prev_token'] = prev_token_score
-                if prev_token_score > 0.3:
+                if prev_token_score > 0.10:
                     labels.append(("Previous Token", prev_token_score))
 
-                # 2. First Token Head: Strong attention to position 0
-                first_token_scores = h_attn[1:, 0]  # Skip first position (self)
+                # 2. Duplicate Token Head (token-aware)
+                if duplicate_pattern.sum() > 0:
+                    duplicate_score = pattern_match_score(h_attn, duplicate_pattern)
+                    scores['duplicate'] = duplicate_score
+                    if duplicate_score > 0.08:
+                        labels.append(("Duplicate Token", duplicate_score))
+                else:
+                    scores['duplicate'] = 0.0
+
+                # 3. Induction Head (token-aware - attend after previous occurrence)
+                if induction_pattern.sum() > 0:
+                    induction_score = pattern_match_score(h_attn, induction_pattern)
+                    scores['induction'] = induction_score
+                    if induction_score > 0.06:
+                        labels.append(("Induction", induction_score))
+                else:
+                    # Fallback: check for off-diagonal stripes (when tokens unknown)
+                    induction_score = 0.0
+                    best_offset = 0
+                    if seq_len >= 6:
+                        for offset in range(2, min(seq_len // 2, 15)):
+                            stripe_values = [h_attn[i, i - offset] for i in range(offset, seq_len)]
+                            if stripe_values:
+                                stripe_mean = np.mean(stripe_values)
+                                if stripe_mean > induction_score:
+                                    induction_score = stripe_mean
+                                    best_offset = offset
+                    scores['induction'] = induction_score
+                    scores['induction_offset'] = best_offset
+                    if induction_score > 0.06:
+                        labels.append(("Induction", induction_score))
+
+                # 4. First Token Head: Strong attention to position 0 (BOS sink)
+                first_token_scores = h_attn[1:, 0]
                 first_token_score = np.mean(first_token_scores) if len(first_token_scores) > 0 else 0
                 scores['first_token'] = first_token_score
-                if first_token_score > 0.2:
+                if first_token_score > 0.08:
                     labels.append(("First Token", first_token_score))
 
-                # 3. Self-Attention / Diagonal: Strong attention to self
+                # 5. Self-Attention / Diagonal
                 diag = np.diag(h_attn)
                 self_attn_score = np.mean(diag)
                 scores['self_attn'] = self_attn_score
-                if self_attn_score > 0.3:
+                if self_attn_score > 0.12:
                     labels.append(("Self-Attention", self_attn_score))
 
-                # 4. Induction Head Detection:
-                # Induction heads show a pattern where if "A B" appeared before,
-                # when "A" appears again, they attend to position after previous "A"
-                # This manifests as a diagonal stripe offset by the distance
-                # Simplified: check for off-diagonal stripe patterns
-                induction_score = 0.0
-                if seq_len >= 8:
-                    # Check for stripe pattern (attending k positions back consistently)
-                    for offset in range(2, min(seq_len // 2, 10)):
-                        stripe_values = []
-                        for i in range(offset, seq_len):
-                            if i - offset >= 0:
-                                stripe_values.append(h_attn[i, i - offset])
-                        if stripe_values:
-                            stripe_mean = np.mean(stripe_values)
-                            induction_score = max(induction_score, stripe_mean)
-                scores['induction'] = induction_score
-                if induction_score > 0.15:
-                    labels.append(("Induction", induction_score))
+                # 6. Recent Context: Attention in local window
+                recent_window = min(5, seq_len - 1)
+                recent_scores_list = []
+                for i in range(recent_window, seq_len):
+                    recent_attn = np.sum(h_attn[i, max(0, i-recent_window):i])
+                    recent_scores_list.append(recent_attn)
+                recent_context_score = np.mean(recent_scores_list) if recent_scores_list else 0
+                scores['recent_context'] = recent_context_score
+                if recent_context_score > 0.35:
+                    labels.append(("Recent Context", recent_context_score))
 
-                # 5. Diffuse / Uniform Attention: High entropy
+                # 7. Global/Long-range: Attention to early context
+                if seq_len > 10:
+                    early_window = seq_len // 4
+                    global_scores_list = []
+                    for i in range(seq_len // 2, seq_len):
+                        early_attn = np.sum(h_attn[i, :early_window])
+                        global_scores_list.append(early_attn)
+                    global_score = np.mean(global_scores_list) if global_scores_list else 0
+                    scores['global'] = global_score
+                    if global_score > 0.15:
+                        labels.append(("Global", global_score))
+
+                # 8. Diffuse / Uniform: High entropy
                 entropy_per_row = -np.sum(h_attn * np.log(h_attn + 1e-10), axis=-1)
                 mean_entropy = np.mean(entropy_per_row)
                 max_possible_entropy = np.log(seq_len)
                 normalized_entropy = mean_entropy / max_possible_entropy if max_possible_entropy > 0 else 0
                 scores['entropy'] = normalized_entropy
-                if normalized_entropy > 0.8:
+                if normalized_entropy > 0.7:
                     labels.append(("Diffuse", normalized_entropy))
-
-                # 6. Recent Context: Attention concentrated in recent positions
-                recent_window = min(5, seq_len - 1)
-                recent_scores = []
-                for i in range(recent_window, seq_len):
-                    recent_attn = np.sum(h_attn[i, max(0, i-recent_window):i])
-                    recent_scores.append(recent_attn)
-                recent_context_score = np.mean(recent_scores) if recent_scores else 0
-                scores['recent_context'] = recent_context_score
-                if recent_context_score > 0.5:
-                    labels.append(("Recent Context", recent_context_score))
 
                 # Determine primary label
                 if labels:
@@ -2010,13 +2079,15 @@ class ModelProber:
 
                 # Generate description
                 descriptions = {
-                    "Previous Token": "Attends to the immediately preceding token",
-                    "First Token": "Attends strongly to the first token (often BOS/system)",
+                    "Previous Token": "Attends to the immediately preceding token (local syntax)",
+                    "First Token": "Attends strongly to the first token (BOS/null attention sink)",
                     "Self-Attention": "Attends primarily to the current position",
-                    "Induction": "Pattern matching head - may copy from similar contexts",
-                    "Diffuse": "Distributes attention broadly across the sequence",
-                    "Recent Context": "Focuses on recent local context",
-                    "Mixed": "No strong specialization detected"
+                    "Duplicate Token": "Attends to positions with the same token (copying behavior)",
+                    "Induction": "Pattern matching - attends after previous occurrence of current token",
+                    "Diffuse": "Distributes attention broadly (high entropy)",
+                    "Recent Context": "Focuses on recent local context window",
+                    "Global": "Attends to early/distant parts of sequence",
+                    "Mixed": "No dominant specialization pattern"
                 }
 
                 head_labels[head_idx] = {
@@ -2236,13 +2307,16 @@ class ModelProber:
             mx.eval(h)
 
         # 4. Get logits
+        # IMPORTANT: Prefer explicit lm_head over as_linear (tied embeddings)
+        # Models like GPT-OSS-20B have untied embeddings where lm_head != embed.as_linear
         if self.config.capture_logits:
-            if hasattr(self.embedding, 'as_linear'):
-                logits = self.embedding.as_linear(h)
-            elif hasattr(self.model, 'lm_head'):
+            if hasattr(self.model, 'lm_head'):
                 logits = self.model.lm_head(h)
             elif hasattr(self.inner_model, 'lm_head'):
                 logits = self.inner_model.lm_head(h)
+            elif hasattr(self.embedding, 'as_linear'):
+                # Fallback to tied embeddings
+                logits = self.embedding.as_linear(h)
             else:
                 logits = h
 
@@ -3120,6 +3194,7 @@ class CausalTracer:
 
                 # Restore clean activations at specified positions using blend mask
                 # More efficient than repeated concatenation
+                seq_len = h.shape[1]
                 blend_mask = mx.zeros((1, seq_len, 1))
                 for pos in restore_positions:
                     if pos < seq_len:
@@ -3148,10 +3223,15 @@ class CausalTracer:
             mx.eval(h)
 
         # Get logits
-        if hasattr(self.embedding, 'as_linear'):
-            logits = self.embedding.as_linear(h)
-        elif hasattr(self.model, 'lm_head'):
+        # IMPORTANT: Prefer explicit lm_head over as_linear (tied embeddings)
+        # Models like GPT-OSS-20B have untied embeddings where lm_head != embed.as_linear
+        if hasattr(self.model, 'lm_head'):
             logits = self.model.lm_head(h)
+        elif hasattr(self.inner_model, 'lm_head'):
+            logits = self.inner_model.lm_head(h)
+        elif hasattr(self.embedding, 'as_linear'):
+            # Fallback to tied embeddings
+            logits = self.embedding.as_linear(h)
         else:
             logits = h
 
@@ -3383,6 +3463,308 @@ class CausalTracer:
         results.critical_layer = layers_to_test[max_idx[0]]
         results.critical_position = positions_to_test[max_idx[1]]
         results.max_recovery = float(indirect_effects[max_idx])
+
+        return results
+
+
+# =============================================================================
+# Steering Vectors (ActAdd)
+# =============================================================================
+
+@dataclass
+class SteeringVectorConfig:
+    """Configuration for steering vector computation."""
+    layer: int = -1  # Layer to extract/inject steering vector (-1 = middle layer)
+    strength: float = 1.0  # Multiplier for steering vector
+    normalize: bool = True  # Whether to normalize the steering vector
+
+
+@dataclass
+class SteeringVectorResults:
+    """Results from steering vector computation and application."""
+    positive_prompt: str = ""
+    negative_prompt: str = ""
+    layer: int = 0
+    steering_vector: Optional[np.ndarray] = None  # Shape: (hidden_dim,)
+    vector_norm: float = 0.0
+
+    # Results from applying the steering vector
+    original_prediction: str = ""
+    original_prob: float = 0.0
+    steered_predictions: Dict[float, Tuple[str, float]] = field(default_factory=dict)  # strength -> (token, prob)
+
+
+class SteeringVectorGenerator:
+    """
+    Compute and apply steering vectors for behavior control.
+
+    Based on ActAdd (Activation Addition) from Turner et al., 2023:
+    https://arxiv.org/abs/2308.10248
+
+    The idea: Extract a "direction" in activation space that represents a concept
+    (e.g., "truthfulness" vs "deception") by computing the mean difference between
+    activations on positive and negative examples.
+
+    Then add this direction (scaled) to steer the model's behavior.
+    """
+
+    def __init__(self, model, tokenizer, topology: Optional[Dict] = None):
+        self.model = model
+        self.tokenizer = tokenizer
+        self.topology = topology or {}
+
+        # Get inner model
+        if hasattr(model, 'model'):
+            self.inner_model = model.model
+        else:
+            self.inner_model = model
+
+        # Get layers
+        if hasattr(self.inner_model, 'layers'):
+            self.layers = list(self.inner_model.layers)
+        else:
+            self.layers = []
+
+        # Get embedding
+        if hasattr(self.inner_model, 'embed_tokens'):
+            self.embedding = self.inner_model.embed_tokens
+        elif hasattr(self.inner_model, 'wte'):
+            self.embedding = self.inner_model.wte
+        else:
+            self.embedding = None
+
+        # Get output norm
+        if hasattr(self.inner_model, 'norm'):
+            self.output_norm = self.inner_model.norm
+        elif hasattr(self.inner_model, 'ln_f'):
+            self.output_norm = self.inner_model.ln_f
+        else:
+            self.output_norm = None
+
+        self.num_layers = len(self.layers)
+
+    def _tokenize(self, text: str) -> List[int]:
+        """Tokenize text."""
+        if hasattr(self.tokenizer, 'encode'):
+            tokens = self.tokenizer.encode(text)
+        else:
+            tokens = self.tokenizer(text)
+        if isinstance(tokens, dict):
+            tokens = tokens['input_ids']
+        return list(tokens)
+
+    def _decode(self, token_id: int) -> str:
+        """Decode single token."""
+        try:
+            if hasattr(self.tokenizer, 'decode'):
+                return self.tokenizer.decode([token_id])
+            return f"[{token_id}]"
+        except:
+            return f"[{token_id}]"
+
+    def _get_layer_activations(self, tokens: List[int], target_layer: int) -> np.ndarray:
+        """
+        Get activations at a specific layer.
+
+        Returns activations at the last token position (shape: hidden_dim).
+        """
+        x = mx.array([tokens])
+
+        # Get embeddings
+        h = self.embedding(x)
+        mx.eval(h)
+
+        # Process through layers up to target
+        causal_mask = "causal"
+        for i, layer in enumerate(self.layers):
+            try:
+                h = layer(h, mask=causal_mask, cache=None)
+            except TypeError:
+                try:
+                    h = layer(h)
+                except:
+                    continue
+
+            if isinstance(h, tuple):
+                h = h[0]
+            mx.eval(h)
+
+            if i == target_layer:
+                break
+
+        # Return last token's activations
+        activations = np.array(h[0, -1, :].astype(mx.float32).tolist())
+        return activations
+
+    def compute_steering_vector(
+        self,
+        positive_prompt: str,
+        negative_prompt: str,
+        layer: int = -1,
+        normalize: bool = True
+    ) -> SteeringVectorResults:
+        """
+        Compute a steering vector from contrastive prompts.
+
+        Args:
+            positive_prompt: Prompt representing the desired direction
+            negative_prompt: Prompt representing the opposite direction
+            layer: Layer to extract from (-1 = middle layer)
+            normalize: Whether to normalize the resulting vector
+
+        Returns:
+            SteeringVectorResults with the computed vector
+        """
+        results = SteeringVectorResults()
+        results.positive_prompt = positive_prompt
+        results.negative_prompt = negative_prompt
+
+        # Default to middle layer
+        if layer < 0:
+            layer = self.num_layers // 2
+        layer = min(layer, self.num_layers - 1)
+        results.layer = layer
+
+        # Tokenize prompts
+        pos_tokens = self._tokenize(positive_prompt)
+        neg_tokens = self._tokenize(negative_prompt)
+
+        # Get activations
+        pos_acts = self._get_layer_activations(pos_tokens, layer)
+        neg_acts = self._get_layer_activations(neg_tokens, layer)
+
+        # Compute steering vector as difference
+        steering_vec = pos_acts - neg_acts
+
+        # Optionally normalize
+        norm = np.linalg.norm(steering_vec)
+        results.vector_norm = float(norm)
+
+        if normalize and norm > 0:
+            steering_vec = steering_vec / norm
+
+        results.steering_vector = steering_vec
+
+        return results
+
+    def _forward_with_steering(
+        self,
+        tokens: List[int],
+        steering_vector: np.ndarray,
+        injection_layer: int,
+        strength: float = 1.0
+    ) -> mx.array:
+        """
+        Run forward pass with steering vector injection.
+
+        The steering vector is added to ALL token positions at the injection layer.
+        """
+        x = mx.array([tokens])
+
+        # Get embeddings
+        h = self.embedding(x)
+        mx.eval(h)
+
+        # Convert steering vector to MLX
+        steer_mx = mx.array(steering_vector.astype(np.float32)) * strength
+        mx.eval(steer_mx)
+
+        # Process through layers
+        causal_mask = "causal"
+        for i, layer in enumerate(self.layers):
+            # Inject steering vector at target layer
+            if i == injection_layer:
+                # Add to all positions
+                h = h + steer_mx.reshape(1, 1, -1)
+                mx.eval(h)
+
+            try:
+                h = layer(h, mask=causal_mask, cache=None)
+            except TypeError:
+                try:
+                    h = layer(h)
+                except:
+                    continue
+
+            if isinstance(h, tuple):
+                h = h[0]
+            mx.eval(h)
+
+        # Output normalization
+        if self.output_norm is not None:
+            h = self.output_norm(h)
+            mx.eval(h)
+
+        # Get logits
+        if hasattr(self.model, 'lm_head'):
+            logits = self.model.lm_head(h)
+        elif hasattr(self.inner_model, 'lm_head'):
+            logits = self.inner_model.lm_head(h)
+        elif hasattr(self.embedding, 'as_linear'):
+            logits = self.embedding.as_linear(h)
+        else:
+            logits = h
+
+        mx.eval(logits)
+        return logits
+
+    def apply_steering(
+        self,
+        test_prompt: str,
+        steering_vector: np.ndarray,
+        injection_layer: int,
+        strengths: List[float] = None
+    ) -> Dict[float, Tuple[str, float, List[Tuple[int, float, str]]]]:
+        """
+        Apply steering vector at various strengths and observe effects.
+
+        Args:
+            test_prompt: Prompt to test steering on
+            steering_vector: The steering vector to apply
+            injection_layer: Layer to inject at
+            strengths: List of strength multipliers to test
+
+        Returns:
+            Dict mapping strength -> (top_token, top_prob, top_k_list)
+        """
+        if strengths is None:
+            strengths = [0.0, 0.5, 1.0, 2.0, 3.0, 5.0]
+
+        tokens = self._tokenize(test_prompt)
+        results = {}
+
+        for strength in strengths:
+            if strength == 0.0:
+                # Baseline - no steering
+                x = mx.array([tokens])
+                logits = self.model(x)
+            else:
+                logits = self._forward_with_steering(
+                    tokens, steering_vector, injection_layer, strength
+                )
+
+            mx.eval(logits)
+
+            # Get predictions
+            step_logits = logits[0, -1, :]
+            probs = mx.softmax(step_logits, axis=-1)
+            mx.eval(probs)
+
+            # Get top-k
+            top_indices = mx.argsort(probs)[-10:][::-1]
+            mx.eval(top_indices)
+
+            probs_np = np.array(probs.astype(mx.float32).tolist())
+            top_k = []
+            for idx in top_indices.tolist():
+                prob_val = float(probs_np[idx])
+                tok_text = self._decode(idx)
+                top_k.append((idx, prob_val, tok_text))
+
+            top_token = top_k[0][2] if top_k else "?"
+            top_prob = top_k[0][1] if top_k else 0.0
+
+            results[strength] = (top_token, top_prob, top_k)
 
         return results
 
@@ -4613,6 +4995,99 @@ def plot_logit_lens_trajectory(results: ProbeResults, target_token: str = None, 
     return fig
 
 
+def plot_logit_lens_position_layer_heatmap(results: ProbeResults, tokenizer=None, pos_range: tuple = None) -> go.Figure:
+    """
+    Plot a 2D heatmap of top-1 prediction probability for each (position, layer) pair.
+
+    X-axis: Token positions
+    Y-axis: Layers
+    Color: Top-1 probability at that position/layer
+    pos_range: Optional (start, end) tuple to filter positions
+    """
+    if not results.logit_lens_by_position:
+        return go.Figure().add_annotation(
+            text="No Full Sequence Logit Lens data available.\nEnable 'Full Sequence' option to capture per-position data.",
+            showarrow=False, font=dict(size=14)
+        )
+
+    positions = sorted(results.logit_lens_by_position.keys())
+    if not positions:
+        return go.Figure()
+
+    # Filter positions by range if specified
+    if pos_range:
+        start_pos, end_pos = pos_range
+        positions = [p for p in positions if start_pos <= p <= end_pos]
+        if not positions:
+            return go.Figure().add_annotation(
+                text="No positions in selected range.",
+                showarrow=False, font=dict(size=14)
+            )
+
+    # Get layers from first position
+    layers = sorted(results.logit_lens_by_position[positions[0]].keys())
+    if not layers:
+        return go.Figure()
+
+    # Build probability matrix: rows = layers, cols = positions
+    prob_matrix = np.zeros((len(layers), len(positions)))
+    token_matrix = [['' for _ in range(len(positions))] for _ in range(len(layers))]
+
+    for col_idx, pos in enumerate(positions):
+        pos_data = results.logit_lens_by_position[pos]
+        for row_idx, layer_idx in enumerate(layers):
+            if layer_idx in pos_data and pos_data[layer_idx]:
+                # Get top-1 prediction
+                top_pred = pos_data[layer_idx][0]  # (token_id, prob, token_text)
+                prob_matrix[row_idx, col_idx] = top_pred[1]  # probability
+                token_matrix[row_idx][col_idx] = top_pred[2][:10]  # token text, truncated
+
+    # Create position labels (show token at that position)
+    # Combine input tokens + generated tokens for full sequence
+    all_tokens = list(results.input_tokens) if results.input_tokens else []
+    if results.generated_tokens:
+        all_tokens.extend(results.generated_tokens)
+
+    pos_labels = []
+    for pos in positions:
+        if tokenizer and pos < len(all_tokens):
+            tok_text = tokenizer.decode([all_tokens[pos]])
+            tok_text = tok_text.replace('\n', '\\n').replace('\t', '\\t')[:8]
+            pos_labels.append(f"{pos}:{tok_text}")
+        else:
+            pos_labels.append(str(pos))
+
+    # Create layer labels - last one is "Final"
+    max_layer = max(layers) if layers else 0
+    layer_labels = [("Final" if l == max_layer else f"L{l}") for l in layers]
+
+    # Create heatmap
+    fig = go.Figure()
+
+    customdata = np.array(token_matrix)
+
+    fig.add_trace(go.Heatmap(
+        z=prob_matrix,
+        x=pos_labels,
+        y=layer_labels,
+        colorscale='Viridis',
+        colorbar=dict(title="Top-1<br>Prob", tickformat=".0%"),
+        customdata=customdata,
+        hovertemplate="Layer: %{y}<br>Position: %{x}<br>Predicts next: %{customdata}<br>Confidence: %{z:.1%}<extra></extra>"
+    ))
+
+    fig.update_layout(
+        title="Logit Lens: Next-Token Prediction Confidence (Position × Layer)",
+        xaxis_title="Position (input token at this position → prediction for next token)",
+        yaxis_title="Layer",
+        height=max(400, len(layers) * 15 + 100),
+        xaxis=dict(tickangle=45, tickfont=dict(size=9)),
+        yaxis=dict(autorange="reversed")  # Layer 0 at top
+    )
+
+    return fig
+
+
 def plot_attention_head_types(results: ProbeResults, layer_idx: int = None) -> go.Figure:
     """
     Plot attention head specialization detection results.
@@ -4634,13 +5109,15 @@ def plot_attention_head_types(results: ProbeResults, layer_idx: int = None) -> g
 
     # Color mapping for head types
     type_colors = {
-        "Previous Token": "#FF6B6B",
-        "First Token": "#4ECDC4",
-        "Self-Attention": "#45B7D1",
-        "Induction": "#96CEB4",
-        "Diffuse": "#FFEAA7",
-        "Recent Context": "#DDA0DD",
-        "Mixed": "#C0C0C0"
+        "Previous Token": "#FF6B6B",  # Red - local syntax
+        "First Token": "#4ECDC4",     # Teal - BOS sink
+        "Self-Attention": "#45B7D1",  # Blue - diagonal
+        "Duplicate Token": "#E74C3C", # Dark red - same token
+        "Induction": "#27AE60",       # Green - pattern matching (key for ICL)
+        "Recent Context": "#DDA0DD",  # Purple - local window
+        "Global": "#9B59B6",          # Dark purple - long range
+        "Diffuse": "#FFEAA7",         # Yellow - uniform
+        "Mixed": "#C0C0C0"            # Gray - unclassified
     }
 
     type_to_num = {t: i for i, t in enumerate(type_colors.keys())}
@@ -4739,6 +5216,114 @@ def plot_attention_head_types(results: ProbeResults, layer_idx: int = None) -> g
             height=max(400, n_heads * 15 + 100),
             margin=dict(t=100)
         )
+
+    return fig
+
+
+def plot_attention_head_types_heatmap(results: ProbeResults) -> go.Figure:
+    """
+    Plot a Layer × Head heatmap showing head types across all layers.
+
+    Y-axis: Layers (0 at top)
+    X-axis: Heads
+    Color: Head type
+    """
+    if not results.attention_head_labels:
+        return go.Figure().add_annotation(
+            text="No attention head labels available.",
+            showarrow=False, font=dict(size=14)
+        )
+
+    layers = sorted(results.attention_head_labels.keys())
+    if not layers:
+        return go.Figure()
+
+    n_heads = len(results.attention_head_labels[layers[0]])
+
+    # Color mapping for head types
+    type_colors = {
+        "Previous Token": "#FF6B6B",
+        "First Token": "#4ECDC4",
+        "Self-Attention": "#45B7D1",
+        "Duplicate Token": "#E74C3C",
+        "Induction": "#27AE60",
+        "Recent Context": "#DDA0DD",
+        "Global": "#9B59B6",
+        "Diffuse": "#FFEAA7",
+        "Mixed": "#C0C0C0"
+    }
+
+    type_to_num = {t: i for i, t in enumerate(type_colors.keys())}
+
+    # Build matrix: rows = layers, cols = heads
+    type_matrix = np.zeros((len(layers), n_heads))
+    hover_matrix = [['' for _ in range(n_heads)] for _ in range(len(layers))]
+    text_matrix = [['' for _ in range(n_heads)] for _ in range(len(layers))]
+
+    for row_idx, l in enumerate(layers):
+        head_labels = results.attention_head_labels[l]
+        for h in range(n_heads):
+            if h in head_labels:
+                info = head_labels[h]
+                type_num = type_to_num.get(info["type"], len(type_colors) - 1)
+                type_matrix[row_idx, h] = type_num
+                hover_matrix[row_idx][h] = f"Layer {l}, Head {h}<br>Type: {info['type']}<br>Score: {info['score']:.1%}"
+                # Short type abbreviation for cell text
+                abbrevs = {
+                    "Previous Token": "Prev",
+                    "First Token": "1st",
+                    "Self-Attention": "Self",
+                    "Duplicate Token": "Dup",
+                    "Induction": "Ind",
+                    "Recent Context": "Rec",
+                    "Global": "Glb",
+                    "Diffuse": "Dif",
+                    "Mixed": "Mix"
+                }
+                text_matrix[row_idx][h] = abbrevs.get(info["type"], "?")
+
+    # Create discrete colorscale
+    color_list = list(type_colors.values())
+    n_colors = len(color_list)
+    colorscale = [[i / (n_colors - 1), c] for i, c in enumerate(color_list)]
+
+    fig = go.Figure(data=go.Heatmap(
+        z=type_matrix,
+        x=[f"H{h}" for h in range(n_heads)],
+        y=[f"L{l}" for l in layers],
+        colorscale=colorscale,
+        customdata=hover_matrix,
+        hovertemplate="%{customdata}<extra></extra>",
+        showscale=False,
+        zmin=0,
+        zmax=n_colors - 1
+    ))
+
+    # Add legend below the chart
+    legend_items = []
+    for type_name, color in type_colors.items():
+        legend_items.append(f"<span style='background-color:{color};color:{color}'>██</span> {type_name}")
+
+    fig.update_layout(
+        title="Head Type Distribution (Layer × Head)",
+        xaxis_title="Head",
+        yaxis_title="Layer",
+        height=max(300, len(layers) * 20 + 150),
+        yaxis=dict(autorange="reversed"),  # Layer 0 at top
+        margin=dict(b=80)
+    )
+
+    # Add legend as annotation at bottom
+    fig.add_annotation(
+        x=0.5,
+        y=-0.15,
+        xref="paper",
+        yref="paper",
+        text="  ".join(legend_items),
+        showarrow=False,
+        font=dict(size=10),
+        align="center"
+    )
 
     return fig
 
@@ -4897,8 +5482,8 @@ The top contributing dimensions may encode specific features relevant to predict
     return interpretation
 
 
-def plot_moe_expert_load(results: ProbeResults, layer_idx: Optional[int] = None) -> go.Figure:
-    """Plot MoE expert load distribution."""
+def plot_moe_expert_load(results: ProbeResults, layer_idx: Optional[int] = None, highlight_top_k: int = 4) -> go.Figure:
+    """Plot MoE expert load distribution with top-K experts highlighted in yellow."""
     if not results.moe_expert_load:
         return go.Figure().add_annotation(text="No MoE data available", showarrow=False)
 
@@ -4908,14 +5493,57 @@ def plot_moe_expert_load(results: ProbeResults, layer_idx: Optional[int] = None)
         experts = list(range(len(load)))
         counts = [load.get(e, 0) for e in experts]
 
+        # Find top-K experts by token count
+        expert_counts = [(e, load.get(e, 0)) for e in experts]
+        expert_counts_sorted = sorted(expert_counts, key=lambda x: x[1], reverse=True)
+
+        # Create rank mapping: expert_id -> rank (1-based)
+        top_k_ranks = {e: rank + 1 for rank, (e, _) in enumerate(expert_counts_sorted[:highlight_top_k])}
+
+        # Use same color scheme as Top-K Expert Weights by Section
+        rank_colors = [
+            '#FFD700',  # Top-1: Gold
+            '#FF00FF',  # Top-2: Magenta
+            '#00FFFF',  # Top-3: Cyan
+            '#FF6600',  # Top-4: Orange
+        ]
+        default_color = '#636EFA'  # Blue for non-top experts
+
+        # Assign colors based on rank
+        colors = []
+        customdata = []
+        for e in experts:
+            if e in top_k_ranks:
+                rank = top_k_ranks[e]
+                colors.append(rank_colors[rank - 1] if rank <= len(rank_colors) else '#FFD700')
+                customdata.append(f'⭐ Top-{rank}')
+            else:
+                colors.append(default_color)
+                customdata.append('')
+
         fig = go.Figure(data=[
-            go.Bar(x=[f"E{e}" for e in experts], y=counts, marker_color='#636EFA')
+            go.Bar(
+                x=[f"E{e}" for e in experts],
+                y=counts,
+                marker_color=colors,
+                hovertemplate="Expert: %{x}<br>Token Count: %{y}<br>%{customdata}<extra></extra>",
+                customdata=customdata
+            )
         ])
         fig.update_layout(
             title=f"Expert Load - Layer {layer_idx}",
             xaxis_title="Expert",
             yaxis_title="Token Count",
-            height=400
+            height=400,
+            # Add legend annotation
+            annotations=[
+                dict(
+                    x=1.0, y=1.15, xref="paper", yref="paper",
+                    text="<b>Top-1</b>: 🟡  <b>Top-2</b>: 🟣  <b>Top-3</b>: 🔵  <b>Top-4</b>: 🟠",
+                    showarrow=False, font=dict(size=11),
+                    xanchor="right"
+                )
+            ]
         )
     else:
         # All layers heatmap
@@ -6028,16 +6656,20 @@ def compute_moe_influence_stats(results: ProbeResults) -> Dict[str, Any]:
     Compute comprehensive MoE expert influence statistics using AI domain metrics.
     Results are cached based on probe results hash.
 
+    NOTE: Each MoE layer has its own independent set of experts. "Expert 24" in Layer 0
+    is completely different from "Expert 24" in Layer 10. Aggregating by expert INDEX
+    across layers shows router bias patterns but does not identify actual expert importance.
+
     Returns dict with:
-    - expert_activation_frequency: How often each expert is selected (normalized)
-    - expert_influence_ranking: Experts ranked by total activation count
+    - expert_activation_frequency: How often each expert INDEX is selected (normalized)
+    - expert_influence_ranking: Expert indices ranked by total activation count
     - router_entropy: Shannon entropy of routing distribution (diversity measure)
     - load_balance_score: 1 - normalized std dev (higher = more balanced)
     - gini_coefficient: Inequality measure (0 = perfect equality, 1 = max inequality)
     - auxiliary_loss_proxy: Approximation of load balancing auxiliary loss
-    - dead_experts: Experts with zero activations
-    - dominant_experts: Experts handling >2x average load
-    - expert_specialization: Per-expert metrics
+    - dead_experts: Expert indices with zero activations in ALL layers
+    - dominant_experts: Expert indices handling >2x average load
+    - expert_specialization: Per-index metrics
     """
     stats = {
         "expert_activation_frequency": {},
@@ -6232,16 +6864,19 @@ def format_moe_influence_report(stats: Dict[str, Any], num_experts: int) -> str:
 
     lines.append("")
 
-    # Expert Influence Ranking
-    lines.append("### Expert Influence Ranking\n")
-    lines.append("*Ranked by total activation count across all MoE layers*\n")
+    # Expert Index Frequency (Note: indices, not actual experts)
+    lines.append("### Expert Index Frequency\n")
+    lines.append("""⚠️ **Important Caveat:** Each MoE layer has its **own independent set of experts**.
+"Expert 24" in Layer 0 is completely different weights than "Expert 24" in Layer 10 - they only share an index number.
+This table shows which **expert indices** are most frequently selected across all layers,
+which can reveal router bias patterns but does **not** identify "the most important expert" in the model.\n""")
 
     ranking = stats.get("expert_influence_ranking", [])
     if ranking:
         # Show top 10 and bottom 5
-        lines.append("**Top Influential Experts:**")
-        lines.append("| Rank | Expert | Activations | Share | Status |")
-        lines.append("|------|--------|-------------|-------|--------|")
+        lines.append("**Most Frequently Selected Indices (across all layers):**")
+        lines.append("| Rank | Index | Activations | Share | Status |")
+        lines.append("|------|-------|-------------|-------|--------|")
 
         avg_share = 1.0 / num_experts if num_experts > 0 else 0
 
@@ -6258,17 +6893,17 @@ def format_moe_influence_report(stats: Dict[str, Any], num_experts: int) -> str:
             else:
                 status = "✓ Normal"
 
-            lines.append(f"| #{item['rank']} | Expert {item['expert_id']} | {item['activations']:,} | {item['frequency']*100:.2f}% | {status} |")
+            lines.append(f"| #{item['rank']} | E{item['expert_id']} | {item['activations']:,} | {item['frequency']*100:.2f}% | {status} |")
 
-        # Show bottom experts if there are many
+        # Show bottom indices if there are many
         if len(ranking) > 15:
             lines.append("")
-            lines.append("**Least Active Experts:**")
-            lines.append("| Rank | Expert | Activations | Share | Status |")
-            lines.append("|------|--------|-------------|-------|--------|")
+            lines.append("**Least Frequently Selected Indices:**")
+            lines.append("| Rank | Index | Activations | Share | Status |")
+            lines.append("|------|-------|-------------|-------|--------|")
             for item in ranking[-5:]:
                 status = "💀 Dead" if item["activations"] == 0 else "⬇️ Underutilized" if item["frequency"] < 0.25 * avg_share else "📉 Low"
-                lines.append(f"| #{item['rank']} | Expert {item['expert_id']} | {item['activations']:,} | {item['frequency']*100:.2f}% | {status} |")
+                lines.append(f"| #{item['rank']} | E{item['expert_id']} | {item['activations']:,} | {item['frequency']*100:.2f}% | {status} |")
 
     lines.append("")
 
@@ -7271,7 +7906,12 @@ def _streamlit_app():
     )
 
     st.title("🔬 MLXLMProbe")
-    st.caption("Universal probing tool for MLX language models")
+    st.caption("v0.1.0 | Universal probing tool for MLX language models")
+    st.markdown(
+        "[![GitHub stars](https://img.shields.io/github/stars/scouzi1966/MLXLMProbe?style=social)](https://github.com/scouzi1966/MLXLMProbe) "
+        "[![GitHub issues](https://img.shields.io/github/issues/scouzi1966/MLXLMProbe)](https://github.com/scouzi1966/MLXLMProbe/issues)"
+    )
+    st.warning("⚠️ **Early Release**: Tested primarily on `mlx-community/gpt-oss-20b-MXFP4-Q8`. Other models may have varying compatibility.", icon="🧪")
 
     # Sidebar - Model Selection
     st.sidebar.header("Model")
@@ -7748,6 +8388,7 @@ def _streamlit_app():
 
     # Always add new feature tabs
     tab_names.append("Knowledge Localization")
+    tab_names.append("Steering Vectors")  # MI: ActAdd-style behavior steering
     tab_names.append("Generation Replay")
 
     tabs = st.tabs(tab_names)
@@ -7759,6 +8400,8 @@ def _streamlit_app():
     if results.is_moe:
         tab_idx += 1
     tab_knowledge = tabs[tab_idx]
+    tab_idx += 1
+    tab_steering = tabs[tab_idx]
     tab_idx += 1
     tab_replay = tabs[tab_idx]
 
@@ -9203,25 +9846,46 @@ This shows how much each component pushes toward the predicted token.
                             })
                         st.dataframe(pd.DataFrame(type_data), hide_index=True, use_container_width=True)
 
-                # Per-layer head type visualization
-                if selected_layer in results.attention_head_labels:
-                    st.markdown(f"**Head Types at Layer {selected_layer}:**")
-                    fig_head_types = plot_attention_head_types(results, layer_idx=selected_layer)
+                # Layer × Head heatmap (all layers overview)
+                st.markdown("**Head Types Across All Layers:**")
+                fig_all_layers = plot_attention_head_types_heatmap(results)
+                st.plotly_chart(fig_all_layers, use_container_width=True)
+
+                # Per-layer head type visualization with layer selector
+                available_layers = sorted(results.attention_head_labels.keys())
+                if available_layers:
+                    head_type_layer = st.selectbox(
+                        "Select Layer for Head Types",
+                        available_layers,
+                        format_func=lambda x: f"Layer {x}",
+                        key="head_type_layer_select"
+                    )
+
+                    st.markdown(f"**Head Types at Layer {head_type_layer}:**")
+                    fig_head_types = plot_attention_head_types(results, layer_idx=head_type_layer)
                     st.plotly_chart(fig_head_types, use_container_width=True)
 
-                    # Show specific head's classification when one is selected
-                    if selected_head != "Average (all heads)":
-                        head_idx = int(selected_head.split()[-1])
-                        layer_labels = results.attention_head_labels.get(selected_layer, {})
-                        if head_idx in layer_labels:
-                            info = layer_labels[head_idx]
-                            st.info(f"**{selected_head} Classification:** {info['type']} (Score: {info['score']:.1%})\n\n{info['description']}")
+                    # Show details for heads in this layer
+                    layer_labels = results.attention_head_labels.get(head_type_layer, {})
+                    if layer_labels:
+                        head_options = [f"Head {h}" for h in sorted(layer_labels.keys())]
+                        selected_head_detail = st.selectbox(
+                            "Select Head for Details",
+                            ["(Select a head)"] + head_options,
+                            key="head_type_head_select"
+                        )
 
-                            # Show all scores for this head
-                            with st.expander("Detailed Scores", expanded=False):
-                                all_scores = info.get("all_scores", {})
-                                score_data = [{"Metric": k, "Score": f"{v:.3f}"} for k, v in all_scores.items()]
-                                st.dataframe(pd.DataFrame(score_data), hide_index=True)
+                        if selected_head_detail != "(Select a head)":
+                            head_idx = int(selected_head_detail.split()[-1])
+                            if head_idx in layer_labels:
+                                info = layer_labels[head_idx]
+                                st.info(f"**{selected_head_detail} Classification:** {info['type']} (Score: {info['score']:.1%})\n\n{info['description']}")
+
+                                # Show all scores for this head
+                                with st.expander("Detailed Scores", expanded=False):
+                                    all_scores = info.get("all_scores", {})
+                                    score_data = [{"Metric": k, "Score": f"{v:.3f}"} for k, v in all_scores.items()]
+                                    st.dataframe(pd.DataFrame(score_data), hide_index=True)
 
             # Attention vs Distance Analysis (RoPE effect)
             st.markdown("---")
@@ -9449,16 +10113,63 @@ This shows how much each component pushes toward the predicted token.
             """)
 
         if results.logit_lens_predictions:
-            # Main heatmap visualization
-            st.markdown("### Per-Layer Top Predictions")
-            fig_lens = plot_logit_lens(results, tokenizer)
-            st.plotly_chart(fig_lens, use_container_width=True)
+            # Position × Layer heatmap (if full sequence data available)
+            if results.logit_lens_by_position:
+                st.markdown("### Position × Layer Heatmap")
+                st.caption("Top-1 prediction confidence at each position and layer")
 
-            # Trajectory plot
-            st.markdown("### Prediction Trajectory")
-            st.caption("How does the probability of the final prediction evolve across layers?")
-            fig_traj = plot_logit_lens_trajectory(results, tokenizer=tokenizer)
-            st.plotly_chart(fig_traj, use_container_width=True)
+                # Get position range info
+                all_positions = sorted(results.logit_lens_by_position.keys())
+                min_pos, max_pos = min(all_positions), max(all_positions)
+
+                # Build token list for labels
+                all_tokens = list(results.input_tokens) if results.input_tokens else []
+                if results.generated_tokens:
+                    all_tokens.extend(results.generated_tokens)
+
+                # Position range slider - put it first so it defines the range
+                col_start, col_slider, col_end = st.columns([1, 6, 1])
+
+                # Initialize default range in session state if not set
+                if "logit_lens_pos_range" not in st.session_state:
+                    st.session_state.logit_lens_pos_range = (min_pos, max_pos)
+
+                # Slider in middle - key automatically manages session state
+                with col_slider:
+                    pos_range = st.slider(
+                        "Position Range",
+                        min_value=min_pos,
+                        max_value=max_pos,
+                        value=st.session_state.logit_lens_pos_range,
+                        key="logit_lens_pos_slider",
+                        label_visibility="collapsed"
+                    )
+                    # Update session state (for token labels)
+                    st.session_state.logit_lens_pos_range = pos_range
+
+                # Show start token label
+                with col_start:
+                    if tokenizer and all_tokens and pos_range[0] < len(all_tokens):
+                        start_tok = tokenizer.decode([all_tokens[pos_range[0]]])
+                        start_tok = start_tok.replace('\n', '\\n').replace('\t', '\\t')[:12]
+                        st.markdown(f"**{pos_range[0]}**<br>`{start_tok}`", unsafe_allow_html=True)
+
+                # Show end token label
+                with col_end:
+                    if tokenizer and all_tokens and pos_range[1] < len(all_tokens):
+                        end_tok = tokenizer.decode([all_tokens[pos_range[1]]])
+                        end_tok = end_tok.replace('\n', '\\n').replace('\t', '\\t')[:12]
+                        st.markdown(f"**{pos_range[1]}**<br>`{end_tok}`", unsafe_allow_html=True)
+
+                # Plot heatmap with selected range
+                fig_pos_layer = plot_logit_lens_position_layer_heatmap(results, tokenizer=tokenizer, pos_range=pos_range)
+                st.plotly_chart(fig_pos_layer, use_container_width=True)
+            else:
+                # Fallback: show single-position trajectory
+                st.markdown("### Prediction Trajectory")
+                st.caption("How does the probability of the final prediction evolve across layers?")
+                fig_traj = plot_logit_lens_trajectory(results, tokenizer=tokenizer)
+                st.plotly_chart(fig_traj, use_container_width=True)
 
             # Per-layer detailed view
             st.markdown("---")
@@ -9479,7 +10190,7 @@ This shows how much each component pushes toward the predicted token.
                 with col_preds:
                     preds = results.logit_lens_predictions[selected_layer]
                     if preds:
-                        st.markdown(f"**Top-5 predictions at Layer {selected_layer}:**")
+                        st.markdown(f"**Top-5 next-token predictions at Layer {selected_layer}:**")
                         pred_data = []
                         for rank, (tok_id, prob, tok_text) in enumerate(preds):
                             pred_data.append({
@@ -9512,7 +10223,7 @@ This shows how much each component pushes toward the predicted token.
             if results.logit_lens_by_position:
                 st.markdown("---")
                 st.markdown("### Full Sequence Analysis")
-                st.caption("Per-position predictions across layers (Full Sequence mode)")
+                st.caption("Per-position **next-token** predictions across layers — what does each layer predict comes AFTER each token?")
 
                 positions = sorted(results.logit_lens_by_position.keys())
                 layers_available = sorted(results.logit_lens_by_position[positions[0]].keys()) if positions else []
@@ -9591,7 +10302,7 @@ This shows how much each component pushes toward the predicted token.
                         if selected_pos < len(all_tokens):
                             tok_id = all_tokens[selected_pos]
                             tok_text = tokenizer.decode([tok_id]) if tokenizer else f"[{tok_id}]"
-                            st.info(f"**Token at position {selected_pos}:** `{tok_text}` (ID: {tok_id})")
+                            st.info(f"**Input token at position {selected_pos}:** `{tok_text}` — predictions below show what each layer thinks comes **next**")
 
                     # Get predictions for selected position across all layers
                     pos_data = results.logit_lens_by_position[selected_pos]
@@ -9603,10 +10314,11 @@ This shows how much each component pushes toward the predicted token.
                     # Layer selection dropdown BEFORE heatmap so we can highlight selected layer
                     col_ll_layer, col_ll_preds = st.columns([1, 2])
                     with col_ll_layer:
+                        max_layer = max(layers) if layers else 0
                         ll_layer = st.selectbox(
                             "Layer",
                             layers,
-                            format_func=lambda x: f"Layer {x}",
+                            format_func=lambda x: "Final" if x == max_layer else f"Layer {x}",
                             key="logit_lens_pos_layer_select"
                         )
 
@@ -9682,7 +10394,7 @@ This shows how much each component pushes toward the predicted token.
                     ))
 
                     fig_pos_lens.update_layout(
-                        title=f"Logit Lens at Position {selected_pos}",
+                        title=f"Logit Lens at Position {selected_pos} (Next Token Prediction)",
                         xaxis_title="Layer",
                         yaxis_title="Prediction Rank",
                         height=350,
@@ -9793,29 +10505,38 @@ The Logit Lens will show what each layer "predicts" when projected through the f
         with col_mode:
             patch_mode = st.selectbox(
                 "Patch Mode",
-                ["Single Site", "Full Scan"],
-                help="Single Site: patch one (layer, position). Full Scan: compute patch effects for all sites.",
+                ["Full Scan", "Single Site"],
+                help="Full Scan: compute causal effects for all (layer, position) pairs. Single Site: patch one specific site.",
                 key="patch_mode"
             )
 
         if patch_mode == "Single Site":
+            # Get actual token count from clean prompt
+            prober = st.session_state.get('prober')
+            if prober and patch_clean_prompt and hasattr(prober, 'tokenizer') and prober.tokenizer:
+                clean_tokens = prober.tokenizer.encode(patch_clean_prompt)
+                max_pos = len(clean_tokens)
+            else:
+                max_pos = 10  # Default fallback
+
             col_layer, col_pos = st.columns(2)
             with col_layer:
                 patch_layer = st.number_input(
                     "Layer to Patch",
                     min_value=0,
                     max_value=results.num_layers - 1 if results.num_layers else 32,
-                    value=results.num_layers // 2 if results.num_layers else 16,
+                    value=min(results.num_layers // 2 if results.num_layers else 16, results.num_layers - 1 if results.num_layers else 16),
                     key="patch_layer"
                 )
             with col_pos:
-                max_pos = len(results.input_tokens) if results.input_tokens else 10
+                # Use last position as default (where prediction happens)
+                default_pos = max(0, max_pos - 1)
                 patch_pos = st.number_input(
                     "Position to Patch",
                     min_value=0,
-                    max_value=max_pos - 1,
-                    value=max_pos - 1,
-                    help="Position in the sequence (0-indexed)",
+                    max_value=max(0, max_pos - 1),
+                    value=default_pos,
+                    help=f"Position in the sequence (0-{max_pos-1}, based on clean prompt with {max_pos} tokens)",
                     key="patch_pos"
                 )
 
@@ -9866,31 +10587,106 @@ The Logit Lens will show what each layer "predicts" when projected through the f
                                 else:
                                     st.error(f"Layer {layer_idx} not captured. Adjust layer sampling settings.")
                             else:
-                                # Full scan - compute differences across all layers and positions
-                                effects = {}
-                                common_layers = set(clean_results.layer_outputs.keys()) & set(alt_results.layer_outputs.keys())
+                                # Full scan - PROPER causal patching with recovery scores
+                                # Use CausalTracer to run actual patching experiments
+                                from dataclasses import dataclass
 
-                                for layer_idx in sorted(common_layers):
-                                    clean_acts = clean_results.layer_outputs[layer_idx]
-                                    alt_acts = alt_results.layer_outputs[layer_idx]
+                                # Get target token (what clean prompt predicts)
+                                target_token_id = clean_results.top_k_tokens[0][0] if clean_results.top_k_tokens else None
+                                target_token_text = clean_results.top_k_tokens[0][2] if clean_results.top_k_tokens else "?"
 
-                                    min_pos = min(clean_acts.shape[1], alt_acts.shape[1])
-                                    layer_effects = []
+                                if target_token_id is None:
+                                    st.error("Could not determine target token from clean prompt")
+                                else:
+                                    # Create tracer
+                                    tracer = CausalTracer(
+                                        prober.model,
+                                        prober.tokenizer,
+                                        topology=prober.topology
+                                    )
 
-                                    for pos in range(min_pos):
-                                        diff_norm = np.linalg.norm(
-                                            alt_acts[0, pos, :] - clean_acts[0, pos, :]
-                                        )
-                                        layer_effects.append(diff_norm)
+                                    # Tokenize prompts
+                                    clean_tokens = tracer._tokenize(patch_clean_prompt)
+                                    alt_tokens = tracer._tokenize(patch_alt_prompt)
 
-                                    effects[layer_idx] = layer_effects
+                                    # Ensure same length by padding shorter sequence
+                                    max_len = max(len(clean_tokens), len(alt_tokens))
+                                    if len(clean_tokens) < max_len:
+                                        # Pad clean tokens (use last token as padding)
+                                        pad_token = clean_tokens[-1] if clean_tokens else 0
+                                        clean_tokens = clean_tokens + [pad_token] * (max_len - len(clean_tokens))
+                                    if len(alt_tokens) < max_len:
+                                        # Pad alt tokens
+                                        pad_token = alt_tokens[-1] if alt_tokens else 0
+                                        alt_tokens = alt_tokens + [pad_token] * (max_len - len(alt_tokens))
 
-                                st.session_state.patch_effects = {
-                                    "mode": "full",
-                                    "effects": effects,
-                                    "clean_top": clean_results.top_k_tokens[:5] if clean_results.top_k_tokens else [],
-                                    "alt_top": alt_results.top_k_tokens[:5] if alt_results.top_k_tokens else []
-                                }
+                                    # Get embeddings
+                                    clean_x = mx.array([clean_tokens])
+                                    alt_x = mx.array([alt_tokens])
+
+                                    clean_embeds = tracer.embedding(clean_x)
+                                    alt_embeds = tracer.embedding(alt_x)
+                                    mx.eval(clean_embeds)
+                                    mx.eval(alt_embeds)
+
+                                    # Get baseline probabilities
+                                    clean_logits = tracer._forward_with_intervention(clean_embeds, clean_embeds)
+                                    clean_prob = tracer._get_target_prob(clean_logits, target_token_id)
+
+                                    alt_logits = tracer._forward_with_intervention(alt_embeds, alt_embeds)
+                                    alt_prob = tracer._get_target_prob(alt_logits, target_token_id)
+
+                                    st.write(f"**Target token:** `{target_token_text}` (ID: {target_token_id})")
+                                    st.write(f"**Clean P(target):** {clean_prob:.2%}")
+                                    st.write(f"**Corrupted P(target):** {alt_prob:.2%}")
+
+                                    # Run patching for each (layer, position)
+                                    # Patch = inject clean activation into corrupted run
+                                    recovery_scores = {}
+                                    seq_len = len(clean_tokens)  # Both are now same length
+                                    total_patches = tracer.num_layers * seq_len
+                                    progress_bar = st.progress(0, text="Running causal patching...")
+
+                                    for layer_idx in range(tracer.num_layers):
+                                        layer_scores = []
+                                        for pos in range(seq_len):
+                                            # Run corrupted with clean patched at (layer, pos)
+                                            patched_logits = tracer._forward_with_intervention(
+                                                clean_embeds,
+                                                alt_embeds,
+                                                restore_layer=layer_idx,
+                                                restore_positions=[pos]
+                                            )
+                                            patched_prob = tracer._get_target_prob(patched_logits, target_token_id)
+
+                                            # Recovery = how much target prob is restored
+                                            # Normalized: (patched - alt) / (clean - alt)
+                                            if clean_prob > alt_prob:
+                                                recovery = (patched_prob - alt_prob) / (clean_prob - alt_prob + 1e-10)
+                                            else:
+                                                recovery = 0.0
+                                            layer_scores.append(recovery)
+
+                                            # Update progress
+                                            done = layer_idx * seq_len + pos + 1
+                                            progress_bar.progress(done / total_patches, text=f"Patching L{layer_idx} P{pos}...")
+
+                                        recovery_scores[layer_idx] = layer_scores
+
+                                    progress_bar.empty()
+
+                                    st.session_state.patch_effects = {
+                                        "mode": "full_causal",
+                                        "recovery_scores": recovery_scores,
+                                        "clean_prob": clean_prob,
+                                        "alt_prob": alt_prob,
+                                        "target_token": target_token_text,
+                                        "target_token_id": target_token_id,
+                                        "clean_top": clean_results.top_k_tokens[:5] if clean_results.top_k_tokens else [],
+                                        "alt_top": alt_results.top_k_tokens[:5] if alt_results.top_k_tokens else [],
+                                        "clean_tokens": clean_tokens,
+                                        "alt_tokens": alt_tokens
+                                    }
 
                             st.success("Patching analysis complete!")
                         else:
@@ -9936,22 +10732,88 @@ The Logit Lens will show what each layer "predicts" when projected through the f
 - To see actual output changes, compare predictions above
                 """)
 
+            elif effects["mode"] == "full_causal":
+                # Proper causal patching with recovery scores
+                recovery_data = effects["recovery_scores"]
+                layers = sorted(recovery_data.keys())
+
+                if layers:
+                    max_pos = max(len(recovery_data[l]) for l in layers)
+
+                    # Build heatmap matrix
+                    heatmap = np.zeros((len(layers), max_pos))
+                    for row_idx, layer_idx in enumerate(layers):
+                        layer_scores = recovery_data[layer_idx]
+                        heatmap[row_idx, :len(layer_scores)] = layer_scores
+
+                    # Get token labels for x-axis
+                    clean_tokens = effects.get("clean_tokens", [])
+                    tokenizer = st.session_state.get('prober').tokenizer if st.session_state.get('prober') else None
+                    if tokenizer and clean_tokens:
+                        x_labels = [f"{i}:{tokenizer.decode([t])[:8]}" for i, t in enumerate(clean_tokens[:max_pos])]
+                    else:
+                        x_labels = [f"P{i}" for i in range(max_pos)]
+
+                    # Create heatmap - use RdYlGn (Red=low, Yellow=mid, Green=high recovery)
+                    fig_patch = go.Figure(data=go.Heatmap(
+                        z=heatmap,
+                        x=x_labels,
+                        y=[f"L{l}" for l in layers],
+                        colorscale='RdYlGn',
+                        zmin=0,
+                        zmax=1,
+                        colorbar=dict(title="Recovery", tickformat=".0%"),
+                        hovertemplate="Layer: %{y}<br>Position: %{x}<br>Recovery: %{z:.1%}<extra></extra>"
+                    ))
+
+                    fig_patch.update_layout(
+                        title=f"Causal Patching: Recovery of P('{effects['target_token']}')",
+                        xaxis_title="Position (token)",
+                        yaxis_title="Layer",
+                        height=max(400, len(layers) * 15 + 100),
+                        xaxis=dict(tickangle=45)
+                    )
+
+                    st.plotly_chart(fig_patch, use_container_width=True)
+
+                    # Find site with maximum recovery
+                    max_recovery = 0
+                    max_layer = 0
+                    max_pos_idx = 0
+                    for layer_idx in layers:
+                        for pos, recovery in enumerate(recovery_data[layer_idx]):
+                            if recovery > max_recovery:
+                                max_recovery = recovery
+                                max_layer = layer_idx
+                                max_pos_idx = pos
+
+                    pos_label = x_labels[max_pos_idx] if max_pos_idx < len(x_labels) else f"P{max_pos_idx}"
+                    st.success(f"**Maximum recovery:** Layer {max_layer}, Position {pos_label} → {max_recovery:.1%} recovery")
+
+                    st.markdown(f"""
+**Interpretation:**
+- **Green** = Patching clean activation here RESTORES the correct answer (`{effects['target_token']}`)
+- **Red** = Patching here has little effect
+- **Key finding**: The knowledge `"{effects['target_token']}"` is stored/processed at green hotspots
+- **ROME insight**: Facts are typically stored in **middle-layer MLPs** at the **subject position**
+
+**Baseline:**
+- Clean P(target): {effects['clean_prob']:.1%}
+- Corrupted P(target): {effects['alt_prob']:.1%}
+                    """)
+
             else:
-                # Full scan heatmap
-                effects_data = effects["effects"]
+                # Old mode: Full scan difference heatmap (backwards compat)
+                effects_data = effects.get("effects", {})
                 layers = sorted(effects_data.keys())
 
                 if layers:
-                    # Find max positions across all layers
                     max_pos = max(len(effects_data[l]) for l in layers)
-
-                    # Build heatmap matrix
                     heatmap = np.zeros((len(layers), max_pos))
                     for row_idx, layer_idx in enumerate(layers):
                         layer_effects = effects_data[layer_idx]
                         heatmap[row_idx, :len(layer_effects)] = layer_effects
 
-                    # Create heatmap
                     fig_patch = go.Figure(data=go.Heatmap(
                         z=heatmap,
                         x=[f"P{i}" for i in range(max_pos)],
@@ -9968,26 +10830,7 @@ The Logit Lens will show what each layer "predicts" when projected through the f
                     )
 
                     st.plotly_chart(fig_patch, use_container_width=True)
-
-                    # Find site with maximum difference
-                    max_diff = 0
-                    max_layer = 0
-                    max_pos = 0
-                    for layer_idx in layers:
-                        for pos, diff in enumerate(effects_data[layer_idx]):
-                            if diff > max_diff:
-                                max_diff = diff
-                                max_layer = layer_idx
-                                max_pos = pos
-
-                    st.info(f"**Maximum difference:** Layer {max_layer}, Position {max_pos} (norm = {max_diff:.4f})")
-
-                    st.markdown("""
-**Interpretation:**
-- Bright areas show where activations differ most between prompts
-- These sites likely encode information specific to each prompt
-- The pattern reveals how information flows differently for each input
-                    """)
+                    st.warning("Note: This shows activation differences, not causal importance. Use Full Scan mode for proper causal patching.")
 
         # Contrastive Analysis Section
         if st.session_state.patch_clean_results and st.session_state.patch_alt_results:
@@ -10314,10 +11157,17 @@ The Logit Lens will show what each layer "predicts" when projected through the f
                         fig_probs = plot_moe_router_probs(results, selected_moe_layer, tokenizer)
                         st.plotly_chart(fig_probs, use_container_width=True)
 
-                        # Show expert selection pattern
+                        # Show expert selection pattern with its own layer selector
                         st.markdown("#### Expert Selection Pattern")
-                        st.caption("Marker size indicates router confidence")
-                        fig_select = plot_moe_expert_selection(results, selected_moe_layer, tokenizer)
+                        st.caption("Marker size indicates router confidence. Colors: 🟡 Top-1, 🟣 Top-2, 🔵 Top-3, 🟠 Top-4")
+                        selection_layer = st.selectbox(
+                            "Layer",
+                            moe_layers,
+                            index=moe_layers.index(selected_moe_layer) if selected_moe_layer in moe_layers else 0,
+                            format_func=lambda x: f"Layer {x}",
+                            key="expert_selection_layer"
+                        )
+                        fig_select = plot_moe_expert_selection(results, selection_layer, tokenizer)
                         st.plotly_chart(fig_select, use_container_width=True)
 
                         # Top-K Expert Weights by Section (System, User, Response)
@@ -10430,15 +11280,22 @@ Labels inside bars show expert ID (E0-E{results.num_experts-1 if results.num_exp
                             else:
                                 st.info("No expert selection data available")
 
-                        # Expert load for this layer
-                        st.markdown("#### Expert Load (This Layer)")
-                        st.caption("Token count per expert in this layer. Taller bars = higher influence (expert processed more tokens)")
-                        fig_layer_load = plot_moe_expert_load(results, selected_moe_layer)
+                        # Expert load for this layer with its own layer selector
+                        st.markdown("#### Expert Load")
+                        st.caption("Token count per expert. Taller bars = higher influence. Top 4 experts highlighted in yellow.")
+                        expert_load_layer = st.selectbox(
+                            "Layer",
+                            moe_layers,
+                            index=moe_layers.index(selected_moe_layer) if selected_moe_layer in moe_layers else 0,
+                            format_func=lambda x: f"Layer {x}",
+                            key="expert_load_layer"
+                        )
+                        fig_layer_load = plot_moe_expert_load(results, expert_load_layer, highlight_top_k=4)
                         st.plotly_chart(fig_layer_load, use_container_width=True)
 
                         # Load balance statistics
-                        if selected_moe_layer in results.moe_expert_load:
-                            load = results.moe_expert_load[selected_moe_layer]
+                        if expert_load_layer in results.moe_expert_load:
+                            load = results.moe_expert_load[expert_load_layer]
                             counts = list(load.values())
                             if counts:
                                 total = sum(counts)
@@ -10899,6 +11756,220 @@ Top 5 Most Active Experts:
                 st.info(f"The critical layer ({trace_results.critical_layer}) is in the **latter half** of the network, where factual associations are typically stored in MLP layers.")
             else:
                 st.info(f"The critical layer ({trace_results.critical_layer}) is in the **earlier half** of the network, which may indicate information is propagated early.")
+
+    # Steering Vectors tab
+    with tab_steering:
+        st.subheader("Steering Vectors (ActAdd)")
+
+        with st.expander("ℹ️ What is this? (click to learn)", expanded=False):
+            st.markdown("""
+**Steering Vectors** allow you to control model behavior by adding direction vectors to activations.
+
+**How it works (ActAdd method):**
+1. Define a **positive prompt** representing the desired behavior (e.g., "I love being honest")
+2. Define a **negative prompt** representing the opposite (e.g., "I love being deceptive")
+3. Compute the **steering vector** as the difference in activations
+4. Add this vector (scaled) to any prompt to steer the model's behavior
+
+**Applications:**
+- Increase/decrease truthfulness, helpfulness, formality
+- Test safety behaviors and refusal patterns
+- Explore latent space structure
+- Understand what directions in activation space encode
+
+**References:**
+- [Activation Addition (ActAdd)](https://arxiv.org/abs/2308.10248) - Turner et al., 2023
+- "Representation Engineering" - Zou et al., 2023
+            """)
+
+        # Initialize state
+        if 'steering_vector' not in st.session_state:
+            st.session_state.steering_vector = None
+        if 'steering_results' not in st.session_state:
+            st.session_state.steering_results = None
+
+        st.markdown("### 1. Define Contrastive Prompts")
+
+        col_pos, col_neg = st.columns(2)
+        with col_pos:
+            steering_pos_prompt = st.text_area(
+                "Positive Prompt (desired direction)",
+                value="I think being honest is important because",
+                height=80,
+                help="Prompt representing the behavior you want to steer toward",
+                key="steering_pos_prompt"
+            )
+        with col_neg:
+            steering_neg_prompt = st.text_area(
+                "Negative Prompt (opposite direction)",
+                value="I think being deceptive is important because",
+                height=80,
+                help="Prompt representing the opposite behavior",
+                key="steering_neg_prompt"
+            )
+
+        col_layer, col_normalize = st.columns(2)
+        with col_layer:
+            steering_layer = st.slider(
+                "Extraction Layer",
+                min_value=0,
+                max_value=results.num_layers - 1 if results.num_layers else 32,
+                value=results.num_layers // 2 if results.num_layers else 16,
+                help="Layer to extract/inject the steering vector",
+                key="steering_layer"
+            )
+        with col_normalize:
+            steering_normalize = st.checkbox(
+                "Normalize vector",
+                value=True,
+                help="Normalize steering vector to unit length",
+                key="steering_normalize"
+            )
+
+        if st.button("Compute Steering Vector", type="primary", key="compute_steering"):
+            if not steering_pos_prompt or not steering_neg_prompt:
+                st.error("Please provide both positive and negative prompts.")
+            else:
+                with st.spinner("Computing steering vector..."):
+                    try:
+                        prober = st.session_state.get('prober')
+                        if prober:
+                            generator = SteeringVectorGenerator(
+                                prober.model,
+                                prober.tokenizer,
+                                topology=prober.topology
+                            )
+                            sv_results = generator.compute_steering_vector(
+                                positive_prompt=steering_pos_prompt,
+                                negative_prompt=steering_neg_prompt,
+                                layer=steering_layer,
+                                normalize=steering_normalize
+                            )
+                            st.session_state.steering_vector = sv_results.steering_vector
+                            st.session_state.steering_results = sv_results
+                            st.session_state.steering_generator = generator
+                            st.success(f"Steering vector computed! Norm: {sv_results.vector_norm:.4f}")
+                        else:
+                            st.error("Model prober not available. Please run inference first.")
+                    except Exception as e:
+                        import traceback
+                        st.error(f"Failed to compute steering vector: {str(e)}")
+                        st.code(traceback.format_exc())
+
+        # Display steering vector info
+        if st.session_state.steering_results:
+            sv_results = st.session_state.steering_results
+
+            st.markdown("---")
+            st.markdown("### Steering Vector Properties")
+
+            col_v1, col_v2, col_v3 = st.columns(3)
+            with col_v1:
+                st.metric("Layer", sv_results.layer)
+            with col_v2:
+                st.metric("Vector Norm", f"{sv_results.vector_norm:.4f}")
+            with col_v3:
+                if sv_results.steering_vector is not None:
+                    st.metric("Dimensions", sv_results.steering_vector.shape[0])
+
+            # Test steering
+            st.markdown("---")
+            st.markdown("### 2. Test Steering Effect")
+
+            test_prompt = st.text_input(
+                "Test Prompt",
+                value="When asked to lie, I would",
+                help="Prompt to test the steering effect on (next token prediction)",
+                key="steering_test_prompt"
+            )
+
+            col_strengths = st.multiselect(
+                "Steering Strengths to Test",
+                options=[0.0, 0.5, 1.0, 2.0, 3.0, 5.0, -1.0, -2.0],
+                default=[0.0, 1.0, 2.0, 3.0],
+                help="Multipliers for the steering vector (negative = opposite direction)",
+                key="steering_strengths"
+            )
+
+            if st.button("Apply Steering", key="apply_steering"):
+                if not test_prompt:
+                    st.error("Please provide a test prompt.")
+                elif st.session_state.steering_vector is None:
+                    st.error("Please compute a steering vector first.")
+                else:
+                    with st.spinner("Applying steering at different strengths..."):
+                        try:
+                            generator = st.session_state.steering_generator
+                            steer_effects = generator.apply_steering(
+                                test_prompt=test_prompt,
+                                steering_vector=st.session_state.steering_vector,
+                                injection_layer=sv_results.layer,
+                                strengths=sorted(col_strengths)
+                            )
+
+                            # Display results
+                            st.markdown("#### Steering Effects on Next Token Prediction")
+
+                            # Create comparison table
+                            data = []
+                            for strength in sorted(steer_effects.keys()):
+                                top_token, top_prob, top_k = steer_effects[strength]
+                                data.append({
+                                    "Strength": strength,
+                                    "Top Prediction": top_token,
+                                    "Probability": f"{top_prob:.2%}",
+                                    "Top-5": ", ".join([f"{t[2]}({t[1]:.1%})" for t in top_k[:5]])
+                                })
+
+                            df = pd.DataFrame(data)
+                            st.dataframe(df, use_container_width=True)
+
+                            # Visualize probability changes
+                            if len(steer_effects) > 1:
+                                baseline_top = steer_effects[0.0][2] if 0.0 in steer_effects else list(steer_effects.values())[0][2]
+
+                                # Track how top-5 baseline tokens change across strengths
+                                fig = go.Figure()
+                                for i, (tok_id, prob, tok_text) in enumerate(baseline_top[:5]):
+                                    probs_at_strengths = []
+                                    for strength in sorted(steer_effects.keys()):
+                                        _, _, top_k = steer_effects[strength]
+                                        # Find this token in top_k
+                                        found_prob = 0.0
+                                        for tid, p, _ in top_k:
+                                            if tid == tok_id:
+                                                found_prob = p
+                                                break
+                                        probs_at_strengths.append(found_prob)
+
+                                    fig.add_trace(go.Scatter(
+                                        x=sorted(steer_effects.keys()),
+                                        y=probs_at_strengths,
+                                        mode='lines+markers',
+                                        name=f'"{tok_text}"'
+                                    ))
+
+                                fig.update_layout(
+                                    title="Token Probabilities vs Steering Strength",
+                                    xaxis_title="Steering Strength",
+                                    yaxis_title="Probability",
+                                    height=400,
+                                    legend=dict(orientation="h", yanchor="bottom", y=1.02)
+                                )
+                                st.plotly_chart(fig, use_container_width=True)
+
+                            st.info("""
+**Interpretation:**
+- **Strength 0.0** = baseline (no steering)
+- **Positive strength** = steer toward the positive prompt direction
+- **Negative strength** = steer toward the negative prompt direction
+- Large probability shifts indicate the steering vector effectively captures the intended concept
+                            """)
+
+                        except Exception as e:
+                            import traceback
+                            st.error(f"Steering failed: {str(e)}")
+                            st.code(traceback.format_exc())
 
     # Generation Replay tab
     with tab_replay:
@@ -11656,10 +12727,62 @@ The timeline will be captured automatically during generation.
             st.warning("Install fpdf2 for PDF export: `pip install fpdf2`")
 
 
+def print_help():
+    """Print CLI help message."""
+    print("""
+MLXLMProbe v0.1.0 - Universal probing tool for MLX language models.
+
+A visual interpretability tool for mechanistic analysis of transformer models.
+
+  GitHub:  https://github.com/scouzi1966/MLXLMProbe
+  Issues:  https://github.com/scouzi1966/MLXLMProbe/issues
+
+  ⚠️  EARLY RELEASE: Tested primarily on mlx-community/gpt-oss-20b-MXFP4-Q8
+      Other models may have varying compatibility.
+
+Usage:
+    mlxlmprobe                    Launch the Streamlit UI
+    mlxlmprobe --help             Show this help message
+    mlxlmprobe --version          Show version
+    mlxlmprobe --model <path>     Launch with a specific model pre-selected
+
+Features:
+    - Layer activation analysis & FFN gate patterns
+    - Token probability distributions & embedding visualization
+    - Attention head analysis & specialization detection
+    - Logit Lens (per-layer next-token predictions)
+    - Causal tracing / knowledge localization (ROME-style)
+    - Activation patching explorer
+    - Steering vectors (ActAdd-style behavior control)
+    - MoE routing analysis (for mixture-of-experts models)
+    - Generation replay with branching
+    - AI interpretation & PDF/HTML export
+
+Examples:
+    mlxlmprobe
+    mlxlmprobe --model mlx-community/Llama-3.2-1B-Instruct-4bit
+
+Star the repo:  https://github.com/scouzi1966/MLXLMProbe
+Report issues:  https://github.com/scouzi1966/MLXLMProbe/issues
+    """)
+
+
 def main():
     """CLI entry point for Homebrew/pip installation - launches Streamlit."""
     import sys
     import os
+
+    # Handle --help and --version before launching Streamlit
+    if len(sys.argv) > 1 and sys.argv[1] in ('--help', '-h'):
+        print_help()
+        sys.exit(0)
+
+    if len(sys.argv) > 1 and sys.argv[1] in ('--version', '-v'):
+        print("MLXLMProbe v0.1.0 (early release)")
+        print("Tested on: mlx-community/gpt-oss-20b-MXFP4-Q8")
+        print("GitHub: https://github.com/scouzi1966/MLXLMProbe")
+        sys.exit(0)
+
     from streamlit.web import cli as stcli
 
     app_path = os.path.abspath(__file__)
