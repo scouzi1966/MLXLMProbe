@@ -4450,7 +4450,8 @@ def plot_logit_lens(results: ProbeResults, tokenizer=None) -> go.Figure:
         xaxis_title="Layer",
         yaxis_title="Prediction Rank",
         height=350,
-        annotations=annotations
+        annotations=annotations,
+        yaxis=dict(autorange="reversed")  # Top-1 at top, Top-5 at bottom
     )
 
     return fig
