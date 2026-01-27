@@ -7906,7 +7906,7 @@ def _streamlit_app():
     )
 
     st.title("🔬 MLXLMProbe")
-    st.caption("v0.1.0 | Universal probing tool for MLX language models")
+    st.caption("v0.1.3 | Universal probing tool for MLX language models")
     st.markdown(
         "[![GitHub stars](https://img.shields.io/github/stars/scouzi1966/MLXLMProbe?style=social)](https://github.com/scouzi1966/MLXLMProbe) "
         "[![GitHub issues](https://img.shields.io/github/issues/scouzi1966/MLXLMProbe)](https://github.com/scouzi1966/MLXLMProbe/issues)"
