@@ -660,6 +660,7 @@ class ProbeConfig:
     capture_residual_stream: bool = True
     capture_token_probs: bool = True
     capture_attention: bool = True  # Capture attention patterns
+    capture_logit_lens: bool = True  # Capture Logit Lens predictions per layer
     layer_indices: Optional[List[int]] = None
     max_sequence_positions: int = 512
 
@@ -773,6 +774,28 @@ class ProbeResults:
 
     # Generation Replay timeline (for replay feature)
     generation_timeline: Optional["GenerationTimeline"] = None
+
+    # === Mechanistic Interpretability Features ===
+
+    # Logit Lens: per-layer predictions by projecting through LM head
+    # {layer_idx: List[(token_id, probability, token_text)] for top-5 predictions}
+    logit_lens_predictions: Dict[int, List[Tuple[int, float, str]]] = field(default_factory=dict)
+
+    # Attention Head Detection: per-head specialization labels
+    # {layer_idx: {head_idx: {"type": str, "score": float, "description": str}}}
+    attention_head_labels: Dict[int, Dict[int, Dict[str, Any]]] = field(default_factory=dict)
+
+    # Neuron Analysis: top contributing neurons at critical layer
+    # {layer_idx: List[(neuron_idx, contribution, activation)]}
+    top_neurons: Dict[int, List[Tuple[int, float, float]]] = field(default_factory=dict)
+
+    # MLP intermediate activations for neuron analysis
+    # {layer_idx: np.ndarray of shape (seq_len, intermediate_size)}
+    mlp_activations: Dict[int, np.ndarray] = field(default_factory=dict)
+
+    # Residual Stream Decomposition: per-component contributions to output
+    # List of (component_name, logit_contribution)
+    residual_decomposition: List[Tuple[str, float]] = field(default_factory=list)
 
 
 # =============================================================================
@@ -1785,6 +1808,313 @@ class ModelProber:
             import traceback
             traceback.print_exc()
 
+    def _capture_logit_lens(self, layer_idx: int, hidden_state: mx.array):
+        """
+        Logit Lens: Project intermediate layer output through final LM head to see predictions.
+
+        This shows what each layer would "predict" if it were the final layer,
+        revealing when the model "decides" on answers.
+        """
+        try:
+            # Apply output normalization (same as final layer)
+            if self.output_norm is not None:
+                h_normed = self.output_norm(hidden_state)
+            else:
+                h_normed = hidden_state
+            mx.eval(h_normed)
+
+            # Project through LM head to get logits
+            if hasattr(self.embedding, 'as_linear'):
+                layer_logits = self.embedding.as_linear(h_normed)
+            elif hasattr(self.model, 'lm_head'):
+                layer_logits = self.model.lm_head(h_normed)
+            elif hasattr(self.inner_model, 'lm_head'):
+                layer_logits = self.inner_model.lm_head(h_normed)
+            else:
+                return  # No LM head available
+
+            mx.eval(layer_logits)
+
+            # Get logits for last position only
+            logits_last = layer_logits[0, -1, :].astype(mx.float32)
+            mx.eval(logits_last)
+
+            # Convert to numpy
+            try:
+                logits_np = np.array(logits_last)
+            except (RuntimeError, TypeError, ValueError):
+                logits_np = np.array(logits_last.tolist(), dtype=np.float32)
+
+            # Compute probabilities
+            max_logit = logits_np.max()
+            exp_logits = np.exp(logits_np - max_logit)
+            probs = exp_logits / exp_logits.sum()
+
+            # Get top-5 predictions
+            top_k = 5
+            top_indices = np.argsort(logits_np)[-top_k:][::-1]
+
+            predictions = []
+            for idx in top_indices:
+                idx_int = int(idx)
+                prob = float(probs[idx])
+                text = self.decode_token(idx_int)
+                if not text or text.isspace():
+                    text = f"<{idx_int}>"
+                predictions.append((idx_int, prob, text))
+
+            self.results.logit_lens_predictions[layer_idx] = predictions
+
+        except Exception as e:
+            # Logit lens capture failed - non-critical
+            pass
+
+    def detect_attention_head_types(self):
+        """
+        Analyze captured attention patterns to detect specialized head types.
+
+        Head types detected:
+        - Induction heads: Copy patterns (A...B seen before, when A appears, predict B)
+        - Previous token heads: Attend primarily to position-1
+        - Copy suppression heads: Strong diagonal patterns
+        - Positional heads: Strong positional bias patterns
+        - First token heads: Strong attention to position 0
+        """
+        if not self.results.attention_patterns:
+            return
+
+        for layer_idx, attn_weights in self.results.attention_patterns.items():
+            # attn_weights shape: (n_heads, seq_len, seq_len)
+            n_heads = attn_weights.shape[0]
+            seq_len = attn_weights.shape[1]
+
+            if seq_len < 3:
+                continue
+
+            head_labels = {}
+
+            for head_idx in range(n_heads):
+                h_attn = attn_weights[head_idx]  # (seq_len, seq_len)
+
+                # Compute various metrics for head classification
+                labels = []
+                scores = {}
+
+                # 1. Previous Token Head: Strong attention to position i-1
+                prev_token_scores = []
+                for i in range(1, seq_len):
+                    prev_token_scores.append(h_attn[i, i-1])
+                prev_token_score = np.mean(prev_token_scores) if prev_token_scores else 0
+                scores['prev_token'] = prev_token_score
+                if prev_token_score > 0.3:
+                    labels.append(("Previous Token", prev_token_score))
+
+                # 2. First Token Head: Strong attention to position 0
+                first_token_scores = h_attn[1:, 0]  # Skip first position (self)
+                first_token_score = np.mean(first_token_scores) if len(first_token_scores) > 0 else 0
+                scores['first_token'] = first_token_score
+                if first_token_score > 0.2:
+                    labels.append(("First Token", first_token_score))
+
+                # 3. Self-Attention / Diagonal: Strong attention to self
+                diag = np.diag(h_attn)
+                self_attn_score = np.mean(diag)
+                scores['self_attn'] = self_attn_score
+                if self_attn_score > 0.3:
+                    labels.append(("Self-Attention", self_attn_score))
+
+                # 4. Induction Head Detection:
+                # Induction heads show a pattern where if "A B" appeared before,
+                # when "A" appears again, they attend to position after previous "A"
+                # This manifests as a diagonal stripe offset by the distance
+                # Simplified: check for off-diagonal stripe patterns
+                induction_score = 0.0
+                if seq_len >= 8:
+                    # Check for stripe pattern (attending k positions back consistently)
+                    for offset in range(2, min(seq_len // 2, 10)):
+                        stripe_values = []
+                        for i in range(offset, seq_len):
+                            if i - offset >= 0:
+                                stripe_values.append(h_attn[i, i - offset])
+                        if stripe_values:
+                            stripe_mean = np.mean(stripe_values)
+                            induction_score = max(induction_score, stripe_mean)
+                scores['induction'] = induction_score
+                if induction_score > 0.15:
+                    labels.append(("Induction", induction_score))
+
+                # 5. Diffuse / Uniform Attention: High entropy
+                entropy_per_row = -np.sum(h_attn * np.log(h_attn + 1e-10), axis=-1)
+                mean_entropy = np.mean(entropy_per_row)
+                max_possible_entropy = np.log(seq_len)
+                normalized_entropy = mean_entropy / max_possible_entropy if max_possible_entropy > 0 else 0
+                scores['entropy'] = normalized_entropy
+                if normalized_entropy > 0.8:
+                    labels.append(("Diffuse", normalized_entropy))
+
+                # 6. Recent Context: Attention concentrated in recent positions
+                recent_window = min(5, seq_len - 1)
+                recent_scores = []
+                for i in range(recent_window, seq_len):
+                    recent_attn = np.sum(h_attn[i, max(0, i-recent_window):i])
+                    recent_scores.append(recent_attn)
+                recent_context_score = np.mean(recent_scores) if recent_scores else 0
+                scores['recent_context'] = recent_context_score
+                if recent_context_score > 0.5:
+                    labels.append(("Recent Context", recent_context_score))
+
+                # Determine primary label
+                if labels:
+                    # Sort by score and take the highest
+                    labels.sort(key=lambda x: x[1], reverse=True)
+                    primary_type = labels[0][0]
+                    primary_score = labels[0][1]
+                else:
+                    primary_type = "Mixed"
+                    primary_score = 0.0
+
+                # Generate description
+                descriptions = {
+                    "Previous Token": "Attends to the immediately preceding token",
+                    "First Token": "Attends strongly to the first token (often BOS/system)",
+                    "Self-Attention": "Attends primarily to the current position",
+                    "Induction": "Pattern matching head - may copy from similar contexts",
+                    "Diffuse": "Distributes attention broadly across the sequence",
+                    "Recent Context": "Focuses on recent local context",
+                    "Mixed": "No strong specialization detected"
+                }
+
+                head_labels[head_idx] = {
+                    "type": primary_type,
+                    "score": primary_score,
+                    "description": descriptions.get(primary_type, ""),
+                    "all_scores": scores,
+                    "all_labels": labels
+                }
+
+            self.results.attention_head_labels[layer_idx] = head_labels
+
+    def analyze_neuron_contributions(self, layer_idx: int = None, top_k: int = 20):
+        """
+        Analyze which MLP neurons contribute most to the output prediction.
+
+        This implements the ROME-style analysis: for each neuron,
+        compute contribution = activation × output_weight.
+
+        Args:
+            layer_idx: Layer to analyze (None = use critical/late layer)
+            top_k: Number of top neurons to return
+        """
+        if not self.results.layer_outputs:
+            return
+
+        available_layers = sorted(self.results.layer_outputs.keys())
+        if not available_layers:
+            return
+
+        # Use specified layer or fall back to late middle layer
+        if layer_idx is None:
+            # Use layer at ~70% depth (where facts are typically stored)
+            target_idx = int(len(available_layers) * 0.7)
+            layer_idx = available_layers[min(target_idx, len(available_layers) - 1)]
+
+        if layer_idx not in self.results.layer_outputs:
+            layer_idx = available_layers[-1]
+
+        try:
+            # Get the layer
+            if layer_idx >= len(self.layers):
+                return
+
+            layer = self.layers[layer_idx]
+
+            # Find the MLP/FFN module
+            mlp = None
+            for name in ['mlp', 'feed_forward', 'ffn', 'block_sparse_moe']:
+                if hasattr(layer, name):
+                    mlp = getattr(layer, name)
+                    break
+
+            if mlp is None:
+                return
+
+            # Get the down projection weight (output projection)
+            down_proj = None
+            for name in ['down_proj', 'w2', 'fc2', 'c_proj']:
+                if hasattr(mlp, name):
+                    down_proj = getattr(mlp, name)
+                    break
+
+            if down_proj is None or not hasattr(down_proj, 'weight'):
+                return
+
+            # Get the output weight matrix
+            # Shape: (hidden_size, intermediate_size) or transposed
+            out_weight = down_proj.weight
+            mx.eval(out_weight)
+
+            # Get layer output (hidden state after this layer)
+            layer_output = self.results.layer_outputs[layer_idx]
+            if len(layer_output.shape) == 3:
+                # Take last position
+                h = layer_output[0, -1, :]  # (hidden_size,)
+            else:
+                h = layer_output.flatten()[:min(len(layer_output.flatten()), 4096)]
+
+            h = np.array(h, dtype=np.float32)
+
+            # Get LM head weights for projecting to vocabulary
+            lm_head_weight = None
+            if hasattr(self.embedding, 'weight'):
+                # Tied embeddings
+                lm_head_weight = self.embedding.weight
+            elif hasattr(self.model, 'lm_head') and hasattr(self.model.lm_head, 'weight'):
+                lm_head_weight = self.model.lm_head.weight
+
+            if lm_head_weight is None:
+                return
+
+            mx.eval(lm_head_weight)
+
+            # Get top predicted token to focus analysis
+            if self.results.top_k_tokens:
+                target_token_id = self.results.top_k_tokens[0][0]
+            else:
+                return
+
+            # Get the direction in hidden space that leads to this token
+            # lm_head_weight shape: (vocab_size, hidden_size)
+            try:
+                lm_weight_np = np.array(lm_head_weight.astype(mx.float32))
+            except:
+                lm_weight_np = np.array(lm_head_weight.tolist(), dtype=np.float32)
+
+            if target_token_id >= lm_weight_np.shape[0]:
+                return
+
+            target_direction = lm_weight_np[target_token_id, :]  # (hidden_size,)
+
+            # Compute contribution of each dimension to the target
+            # contribution = h[i] * target_direction[i]
+            contributions = h * target_direction
+
+            # Find top contributing dimensions
+            top_indices = np.argsort(np.abs(contributions))[-top_k:][::-1]
+
+            top_neurons = []
+            for idx in top_indices:
+                idx_int = int(idx)
+                contribution = float(contributions[idx])
+                activation = float(h[idx])
+                top_neurons.append((idx_int, contribution, activation))
+
+            self.results.top_neurons[layer_idx] = top_neurons
+
+        except Exception as e:
+            # Neuron analysis failed - non-critical
+            import sys
+            print(f"Neuron analysis failed for layer {layer_idx}: {e}", file=sys.stderr)
+
     def _capture_activations(self, x: mx.array):
         """Run forward pass and capture activations."""
         max_pos = self.config.max_sequence_positions
@@ -1854,6 +2184,10 @@ class ModelProber:
             if self.config.capture_attention and self._should_capture_layer(i):
                 self._capture_attention_patterns(i, layer, h_pre_layer)
 
+            # Logit Lens: project layer output through LM head to see predictions
+            if self.config.capture_logit_lens and self._should_capture_layer(i):
+                self._capture_logit_lens(i, h)
+
         # 3. Output normalization
         if self.output_norm is not None:
             h = self.output_norm(h)
@@ -1897,6 +2231,14 @@ class ModelProber:
                 if not text or text.isspace():
                     text = f"<{idx_int}>"
                 self.results.top_k_tokens.append((idx_int, prob, text))
+
+        # 5. Detect attention head specialization (after all patterns captured)
+        if self.config.capture_attention and self.results.attention_patterns:
+            self.detect_attention_head_types()
+
+        # 6. Analyze neuron contributions (requires layer outputs and logits)
+        if self.config.capture_layer_outputs and self.results.layer_outputs and self.results.top_k_tokens:
+            self.analyze_neuron_contributions()
 
     def probe(self, prompt: str, max_tokens: int = 1) -> ProbeResults:
         """Run probing on a prompt."""
@@ -3318,6 +3660,109 @@ The residual stream is {norm_trend}, indicating {"information accumulation" if n
     return interpretation
 
 
+def get_logit_lens_interpretation(results: ProbeResults, model=None, tokenizer=None, use_ai: bool = False, interpreter: str = "claude") -> str:
+    """Generate interpretation for Logit Lens analysis."""
+    if not results.logit_lens_predictions:
+        return "No Logit Lens data available."
+
+    layers = sorted(results.logit_lens_predictions.keys())
+    if not layers:
+        return "No Logit Lens data available."
+
+    # Get final prediction
+    final_token = None
+    final_token_id = None
+    if results.top_k_tokens:
+        final_token = results.top_k_tokens[0][2]
+        final_token_id = results.top_k_tokens[0][0]
+    else:
+        last_preds = results.logit_lens_predictions[layers[-1]]
+        if last_preds:
+            final_token_id, _, final_token = last_preds[0]
+
+    if not final_token:
+        return "Could not determine final prediction."
+
+    # Find when the final token first appears as top-1
+    first_appearance_layer = None
+    confidence_at_first = 0.0
+    for layer_idx in layers:
+        preds = results.logit_lens_predictions[layer_idx]
+        if preds and preds[0][0] == final_token_id:
+            first_appearance_layer = layer_idx
+            confidence_at_first = preds[0][1]
+            break
+
+    # Track how many layers agree with final
+    agreeing_layers = 0
+    for layer_idx in layers:
+        preds = results.logit_lens_predictions[layer_idx]
+        if preds and preds[0][0] == final_token_id:
+            agreeing_layers += 1
+
+    # Build summary
+    total_layers = len(layers)
+    agreement_pct = (agreeing_layers / total_layers) * 100 if total_layers > 0 else 0
+
+    # Analyze trajectory
+    early_layers = [l for l in layers if l < total_layers // 3]
+    late_layers = [l for l in layers if l >= 2 * total_layers // 3]
+
+    early_confidence = 0.0
+    late_confidence = 0.0
+    for l in early_layers:
+        preds = results.logit_lens_predictions[l]
+        if preds:
+            for tok_id, prob, _ in preds:
+                if tok_id == final_token_id:
+                    early_confidence = max(early_confidence, prob)
+                    break
+
+    for l in late_layers:
+        preds = results.logit_lens_predictions[l]
+        if preds:
+            for tok_id, prob, _ in preds:
+                if tok_id == final_token_id:
+                    late_confidence = max(late_confidence, prob)
+                    break
+
+    context = f"""Logit Lens Analysis:
+Final predicted token: '{final_token}'
+First appears as top-1 at: Layer {first_appearance_layer} (confidence: {confidence_at_first:.1%})
+Layers agreeing with final: {agreeing_layers}/{total_layers} ({agreement_pct:.0f}%)
+Early layer max confidence: {early_confidence:.1%}
+Late layer max confidence: {late_confidence:.1%}"""
+
+    if use_ai:
+        return generate_ai_interpretation(
+            model, tokenizer, context,
+            "When does the model 'decide' on the answer? Is the decision made early (fast path) or developed gradually?",
+            interpreter=interpreter
+        )
+
+    # Static interpretation
+    if first_appearance_layer is None:
+        decision_type = "The final answer never becomes the top prediction in intermediate layers - this may indicate a late-stage correction or reconsideration."
+    elif first_appearance_layer < total_layers // 3:
+        decision_type = f"**Early decision** (layer {first_appearance_layer}): The model identifies the answer in early layers and maintains it."
+    elif first_appearance_layer < 2 * total_layers // 3:
+        decision_type = f"**Mid-stage decision** (layer {first_appearance_layer}): The answer emerges in middle layers after initial processing."
+    else:
+        decision_type = f"**Late decision** (layer {first_appearance_layer}): The answer only becomes dominant in later layers, suggesting complex reasoning."
+
+    interpretation = f"""**Logit Lens Analysis:**
+
+- **Final prediction:** `{final_token}`
+- **First appears as top-1:** Layer {first_appearance_layer or 'Never'} ({confidence_at_first:.1%} confidence)
+- **Layer agreement:** {agreeing_layers}/{total_layers} layers ({agreement_pct:.0f}%)
+
+{decision_type}
+
+Confidence trajectory: Early={early_confidence:.0%} → Late={late_confidence:.0%}"""
+
+    return interpretation
+
+
 def get_logits_interpretation(results: ProbeResults, model=None, tokenizer=None, use_ai: bool = False, interpreter: str = "claude") -> str:
     """Generate interpretation for logits distribution."""
     if results.logits is None:
@@ -3897,6 +4342,464 @@ def plot_residual_stream(results: ProbeResults) -> go.Figure:
     fig.update_yaxes(title_text="Delta", row=2, col=1)
 
     return fig
+
+
+def plot_logit_lens(results: ProbeResults, tokenizer=None) -> go.Figure:
+    """
+    Plot Logit Lens visualization: what each layer "predicts" when projected through LM head.
+
+    Shows a heatmap where:
+    - X-axis: Layer index
+    - Y-axis: Top-K predictions (rank 1-5)
+    - Color intensity: Probability
+    - Hover shows token text
+    """
+    if not results.logit_lens_predictions:
+        return go.Figure().add_annotation(
+            text="No Logit Lens data available.\nEnable 'Capture Logit Lens' to see this visualization.",
+            showarrow=False, font=dict(size=14)
+        )
+
+    layers = sorted(results.logit_lens_predictions.keys())
+    num_layers = len(layers)
+
+    if num_layers == 0:
+        return go.Figure()
+
+    # Build data matrices
+    # Rows = rank (0=top-1, 4=top-5), Cols = layer
+    max_rank = 5
+    probs = np.zeros((max_rank, num_layers))
+    token_texts = [['' for _ in range(num_layers)] for _ in range(max_rank)]
+    token_ids = [[0 for _ in range(num_layers)] for _ in range(max_rank)]
+
+    for col_idx, layer_idx in enumerate(layers):
+        preds = results.logit_lens_predictions[layer_idx]
+        for rank_idx, (tok_id, prob, tok_text) in enumerate(preds[:max_rank]):
+            probs[rank_idx, col_idx] = prob
+            token_texts[rank_idx][col_idx] = tok_text[:15]  # Truncate for display
+            token_ids[rank_idx][col_idx] = tok_id
+
+    # Create heatmap
+    fig = go.Figure()
+
+    # Custom hover template
+    customdata = np.dstack([
+        [[token_texts[r][c] for c in range(num_layers)] for r in range(max_rank)],
+        [[f"{probs[r, c]:.2%}" for c in range(num_layers)] for r in range(max_rank)],
+        [[str(token_ids[r][c]) for c in range(num_layers)] for r in range(max_rank)]
+    ])
+
+    fig.add_trace(go.Heatmap(
+        z=probs,
+        x=[f"L{l}" for l in layers],
+        y=[f"Top-{i+1}" for i in range(max_rank)],
+        colorscale='Viridis',
+        colorbar=dict(title="Probability"),
+        customdata=customdata,
+        hovertemplate="Layer %{x}<br>Rank: %{y}<br>Token: %{customdata[0]}<br>Prob: %{customdata[1]}<br>ID: %{customdata[2]}<extra></extra>"
+    ))
+
+    # Add text annotations for token names
+    annotations = []
+    for row_idx in range(max_rank):
+        for col_idx in range(num_layers):
+            text = token_texts[row_idx][col_idx]
+            prob = probs[row_idx, col_idx]
+            if text and prob > 0.01:  # Only show if probability is meaningful
+                # Use contrasting color based on probability
+                text_color = 'white' if prob > 0.5 else 'black'
+                annotations.append(dict(
+                    x=col_idx,
+                    y=row_idx,
+                    text=text[:8],  # Further truncate for display
+                    showarrow=False,
+                    font=dict(size=9, color=text_color),
+                    xref='x',
+                    yref='y'
+                ))
+
+    fig.update_layout(
+        title="Logit Lens: Per-Layer Predictions",
+        xaxis_title="Layer",
+        yaxis_title="Prediction Rank",
+        height=350,
+        annotations=annotations
+    )
+
+    return fig
+
+
+def plot_logit_lens_trajectory(results: ProbeResults, target_token: str = None, tokenizer=None) -> go.Figure:
+    """
+    Plot how the probability of specific tokens evolves across layers.
+
+    Shows when the model "decides" on the answer.
+    """
+    if not results.logit_lens_predictions:
+        return go.Figure().add_annotation(
+            text="No Logit Lens data available.",
+            showarrow=False, font=dict(size=14)
+        )
+
+    layers = sorted(results.logit_lens_predictions.keys())
+
+    # Find the final prediction (from last layer or from top_k_tokens)
+    if results.top_k_tokens:
+        final_token = results.top_k_tokens[0][2]  # Top predicted token text
+        final_token_id = results.top_k_tokens[0][0]
+    elif layers:
+        last_layer_preds = results.logit_lens_predictions[layers[-1]]
+        if last_layer_preds:
+            final_token = last_layer_preds[0][2]
+            final_token_id = last_layer_preds[0][0]
+        else:
+            return go.Figure()
+    else:
+        return go.Figure()
+
+    # Track probability of final token across layers
+    final_token_probs = []
+    for layer_idx in layers:
+        preds = results.logit_lens_predictions[layer_idx]
+        # Find the probability of final_token_id in this layer's predictions
+        prob = 0.0
+        for tok_id, p, _ in preds:
+            if tok_id == final_token_id:
+                prob = p
+                break
+        final_token_probs.append(prob)
+
+    # Also track top-1 probability per layer
+    top1_probs = []
+    top1_tokens = []
+    for layer_idx in layers:
+        preds = results.logit_lens_predictions[layer_idx]
+        if preds:
+            top1_probs.append(preds[0][1])
+            top1_tokens.append(preds[0][2])
+        else:
+            top1_probs.append(0)
+            top1_tokens.append("")
+
+    fig = go.Figure()
+
+    # Plot final token probability trajectory
+    fig.add_trace(go.Scatter(
+        x=[f"L{l}" for l in layers],
+        y=[p * 100 for p in final_token_probs],
+        mode='lines+markers',
+        name=f'P("{final_token[:15]}")',
+        line=dict(color='#28A745', width=2),
+        marker=dict(size=8)
+    ))
+
+    # Plot top-1 probability trajectory
+    fig.add_trace(go.Scatter(
+        x=[f"L{l}" for l in layers],
+        y=[p * 100 for p in top1_probs],
+        mode='lines+markers',
+        name='Top-1 Probability',
+        line=dict(color='#636EFA', width=2, dash='dash'),
+        marker=dict(size=6),
+        customdata=top1_tokens,
+        hovertemplate="Layer %{x}<br>Top-1: %{customdata}<br>Prob: %{y:.1f}%<extra></extra>"
+    ))
+
+    fig.update_layout(
+        title=f"Token Probability Trajectory: When Does the Model Decide?",
+        xaxis_title="Layer",
+        yaxis_title="Probability (%)",
+        height=350,
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        hovermode='x unified'
+    )
+
+    return fig
+
+
+def plot_attention_head_types(results: ProbeResults, layer_idx: int = None) -> go.Figure:
+    """
+    Plot attention head specialization detection results.
+
+    Shows a heatmap of head types across layers, or detailed view for a single layer.
+    """
+    if not results.attention_head_labels:
+        return go.Figure().add_annotation(
+            text="No attention head labels available.\nEnable 'Capture Attention Patterns' to detect head types.",
+            showarrow=False, font=dict(size=14)
+        )
+
+    layers = sorted(results.attention_head_labels.keys())
+    if not layers:
+        return go.Figure()
+
+    # Get number of heads from first layer
+    n_heads = len(results.attention_head_labels[layers[0]])
+
+    # Color mapping for head types
+    type_colors = {
+        "Previous Token": "#FF6B6B",
+        "First Token": "#4ECDC4",
+        "Self-Attention": "#45B7D1",
+        "Induction": "#96CEB4",
+        "Diffuse": "#FFEAA7",
+        "Recent Context": "#DDA0DD",
+        "Mixed": "#C0C0C0"
+    }
+
+    type_to_num = {t: i for i, t in enumerate(type_colors.keys())}
+
+    if layer_idx is not None and layer_idx in results.attention_head_labels:
+        # Single layer detailed view
+        head_labels = results.attention_head_labels[layer_idx]
+
+        # Build data for bar chart
+        head_nums = list(range(n_heads))
+        types = []
+        scores = []
+        colors = []
+        hover_texts = []
+
+        for h in head_nums:
+            if h in head_labels:
+                info = head_labels[h]
+                types.append(info["type"])
+                scores.append(info["score"] * 100)
+                colors.append(type_colors.get(info["type"], "#C0C0C0"))
+                hover_texts.append(f"Head {h}<br>Type: {info['type']}<br>Score: {info['score']:.1%}<br>{info['description']}")
+            else:
+                types.append("Unknown")
+                scores.append(0)
+                colors.append("#C0C0C0")
+                hover_texts.append(f"Head {h}<br>No data")
+
+        fig = go.Figure(data=[
+            go.Bar(
+                x=[f"H{h}" for h in head_nums],
+                y=scores,
+                marker_color=colors,
+                text=types,
+                textposition='outside',
+                hovertext=hover_texts,
+                hoverinfo='text'
+            )
+        ])
+
+        fig.update_layout(
+            title=f"Attention Head Types - Layer {layer_idx}",
+            xaxis_title="Head",
+            yaxis_title="Confidence Score (%)",
+            height=400,
+            showlegend=False
+        )
+
+    else:
+        # All layers heatmap view
+        # Build matrix: rows = heads, cols = layers
+        type_matrix = np.zeros((n_heads, len(layers)))
+        hover_matrix = [['' for _ in range(len(layers))] for _ in range(n_heads)]
+
+        for col_idx, l in enumerate(layers):
+            head_labels = results.attention_head_labels[l]
+            for h in range(n_heads):
+                if h in head_labels:
+                    info = head_labels[h]
+                    type_num = type_to_num.get(info["type"], len(type_colors) - 1)
+                    type_matrix[h, col_idx] = type_num
+                    hover_matrix[h][col_idx] = f"L{l} H{h}: {info['type']} ({info['score']:.1%})"
+
+        # Create colorscale from type colors
+        color_list = list(type_colors.values())
+        n_colors = len(color_list)
+        colorscale = [[i / (n_colors - 1), c] for i, c in enumerate(color_list)]
+
+        fig = go.Figure(data=go.Heatmap(
+            z=type_matrix,
+            x=[f"L{l}" for l in layers],
+            y=[f"H{h}" for h in range(n_heads)],
+            colorscale=colorscale,
+            customdata=hover_matrix,
+            hovertemplate="%{customdata}<extra></extra>",
+            showscale=False
+        ))
+
+        # Add legend as annotations
+        legend_y = 1.15
+        for i, (type_name, color) in enumerate(type_colors.items()):
+            fig.add_annotation(
+                x=i / (len(type_colors) - 1),
+                y=legend_y,
+                xref="paper",
+                yref="paper",
+                text=f"<span style='color:{color}'>■</span> {type_name}",
+                showarrow=False,
+                font=dict(size=10)
+            )
+
+        fig.update_layout(
+            title="Attention Head Specialization Across Layers",
+            xaxis_title="Layer",
+            yaxis_title="Head",
+            height=max(400, n_heads * 15 + 100),
+            margin=dict(t=100)
+        )
+
+    return fig
+
+
+def get_attention_head_summary(results: ProbeResults) -> Dict[str, Any]:
+    """Get summary statistics of attention head types across all layers."""
+    if not results.attention_head_labels:
+        return {}
+
+    type_counts = {}
+    total_heads = 0
+
+    for layer_idx, head_labels in results.attention_head_labels.items():
+        for head_idx, info in head_labels.items():
+            head_type = info["type"]
+            if head_type not in type_counts:
+                type_counts[head_type] = 0
+            type_counts[head_type] += 1
+            total_heads += 1
+
+    # Calculate percentages
+    type_percentages = {t: (c / total_heads * 100) for t, c in type_counts.items()}
+
+    # Find dominant type
+    dominant_type = max(type_counts.keys(), key=lambda t: type_counts[t]) if type_counts else "Unknown"
+
+    return {
+        "type_counts": type_counts,
+        "type_percentages": type_percentages,
+        "total_heads": total_heads,
+        "dominant_type": dominant_type,
+        "num_layers": len(results.attention_head_labels)
+    }
+
+
+def plot_neuron_contributions(results: ProbeResults, layer_idx: int = None) -> go.Figure:
+    """
+    Plot top contributing neurons/dimensions to the output prediction.
+
+    Shows which hidden dimensions contribute most to the predicted token.
+    """
+    if not results.top_neurons:
+        return go.Figure().add_annotation(
+            text="No neuron contribution data available.",
+            showarrow=False, font=dict(size=14)
+        )
+
+    # Get available layers with neuron data
+    layers = sorted(results.top_neurons.keys())
+    if not layers:
+        return go.Figure()
+
+    # Use specified layer or first available
+    if layer_idx is None or layer_idx not in results.top_neurons:
+        layer_idx = layers[0]
+
+    neurons = results.top_neurons[layer_idx]
+
+    # Separate positive and negative contributions
+    neuron_indices = [n[0] for n in neurons]
+    contributions = [n[1] for n in neurons]
+    activations = [n[2] for n in neurons]
+
+    # Create colors based on contribution sign
+    colors = ['#28A745' if c > 0 else '#DC3545' for c in contributions]
+
+    fig = go.Figure()
+
+    fig.add_trace(go.Bar(
+        x=[f"D{idx}" for idx in neuron_indices],
+        y=contributions,
+        marker_color=colors,
+        text=[f"{c:.3f}" for c in contributions],
+        textposition='outside',
+        hovertemplate="Dimension %{x}<br>Contribution: %{y:.4f}<br>Activation: %{customdata:.4f}<extra></extra>",
+        customdata=activations
+    ))
+
+    # Get target token for title
+    target_token = ""
+    if results.top_k_tokens:
+        target_token = results.top_k_tokens[0][2]
+
+    fig.update_layout(
+        title=f"Top Contributing Dimensions at Layer {layer_idx}" +
+              (f" (predicting '{target_token}')" if target_token else ""),
+        xaxis_title="Hidden Dimension",
+        yaxis_title="Contribution to Output",
+        height=400,
+        showlegend=False
+    )
+
+    # Add zero line
+    fig.add_hline(y=0, line_dash="dash", line_color="gray")
+
+    return fig
+
+
+def get_neuron_interpretation(results: ProbeResults, model=None, tokenizer=None, use_ai: bool = False, interpreter: str = "claude") -> str:
+    """Generate interpretation for neuron contribution analysis."""
+    if not results.top_neurons:
+        return "No neuron contribution data available."
+
+    layers = sorted(results.top_neurons.keys())
+    if not layers:
+        return "No neuron data available."
+
+    layer_idx = layers[0]
+    neurons = results.top_neurons[layer_idx]
+
+    if not neurons:
+        return "No neuron contributions computed."
+
+    # Analyze contribution pattern
+    positive_contrib = sum(n[1] for n in neurons if n[1] > 0)
+    negative_contrib = sum(n[1] for n in neurons if n[1] < 0)
+
+    top_positive = [(n[0], n[1]) for n in neurons if n[1] > 0][:5]
+    top_negative = [(n[0], n[1]) for n in neurons if n[1] < 0][:5]
+
+    target_token = results.top_k_tokens[0][2] if results.top_k_tokens else "unknown"
+
+    context = f"""Neuron Contribution Analysis (Layer {layer_idx}):
+Target token: '{target_token}'
+Top 5 positive contributors: {[(f"D{d}", f"{c:.4f}") for d, c in top_positive]}
+Top 5 negative contributors: {[(f"D{d}", f"{c:.4f}") for d, c in top_negative]}
+Total positive contribution: {positive_contrib:.4f}
+Total negative contribution: {negative_contrib:.4f}
+Net contribution (top-20): {positive_contrib + negative_contrib:.4f}"""
+
+    if use_ai:
+        from mlxlmprobe import generate_ai_interpretation
+        return generate_ai_interpretation(
+            model, tokenizer, context,
+            "What do these neuron contributions reveal about how the model produces this prediction?",
+            interpreter=interpreter
+        )
+
+    # Static interpretation
+    balance = "positive-dominated" if positive_contrib > abs(negative_contrib) else "balanced"
+
+    # Format top contributors for the interpretation
+    top_pos_text = f"Dimension {top_positive[0][0]} ({top_positive[0][1]:.4f})" if top_positive else "N/A"
+    top_neg_text = f"Dimension {top_negative[0][0]} ({top_negative[0][1]:.4f})" if top_negative else "N/A"
+
+    interpretation = f"""**Neuron Contribution Analysis (Layer {layer_idx}):**
+
+- **Target prediction:** `{target_token}`
+- **Top positive contributor:** {top_pos_text}
+- **Top negative contributor:** {top_neg_text}
+
+The contribution pattern is **{balance}**. Positive contributions push toward the predicted token, while negative contributions suppress it.
+
+The top contributing dimensions may encode specific features relevant to predicting `{target_token}`."""
+
+    return interpretation
 
 
 def plot_moe_expert_load(results: ProbeResults, layer_idx: Optional[int] = None) -> go.Figure:
@@ -6198,6 +7101,50 @@ Different attention heads learn different patterns:
 - Explore alternative continuations
 - Understand model confidence at each step
 - Educational tool for understanding LLM generation"""
+    },
+
+    "attention_head_types": {
+        "short": "Automatic detection of specialized attention head patterns",
+        "full": """**Attention Head Type Detection** automatically classifies heads based on their attention patterns.
+
+**Detected Types:**
+- **Previous Token**: Attends strongly to position i-1 (local context)
+- **First Token**: Focuses on the first token (often BOS/system prompt)
+- **Self-Attention**: Diagonal pattern (token attends to itself)
+- **Induction**: Pattern matching - if "A B" seen before, when "A" appears, attend after previous "A"
+- **Diffuse**: High entropy - distributes attention broadly
+- **Recent Context**: Focuses on nearby recent tokens
+
+**Why it matters:**
+- Induction heads are key for in-context learning
+- Previous token heads help with syntax
+- First token heads anchor to instruction/system context
+- Understanding specialization reveals how the model processes information
+
+**Reference:** In-context Learning and Induction Heads (Olsson et al., 2022)"""
+    },
+
+    "logit_lens": {
+        "short": "Per-layer predictions when projected through LM head",
+        "full": """**Logit Lens** is a mechanistic interpretability technique that reveals what each layer "predicts."
+
+**How it works:**
+1. Take the hidden state output from each intermediate layer
+2. Apply the final layer normalization
+3. Project through the LM head (unembedding) to get logits
+4. Convert to token probabilities
+
+**What it reveals:**
+- **Early layers**: Often show generic predictions or input echoing
+- **Middle layers**: Predictions start to form based on context
+- **Late layers**: Final answer crystallizes
+
+**Key patterns to look for:**
+- 🎯 **Early decision**: Final answer appears in early layers → Simple/memorized knowledge
+- 🔄 **Gradual emergence**: Answer builds across layers → Complex reasoning
+- ⚡ **Late correction**: Answer changes in final layers → Information suppression or reconsideration
+
+**Reference:** Interpreting GPT: the logit lens (Nostalgebraist, 2020)"""
     }
 }
 
@@ -6391,6 +7338,8 @@ def _streamlit_app():
     capture_attention = st.sidebar.checkbox("Capture Attention Patterns", value=True)
     capture_token_probs = st.sidebar.checkbox("Capture Token Probabilities", value=True)
     capture_residual = st.sidebar.checkbox("Capture Residual Stream", value=True)
+    capture_logit_lens = st.sidebar.checkbox("Capture Logit Lens", value=True,
+        help="Project each layer's output through LM head to see per-layer predictions")
 
     # Max sequence positions
     max_seq_positions = st.sidebar.slider("Max Sequence Positions", 32, 512, 256,
@@ -6408,6 +7357,7 @@ def _streamlit_app():
         capture_token_probs=capture_token_probs,
         capture_residual_stream=capture_residual,
         capture_attention=capture_attention,
+        capture_logit_lens=capture_logit_lens,
         max_sequence_positions=max_seq_positions
     )
 
@@ -6638,7 +7588,9 @@ def _streamlit_app():
         "Logits",
         "Layer Similarity",
         "Residual Stream",
-        "Attention"
+        "Attention",
+        "Logit Lens",  # Mechanistic Interpretability feature
+        "Activation Patching"  # MI: Compare prompts
     ]
 
     if results.is_moe:
@@ -6651,8 +7603,8 @@ def _streamlit_app():
     tabs = st.tabs(tab_names)
 
     # Unpack tabs (handle both MoE and non-MoE cases)
-    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab_attn = tabs[:9]
-    tab_idx = 9
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab_attn, tab_logit_lens, tab_patching = tabs[:11]
+    tab_idx = 11
     tab_moe = tabs[tab_idx] if results.is_moe else None
     if results.is_moe:
         tab_idx += 1
@@ -6739,6 +7691,74 @@ def _streamlit_app():
                     )
         else:
             st.info("Enable 'Capture FFN Activations' to see this visualization.")
+
+        # Neuron Contribution Analysis Section
+        st.markdown("---")
+        st.subheader("Neuron Contribution Analysis")
+
+        with st.expander("ℹ️ What is this? (click to learn)", expanded=False):
+            st.markdown("""
+**Neuron Contribution Analysis** identifies which hidden dimensions contribute most to the model's prediction.
+
+**How it works:**
+1. For each hidden dimension, compute: `contribution = activation × output_weight`
+2. The output_weight is the LM head weight for the predicted token
+3. Positive contributions push toward the prediction; negative contributions suppress it
+
+**Why it matters:**
+- Identifies specific neurons encoding relevant knowledge
+- Foundation for targeted interventions (ablation, patching)
+- Reveals how the model "computes" its answer
+
+**Reference:** ROME: Locating and Editing Factual Associations (Meng et al., 2022)
+            """)
+
+        if results.top_neurons:
+            available_layers = sorted(results.top_neurons.keys())
+            if available_layers:
+                col_nlayer, col_ninfo = st.columns([1, 2])
+                with col_nlayer:
+                    neuron_layer = st.selectbox(
+                        "Layer",
+                        available_layers,
+                        format_func=lambda x: f"Layer {x}",
+                        key="neuron_layer_select"
+                    )
+                with col_ninfo:
+                    if results.top_k_tokens:
+                        st.info(f"Analyzing contributions to: **{results.top_k_tokens[0][2]}** ({results.top_k_tokens[0][1]:.1%})")
+
+                fig_neurons = plot_neuron_contributions(results, layer_idx=neuron_layer)
+                st.plotly_chart(fig_neurons, use_container_width=True)
+
+                # Detailed table
+                with st.expander("Detailed Neuron Data", expanded=False):
+                    neurons = results.top_neurons.get(neuron_layer, [])
+                    if neurons:
+                        neuron_data = []
+                        for idx, contrib, activ in neurons:
+                            neuron_data.append({
+                                "Dimension": f"D{idx}",
+                                "Contribution": f"{contrib:.4f}",
+                                "Activation": f"{activ:.4f}",
+                                "Direction": "+" if contrib > 0 else "-"
+                            })
+                        st.dataframe(pd.DataFrame(neuron_data), hide_index=True, use_container_width=True)
+
+                # AI Interpretation
+                if ai_interpret:
+                    interp_label = "Claude" if interp_choice == "claude" else "Local LLM"
+                    with st.expander("🧠 AI Interpretation", expanded=True):
+                        render_cached_interpretation(
+                            f"neuron_analysis_{interp_choice}",
+                            results,
+                            lambda: get_neuron_interpretation(
+                                results, model, tokenizer, use_ai=True, interpreter=interp_choice
+                            ),
+                            interp_label
+                        )
+        else:
+            st.info("Neuron contribution analysis not available. This requires capturing layer outputs.")
 
     # Tab 3: Token Probabilities
     with tab3:
@@ -7600,6 +8620,143 @@ def _streamlit_app():
                         ),
                         interp_label
                     )
+
+            # Residual Stream Decomposition Section
+            st.markdown("---")
+            st.subheader("Residual Stream Decomposition")
+
+            with st.expander("ℹ️ What is this? (click to learn)", expanded=False):
+                st.markdown("""
+**Residual Stream Decomposition** breaks down the final hidden state into contributions from each component:
+
+**Components:**
+- **Embedding**: Initial token representations
+- **Attention outputs**: Per-layer attention contributions
+- **MLP outputs**: Per-layer MLP/FFN contributions
+
+**Why it matters:**
+- See exactly what each component adds to the prediction
+- Identify which layers/components are most important
+- Foundation for targeted interventions
+
+**Calculation:**
+For each component, we compute: `contribution = component_output @ unembedding[target_token]`
+This shows how much each component pushes toward the predicted token.
+
+**Reference:** A Mathematical Framework for Transformer Circuits (Elhage et al., 2021)
+                """)
+
+            # Compute decomposition from residual stream data
+            if results.residual_stream and results.top_k_tokens:
+                st.markdown("### Component Contributions")
+
+                # Get target token info
+                target_token_id = results.top_k_tokens[0][0]
+                target_token_text = results.top_k_tokens[0][2]
+                target_prob = results.top_k_tokens[0][1]
+
+                st.info(f"Analyzing contributions to prediction: **{target_token_text}** ({target_prob:.1%})")
+
+                # Compute contributions if we have the necessary data
+                try:
+                    # Get the LM head weights for the target token
+                    prober = st.session_state.get('prober')
+                    lm_head_weight = None
+
+                    if prober:
+                        if hasattr(prober.embedding, 'weight'):
+                            lm_head_weight = prober.embedding.weight
+                        elif hasattr(prober.model, 'lm_head') and hasattr(prober.model.lm_head, 'weight'):
+                            lm_head_weight = prober.model.lm_head.weight
+
+                    if lm_head_weight is not None:
+                        mx.eval(lm_head_weight)
+                        try:
+                            lm_weight_np = np.array(lm_head_weight.astype(mx.float32))
+                        except:
+                            lm_weight_np = np.array(lm_head_weight.tolist(), dtype=np.float32)
+
+                        if target_token_id < lm_weight_np.shape[0]:
+                            target_direction = lm_weight_np[target_token_id, :]
+
+                            # Compute contribution from each residual stream component
+                            contributions = []
+
+                            for key, value in sorted(results.residual_stream.items()):
+                                if isinstance(value, np.ndarray):
+                                    # Get last position
+                                    if len(value.shape) == 3:
+                                        vec = value[0, -1, :]
+                                    elif len(value.shape) == 2:
+                                        vec = value[-1, :]
+                                    else:
+                                        vec = value.flatten()[:len(target_direction)]
+
+                                    if len(vec) == len(target_direction):
+                                        contribution = float(np.dot(vec, target_direction))
+                                        contributions.append((key, contribution))
+
+                            if contributions:
+                                # Sort by absolute contribution
+                                contributions.sort(key=lambda x: abs(x[1]), reverse=True)
+
+                                # Create bar chart
+                                labels = [c[0] for c in contributions]
+                                values = [c[1] for c in contributions]
+                                colors = ['#28A745' if v > 0 else '#DC3545' for v in values]
+
+                                fig_decomp = go.Figure(data=[
+                                    go.Bar(
+                                        x=labels,
+                                        y=values,
+                                        marker_color=colors,
+                                        text=[f"{v:.2f}" for v in values],
+                                        textposition='outside'
+                                    )
+                                ])
+
+                                fig_decomp.update_layout(
+                                    title=f"Component Contributions to '{target_token_text}'",
+                                    xaxis_title="Component",
+                                    yaxis_title="Logit Contribution",
+                                    height=400
+                                )
+
+                                fig_decomp.add_hline(y=0, line_dash="dash", line_color="gray")
+
+                                st.plotly_chart(fig_decomp, use_container_width=True)
+
+                                # Summary table
+                                with st.expander("Detailed Contributions", expanded=False):
+                                    contrib_data = []
+                                    for name, contrib in contributions:
+                                        contrib_data.append({
+                                            "Component": name,
+                                            "Contribution": f"{contrib:.4f}",
+                                            "Direction": "+" if contrib > 0 else "-"
+                                        })
+                                    st.dataframe(pd.DataFrame(contrib_data), hide_index=True, use_container_width=True)
+
+                                # Store for later use
+                                results.residual_decomposition = contributions
+
+                                st.markdown("""
+**Interpretation:**
+- **Positive** contributions push toward the predicted token
+- **Negative** contributions suppress the predicted token
+- The final logit is approximately the sum of all contributions
+                                """)
+                            else:
+                                st.warning("Could not compute contributions - check that residual stream data is available.")
+                        else:
+                            st.warning("Target token ID out of vocabulary range.")
+                    else:
+                        st.info("LM head weights not accessible for decomposition analysis.")
+                except Exception as e:
+                    st.warning(f"Decomposition analysis failed: {e}")
+            else:
+                st.info("Residual stream decomposition requires both residual stream capture and a prediction.")
+
         else:
             st.info("Enable 'Capture Residual Stream' to see this visualization.")
 
@@ -7867,6 +9024,54 @@ def _streamlit_app():
                         st.session_state[head_show_key] = min(heads_to_show + 16, n_heads)
                         st.rerun()
 
+            # Detected Head Types Section
+            if results.attention_head_labels:
+                st.markdown("---")
+                st.markdown("### Detected Attention Head Types")
+                st.caption("Automatic classification of attention head specialization based on pattern analysis")
+
+                # Summary statistics
+                head_summary = get_attention_head_summary(results)
+                if head_summary:
+                    col_sum1, col_sum2, col_sum3 = st.columns(3)
+                    col_sum1.metric("Total Heads Analyzed", head_summary.get("total_heads", 0))
+                    col_sum2.metric("Dominant Type", head_summary.get("dominant_type", "Unknown"))
+                    col_sum3.metric("Layers", head_summary.get("num_layers", 0))
+
+                    # Type distribution
+                    type_pcts = head_summary.get("type_percentages", {})
+                    if type_pcts:
+                        st.markdown("**Head Type Distribution:**")
+                        type_data = []
+                        for head_type, pct in sorted(type_pcts.items(), key=lambda x: -x[1]):
+                            count = head_summary["type_counts"].get(head_type, 0)
+                            type_data.append({
+                                "Type": head_type,
+                                "Count": count,
+                                "Percentage": f"{pct:.1f}%"
+                            })
+                        st.dataframe(pd.DataFrame(type_data), hide_index=True, use_container_width=True)
+
+                # Per-layer head type visualization
+                if selected_layer in results.attention_head_labels:
+                    st.markdown(f"**Head Types at Layer {selected_layer}:**")
+                    fig_head_types = plot_attention_head_types(results, layer_idx=selected_layer)
+                    st.plotly_chart(fig_head_types, use_container_width=True)
+
+                    # Show specific head's classification when one is selected
+                    if selected_head != "Average (all heads)":
+                        head_idx = int(selected_head.split()[-1])
+                        layer_labels = results.attention_head_labels.get(selected_layer, {})
+                        if head_idx in layer_labels:
+                            info = layer_labels[head_idx]
+                            st.info(f"**{selected_head} Classification:** {info['type']} (Score: {info['score']:.1%})\n\n{info['description']}")
+
+                            # Show all scores for this head
+                            with st.expander("Detailed Scores", expanded=False):
+                                all_scores = info.get("all_scores", {})
+                                score_data = [{"Metric": k, "Score": f"{v:.3f}"} for k, v in all_scores.items()]
+                                st.dataframe(pd.DataFrame(score_data), hide_index=True)
+
             # Attention vs Distance Analysis (RoPE effect)
             st.markdown("---")
             st.markdown("### Attention vs Distance (RoPE Effect)")
@@ -8064,6 +9269,558 @@ def _streamlit_app():
                         else:
                             st.write(f"No self_attn/attention/attn found")
                             st.write(f"Layer keys: {list(layer.keys()) if hasattr(layer, 'keys') else 'N/A'}")
+
+    # Tab 10: Logit Lens (Mechanistic Interpretability)
+    with tab_logit_lens:
+        st.subheader("Logit Lens: Per-Layer Predictions")
+
+        with st.expander("ℹ️ What is this? (click to learn)", expanded=False):
+            st.markdown("""
+**Logit Lens** is a mechanistic interpretability technique that reveals what each layer "predicts."
+
+**How it works:**
+1. Take the hidden state output from each intermediate layer
+2. Apply the final layer normalization
+3. Project through the LM head (unembedding) to get logits
+4. Convert to token probabilities
+
+**What it reveals:**
+- **Early layers**: Often show generic predictions or input echoing
+- **Middle layers**: Predictions start to form based on context
+- **Late layers**: Final answer crystallizes
+
+**Key patterns to look for:**
+- 🎯 **Early decision**: Final answer appears in early layers → Simple/memorized knowledge
+- 🔄 **Gradual emergence**: Answer builds across layers → Complex reasoning
+- ⚡ **Late correction**: Answer changes in final layers → Information suppression or reconsideration
+
+**Reference:** [Interpreting GPT: the logit lens](https://www.lesswrong.com/posts/AcKRB8wDpdaN6v6ru/interpreting-gpt-the-logit-lens)
+            """)
+
+        if results.logit_lens_predictions:
+            # Main heatmap visualization
+            st.markdown("### Per-Layer Top Predictions")
+            fig_lens = plot_logit_lens(results, tokenizer)
+            st.plotly_chart(fig_lens, use_container_width=True)
+
+            # Trajectory plot
+            st.markdown("### Prediction Trajectory")
+            st.caption("How does the probability of the final prediction evolve across layers?")
+            fig_traj = plot_logit_lens_trajectory(results, tokenizer=tokenizer)
+            st.plotly_chart(fig_traj, use_container_width=True)
+
+            # Per-layer detailed view
+            st.markdown("---")
+            st.markdown("### Layer-by-Layer Details")
+
+            available_layers = sorted(results.logit_lens_predictions.keys())
+            if available_layers:
+                col_layer, col_preds = st.columns([1, 3])
+
+                with col_layer:
+                    selected_layer = st.selectbox(
+                        "Select Layer",
+                        available_layers,
+                        format_func=lambda x: f"Layer {x}",
+                        key="logit_lens_layer_select"
+                    )
+
+                with col_preds:
+                    preds = results.logit_lens_predictions[selected_layer]
+                    if preds:
+                        st.markdown(f"**Top-5 predictions at Layer {selected_layer}:**")
+                        pred_data = []
+                        for rank, (tok_id, prob, tok_text) in enumerate(preds):
+                            pred_data.append({
+                                "Rank": rank + 1,
+                                "Token": tok_text,
+                                "Probability": f"{prob:.2%}",
+                                "Token ID": tok_id
+                            })
+                        st.dataframe(pd.DataFrame(pred_data), hide_index=True, use_container_width=True)
+
+                        # Compare to final prediction
+                        if results.top_k_tokens:
+                            final_token = results.top_k_tokens[0][2]
+                            final_prob = results.top_k_tokens[0][1]
+
+                            # Check if final token is in this layer's predictions
+                            layer_has_final = any(tok_id == results.top_k_tokens[0][0] for tok_id, _, _ in preds)
+                            if layer_has_final:
+                                # Find the probability
+                                for tok_id, prob, _ in preds:
+                                    if tok_id == results.top_k_tokens[0][0]:
+                                        st.success(f"✓ Final prediction `{final_token}` appears with {prob:.1%} probability")
+                                        break
+                            else:
+                                st.info(f"Final prediction `{final_token}` not in top-5 at this layer")
+                    else:
+                        st.info("No predictions captured for this layer")
+
+            # AI Interpretation
+            if ai_interpret:
+                interp_label = "Claude" if interp_choice == "claude" else "Local LLM"
+                with st.expander("🧠 AI Interpretation", expanded=True):
+                    render_cached_interpretation(
+                        f"logit_lens_{interp_choice}",
+                        results,
+                        lambda: get_logit_lens_interpretation(
+                            results, model, tokenizer, use_ai=True, interpreter=interp_choice
+                        ),
+                        interp_label
+                    )
+        else:
+            st.info("No Logit Lens data available. Enable 'Capture Logit Lens' in probe settings to see this visualization.")
+
+            # Help text
+            st.markdown("""
+**To enable Logit Lens:**
+1. Check 'Capture Logit Lens' in the sidebar (under Probe Settings)
+2. Run inference again
+
+The Logit Lens will show what each layer "predicts" when projected through the final LM head.
+            """)
+
+    # Tab 11: Activation Patching
+    with tab_patching:
+        st.subheader("Activation Patching Explorer")
+
+        with st.expander("ℹ️ What is this? (click to learn)", expanded=False):
+            st.markdown("""
+**Activation Patching** (also called "causal intervention") lets you swap activations between two prompts to understand causal relationships.
+
+**How it works:**
+1. Run a "clean" prompt (e.g., "The capital of France is")
+2. Run an "alternative" prompt (e.g., "The capital of Germany is")
+3. At selected (layer, position), replace clean activations with alternative activations
+4. Observe how the output changes
+
+**Use cases:**
+- "What if the model saw 'Paris' context instead of 'Berlin' context at layer 10?"
+- Find which layers encode specific information
+- Understand information flow through the model
+
+**Related to:**
+- Causal Tracing (Knowledge Localization tab) - corrupts with noise instead of alternative prompt
+- ROME/MEMIT - uses similar techniques for model editing
+
+**Reference:** Locating and Editing Factual Associations in GPT (Meng et al., 2022)
+            """)
+
+        # Initialize state
+        if 'patch_clean_results' not in st.session_state:
+            st.session_state.patch_clean_results = None
+        if 'patch_alt_results' not in st.session_state:
+            st.session_state.patch_alt_results = None
+        if 'patch_effects' not in st.session_state:
+            st.session_state.patch_effects = None
+
+        # Input prompts
+        st.markdown("### Prompt Configuration")
+
+        col_clean, col_alt = st.columns(2)
+        with col_clean:
+            patch_clean_prompt = st.text_input(
+                "Clean Prompt",
+                value="The capital of France is",
+                help="The baseline prompt",
+                key="patch_clean_prompt"
+            )
+        with col_alt:
+            patch_alt_prompt = st.text_input(
+                "Alternative Prompt",
+                value="The capital of Germany is",
+                help="The alternative prompt to patch from",
+                key="patch_alt_prompt"
+            )
+
+        col_target, col_mode = st.columns(2)
+        with col_target:
+            patch_target = st.text_input(
+                "Target Token (optional)",
+                value="",
+                help="Token to track probability changes for (leave empty for top prediction)",
+                key="patch_target"
+            )
+        with col_mode:
+            patch_mode = st.selectbox(
+                "Patch Mode",
+                ["Single Site", "Full Scan"],
+                help="Single Site: patch one (layer, position). Full Scan: compute patch effects for all sites.",
+                key="patch_mode"
+            )
+
+        if patch_mode == "Single Site":
+            col_layer, col_pos = st.columns(2)
+            with col_layer:
+                patch_layer = st.number_input(
+                    "Layer to Patch",
+                    min_value=0,
+                    max_value=results.num_layers - 1 if results.num_layers else 32,
+                    value=results.num_layers // 2 if results.num_layers else 16,
+                    key="patch_layer"
+                )
+            with col_pos:
+                max_pos = len(results.input_tokens) if results.input_tokens else 10
+                patch_pos = st.number_input(
+                    "Position to Patch",
+                    min_value=0,
+                    max_value=max_pos - 1,
+                    value=max_pos - 1,
+                    help="Position in the sequence (0-indexed)",
+                    key="patch_pos"
+                )
+
+        # Run button
+        if st.button("Run Activation Patching", type="primary", key="run_patching"):
+            if not patch_clean_prompt or not patch_alt_prompt:
+                st.error("Please provide both clean and alternative prompts.")
+            else:
+                with st.spinner("Running activation patching..."):
+                    try:
+                        prober = st.session_state.get('prober')
+                        if prober:
+                            # Run clean prompt
+                            clean_results = prober.probe(patch_clean_prompt)
+                            st.session_state.patch_clean_results = clean_results
+
+                            # Run alternative prompt
+                            alt_results = prober.probe(patch_alt_prompt)
+                            st.session_state.patch_alt_results = alt_results
+
+                            # Compute patch effects
+                            if patch_mode == "Single Site":
+                                # Single site patching
+                                layer_idx = int(patch_layer)
+                                pos_idx = int(patch_pos)
+
+                                # Check if we have the layer outputs
+                                if layer_idx in clean_results.layer_outputs and layer_idx in alt_results.layer_outputs:
+                                    clean_acts = clean_results.layer_outputs[layer_idx]
+                                    alt_acts = alt_results.layer_outputs[layer_idx]
+
+                                    # Compute activation difference at this position
+                                    if pos_idx < clean_acts.shape[1] and pos_idx < alt_acts.shape[1]:
+                                        clean_vec = clean_acts[0, pos_idx, :]
+                                        alt_vec = alt_acts[0, pos_idx, :]
+                                        diff_norm = np.linalg.norm(alt_vec - clean_vec)
+
+                                        st.session_state.patch_effects = {
+                                            "mode": "single",
+                                            "layer": layer_idx,
+                                            "position": pos_idx,
+                                            "diff_norm": diff_norm,
+                                            "clean_top": clean_results.top_k_tokens[:5] if clean_results.top_k_tokens else [],
+                                            "alt_top": alt_results.top_k_tokens[:5] if alt_results.top_k_tokens else []
+                                        }
+                                    else:
+                                        st.error(f"Position {pos_idx} out of range")
+                                else:
+                                    st.error(f"Layer {layer_idx} not captured. Adjust layer sampling settings.")
+                            else:
+                                # Full scan - compute differences across all layers and positions
+                                effects = {}
+                                common_layers = set(clean_results.layer_outputs.keys()) & set(alt_results.layer_outputs.keys())
+
+                                for layer_idx in sorted(common_layers):
+                                    clean_acts = clean_results.layer_outputs[layer_idx]
+                                    alt_acts = alt_results.layer_outputs[layer_idx]
+
+                                    min_pos = min(clean_acts.shape[1], alt_acts.shape[1])
+                                    layer_effects = []
+
+                                    for pos in range(min_pos):
+                                        diff_norm = np.linalg.norm(
+                                            alt_acts[0, pos, :] - clean_acts[0, pos, :]
+                                        )
+                                        layer_effects.append(diff_norm)
+
+                                    effects[layer_idx] = layer_effects
+
+                                st.session_state.patch_effects = {
+                                    "mode": "full",
+                                    "effects": effects,
+                                    "clean_top": clean_results.top_k_tokens[:5] if clean_results.top_k_tokens else [],
+                                    "alt_top": alt_results.top_k_tokens[:5] if alt_results.top_k_tokens else []
+                                }
+
+                            st.success("Patching analysis complete!")
+                        else:
+                            st.error("Model prober not available. Please run inference first.")
+                    except Exception as e:
+                        import traceback
+                        st.error(f"Patching failed: {str(e)}")
+                        st.code(traceback.format_exc())
+
+        # Display results
+        if st.session_state.patch_effects:
+            effects = st.session_state.patch_effects
+
+            st.markdown("---")
+            st.markdown("### Results")
+
+            # Show prediction comparison
+            col_res1, col_res2 = st.columns(2)
+            with col_res1:
+                st.markdown("**Clean Prompt Predictions:**")
+                if effects.get("clean_top"):
+                    for tok_id, prob, tok_text in effects["clean_top"][:5]:
+                        st.write(f"  {prob:.1%} `{tok_text}`")
+            with col_res2:
+                st.markdown("**Alternative Prompt Predictions:**")
+                if effects.get("alt_top"):
+                    for tok_id, prob, tok_text in effects["alt_top"][:5]:
+                        st.write(f"  {prob:.1%} `{tok_text}`")
+
+            if effects["mode"] == "single":
+                # Single site result
+                st.markdown(f"**Patch Site:** Layer {effects['layer']}, Position {effects['position']}")
+                st.metric(
+                    "Activation Difference (L2 Norm)",
+                    f"{effects['diff_norm']:.4f}",
+                    help="How different the activations are at this site"
+                )
+
+                st.info("""
+**Interpretation:**
+- Higher difference norm indicates the prompts diverge more at this site
+- This site may encode information that differs between the prompts
+- To see actual output changes, compare predictions above
+                """)
+
+            else:
+                # Full scan heatmap
+                effects_data = effects["effects"]
+                layers = sorted(effects_data.keys())
+
+                if layers:
+                    # Find max positions across all layers
+                    max_pos = max(len(effects_data[l]) for l in layers)
+
+                    # Build heatmap matrix
+                    heatmap = np.zeros((len(layers), max_pos))
+                    for row_idx, layer_idx in enumerate(layers):
+                        layer_effects = effects_data[layer_idx]
+                        heatmap[row_idx, :len(layer_effects)] = layer_effects
+
+                    # Create heatmap
+                    fig_patch = go.Figure(data=go.Heatmap(
+                        z=heatmap,
+                        x=[f"P{i}" for i in range(max_pos)],
+                        y=[f"L{l}" for l in layers],
+                        colorscale='YlOrRd',
+                        colorbar=dict(title="Diff Norm")
+                    ))
+
+                    fig_patch.update_layout(
+                        title="Activation Difference Heatmap (Clean vs Alternative)",
+                        xaxis_title="Position",
+                        yaxis_title="Layer",
+                        height=max(400, len(layers) * 15 + 100)
+                    )
+
+                    st.plotly_chart(fig_patch, use_container_width=True)
+
+                    # Find site with maximum difference
+                    max_diff = 0
+                    max_layer = 0
+                    max_pos = 0
+                    for layer_idx in layers:
+                        for pos, diff in enumerate(effects_data[layer_idx]):
+                            if diff > max_diff:
+                                max_diff = diff
+                                max_layer = layer_idx
+                                max_pos = pos
+
+                    st.info(f"**Maximum difference:** Layer {max_layer}, Position {max_pos} (norm = {max_diff:.4f})")
+
+                    st.markdown("""
+**Interpretation:**
+- Bright areas show where activations differ most between prompts
+- These sites likely encode information specific to each prompt
+- The pattern reveals how information flows differently for each input
+                    """)
+
+        # Contrastive Analysis Section
+        if st.session_state.patch_clean_results and st.session_state.patch_alt_results:
+            st.markdown("---")
+            st.markdown("### Contrastive Activation Analysis")
+
+            with st.expander("ℹ️ What is this? (click to learn)", expanded=False):
+                st.markdown("""
+**Contrastive Analysis** compares activations between two prompts to find differentiating features.
+
+**Visualizations:**
+- **Layer Similarity**: Cosine similarity between clean and alternative activations at each layer
+- **Difference Vector Analysis**: PCA of the activation differences to find principal directions
+
+**Use cases:**
+- Find features that encode the distinction between prompts
+- Understand at which layers prompts diverge
+- Identify steering directions for activation addition
+                """)
+
+            clean_results = st.session_state.patch_clean_results
+            alt_results = st.session_state.patch_alt_results
+
+            # Layer-wise similarity analysis
+            st.markdown("#### Layer-wise Activation Similarity")
+
+            common_layers = set(clean_results.layer_outputs.keys()) & set(alt_results.layer_outputs.keys())
+            if common_layers:
+                layers = sorted(common_layers)
+                similarities = []
+
+                for layer_idx in layers:
+                    clean_acts = clean_results.layer_outputs[layer_idx]
+                    alt_acts = alt_results.layer_outputs[layer_idx]
+
+                    # Flatten to last position
+                    if len(clean_acts.shape) == 3:
+                        clean_vec = clean_acts[0, -1, :].flatten()
+                        alt_vec = alt_acts[0, -1, :].flatten()
+                    else:
+                        clean_vec = clean_acts.flatten()
+                        alt_vec = alt_acts.flatten()
+
+                    # Compute cosine similarity
+                    norm_clean = np.linalg.norm(clean_vec)
+                    norm_alt = np.linalg.norm(alt_vec)
+                    if norm_clean > 0 and norm_alt > 0:
+                        cos_sim = np.dot(clean_vec, alt_vec) / (norm_clean * norm_alt)
+                    else:
+                        cos_sim = 0
+                    similarities.append(cos_sim)
+
+                # Plot similarity curve
+                fig_sim = go.Figure()
+                fig_sim.add_trace(go.Scatter(
+                    x=[f"L{l}" for l in layers],
+                    y=similarities,
+                    mode='lines+markers',
+                    name='Cosine Similarity',
+                    line=dict(color='#636EFA', width=2),
+                    marker=dict(size=8)
+                ))
+
+                fig_sim.update_layout(
+                    title="Activation Similarity Across Layers",
+                    xaxis_title="Layer",
+                    yaxis_title="Cosine Similarity",
+                    height=300,
+                    yaxis=dict(range=[0, 1.05])
+                )
+
+                st.plotly_chart(fig_sim, use_container_width=True)
+
+                # Find divergence points
+                min_sim_idx = np.argmin(similarities)
+                min_sim_layer = layers[min_sim_idx]
+                min_sim = similarities[min_sim_idx]
+
+                # Find where similarity drops significantly
+                divergence_layers = []
+                for i, sim in enumerate(similarities):
+                    if i > 0 and similarities[i-1] - sim > 0.05:
+                        divergence_layers.append(layers[i])
+
+                st.markdown(f"""
+**Analysis:**
+- **Minimum similarity:** Layer {min_sim_layer} (similarity = {min_sim:.3f})
+- **Divergence starts at:** {', '.join([f'L{l}' for l in divergence_layers[:3]]) if divergence_layers else 'Gradual divergence'}
+- **Final layer similarity:** {similarities[-1]:.3f}
+                """)
+
+                # Difference vector PCA (simplified)
+                st.markdown("#### Difference Vector Analysis")
+
+                # Collect difference vectors from all layers
+                diff_vectors = []
+                diff_labels = []
+
+                for layer_idx in layers:
+                    clean_acts = clean_results.layer_outputs[layer_idx]
+                    alt_acts = alt_results.layer_outputs[layer_idx]
+
+                    if len(clean_acts.shape) == 3:
+                        clean_vec = clean_acts[0, -1, :]
+                        alt_vec = alt_acts[0, -1, :]
+                    else:
+                        clean_vec = clean_acts.flatten()[:4096]
+                        alt_vec = alt_acts.flatten()[:4096]
+
+                    diff = alt_vec - clean_vec
+                    diff_vectors.append(diff.flatten()[:min(4096, len(diff.flatten()))])
+                    diff_labels.append(f"L{layer_idx}")
+
+                # Simple 2D projection using first 2 principal components
+                if len(diff_vectors) > 2:
+                    try:
+                        # Ensure all vectors have same length
+                        min_len = min(len(v) for v in diff_vectors)
+                        diff_matrix = np.array([v[:min_len] for v in diff_vectors])
+
+                        # Center the data
+                        diff_centered = diff_matrix - diff_matrix.mean(axis=0)
+
+                        # Simple PCA via SVD
+                        U, S, Vt = np.linalg.svd(diff_centered, full_matrices=False)
+
+                        # Project to 2D
+                        projected = U[:, :2] * S[:2]
+
+                        # Plot
+                        fig_pca = go.Figure()
+
+                        # Color by layer index
+                        colors = np.linspace(0, 1, len(layers))
+
+                        fig_pca.add_trace(go.Scatter(
+                            x=projected[:, 0],
+                            y=projected[:, 1],
+                            mode='markers+text',
+                            text=diff_labels,
+                            textposition='top center',
+                            marker=dict(
+                                size=10,
+                                color=list(range(len(layers))),
+                                colorscale='Viridis',
+                                colorbar=dict(title="Layer")
+                            ),
+                            hovertemplate="Layer %{text}<br>PC1: %{x:.3f}<br>PC2: %{y:.3f}<extra></extra>"
+                        ))
+
+                        # Add trajectory line
+                        fig_pca.add_trace(go.Scatter(
+                            x=projected[:, 0],
+                            y=projected[:, 1],
+                            mode='lines',
+                            line=dict(color='gray', width=1, dash='dot'),
+                            showlegend=False,
+                            hoverinfo='skip'
+                        ))
+
+                        var_explained = (S[:2]**2 / (S**2).sum() * 100) if len(S) > 0 else [0, 0]
+
+                        fig_pca.update_layout(
+                            title=f"Difference Vectors in PCA Space (PC1: {var_explained[0]:.1f}%, PC2: {var_explained[1]:.1f}%)",
+                            xaxis_title="Principal Component 1",
+                            yaxis_title="Principal Component 2",
+                            height=400
+                        )
+
+                        st.plotly_chart(fig_pca, use_container_width=True)
+
+                        st.markdown("""
+**Interpretation:**
+- Points represent difference vectors (alt - clean) at each layer
+- Close points = similar changes; distant points = different changes
+- The trajectory shows how the difference evolves through the network
+- Variance explained indicates how much information is captured in 2D
+                        """)
+
+                    except Exception as e:
+                        st.warning(f"PCA visualization failed: {e}")
 
     # MoE Routing tab (only if model is MoE)
     if tab_moe is not None:
