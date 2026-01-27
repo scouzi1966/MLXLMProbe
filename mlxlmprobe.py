@@ -75,6 +75,9 @@ except ImportError:
 import shutil
 import subprocess
 
+# Version - update this when releasing
+__version__ = "0.1.5"
+
 
 # =============================================================================
 # Performance Utilities - Caching and Background Processing
@@ -7905,8 +7908,14 @@ def _streamlit_app():
         layout="wide"
     )
 
+    # Clear caches when version changes (ensures users get fresh UI after upgrade)
+    if "app_version" not in st.session_state or st.session_state.app_version != __version__:
+        st.cache_data.clear()
+        st.cache_resource.clear()
+        st.session_state.app_version = __version__
+
     st.title("🔬 MLXLMProbe")
-    st.caption("v0.1.4 | Universal probing tool for MLX language models")
+    st.caption(f"v{__version__} | Universal probing tool for MLX language models")
     st.markdown(
         "[![GitHub stars](https://img.shields.io/github/stars/scouzi1966/MLXLMProbe?style=social)](https://github.com/scouzi1966/MLXLMProbe) "
         "[![GitHub issues](https://img.shields.io/github/issues/scouzi1966/MLXLMProbe)](https://github.com/scouzi1966/MLXLMProbe/issues)"
