@@ -661,7 +661,7 @@ class ProbeConfig:
     capture_token_probs: bool = True
     capture_attention: bool = True  # Capture attention patterns
     capture_logit_lens: bool = True  # Capture Logit Lens predictions per layer
-    capture_logit_lens_full_sequence: bool = False  # Capture all positions (memory intensive)
+    capture_logit_lens_full_sequence: bool = True  # Capture all positions (memory intensive)
     layer_indices: Optional[List[int]] = None
     max_sequence_positions: int = 512
 
@@ -1847,21 +1847,25 @@ class ModelProber:
             max_pos = min(seq_len, self.config.max_sequence_positions)
 
             if self.config.capture_logit_lens_full_sequence:
-                # Capture all positions
-                positions_to_capture = range(max_pos)
+                # Capture all positions (limit to prevent memory issues)
+                positions_to_capture = list(range(min(max_pos, 512)))  # Cap at 512 positions
             else:
                 # Only capture last position
                 positions_to_capture = [seq_len - 1]
 
             for pos in positions_to_capture:
-                logits_pos = layer_logits[0, pos, :].astype(mx.float32)
+                # Extract single position and immediately convert to numpy to free MLX memory
+                logits_pos = layer_logits[0, pos, :]
                 mx.eval(logits_pos)
 
-                # Convert to numpy
+                # Convert to numpy immediately
                 try:
-                    logits_np = np.array(logits_pos)
+                    logits_np = np.array(logits_pos.astype(mx.float32))
                 except (RuntimeError, TypeError, ValueError):
                     logits_np = np.array(logits_pos.tolist(), dtype=np.float32)
+
+                # Free the MLX tensor
+                del logits_pos
 
                 # Compute probabilities
                 max_logit = logits_np.max()
@@ -1890,6 +1894,11 @@ class ModelProber:
                 # Always store last position in the standard dict for backward compatibility
                 if pos == seq_len - 1:
                     self.results.logit_lens_predictions[layer_idx] = predictions
+
+            # Free layer_logits to reduce memory pressure
+            del layer_logits
+            import gc
+            gc.collect()
 
         except Exception as e:
             # Logit lens capture failed - non-critical
@@ -2148,20 +2157,6 @@ class ModelProber:
         def compute_norm(arr: np.ndarray) -> float:
             return float(np.linalg.norm(arr, axis=-1).mean())
 
-        # Create causal attention mask - CRITICAL for correct logit lens behavior
-        # Without this, position P can see position P+1, breaking next-token prediction
-        seq_len = x.shape[1]
-        try:
-            from mlx.nn import MultiHeadAttention
-            causal_mask = MultiHeadAttention.create_additive_causal_mask(seq_len)
-            mx.eval(causal_mask)
-        except Exception:
-            # Fallback: create mask manually
-            # 0 where can attend, -inf where blocked
-            causal_mask = mx.full((seq_len, seq_len), -1e9, dtype=mx.float32)
-            causal_mask = mx.triu(causal_mask, k=1)  # Upper triangle (excluding diagonal) = -inf
-            mx.eval(causal_mask)
-
         # 1. Embedding
         if self.embedding is not None:
             h = self.embedding(x)
@@ -2178,6 +2173,22 @@ class ModelProber:
         else:
             h = x
             prev_h = None
+
+        # Create causal attention mask - CRITICAL for correct logit lens behavior
+        # Without this, position P can see position P+1, breaking next-token prediction
+        # Must be created AFTER embedding to match dtype (e.g., bfloat16)
+        seq_len = x.shape[1]
+        model_dtype = h.dtype  # Match the model's dtype
+        try:
+            from mlx.nn import MultiHeadAttention
+            causal_mask = MultiHeadAttention.create_additive_causal_mask(seq_len, dtype=model_dtype)
+            mx.eval(causal_mask)
+        except Exception:
+            # Fallback: create mask manually with matching dtype
+            # 0 where can attend, -inf where blocked
+            causal_mask = mx.full((seq_len, seq_len), -1e9, dtype=model_dtype)
+            causal_mask = mx.triu(causal_mask, k=1)  # Upper triangle (excluding diagonal) = -inf
+            mx.eval(causal_mask)
 
         # 2. Transformer layers
         for i, layer in enumerate(self.layers):
@@ -2273,6 +2284,43 @@ class ModelProber:
                 if not text or text.isspace():
                     text = f"<{idx_int}>"
                 self.results.top_k_tokens.append((idx_int, prob, text))
+
+            # Add FINAL output to logit lens (after output normalization - this is the actual output)
+            # Use layer index = num_layers to represent the final output
+            if self.config.capture_logit_lens:
+                final_layer_idx = len(self.layers)  # One past last layer
+                final_predictions = []
+                for idx in top_indices[:5]:  # Top 5 for logit lens
+                    idx_int = int(idx)
+                    prob = float(self.results.token_probs[idx]) if self.results.token_probs is not None else 0.0
+                    text = self.decode_token(idx_int)
+                    if not text or text.isspace():
+                        text = f"<{idx_int}>"
+                    final_predictions.append((idx_int, prob, text))
+                self.results.logit_lens_predictions[final_layer_idx] = final_predictions
+
+                # Also add to full sequence data if enabled (for last position)
+                if self.config.capture_logit_lens_full_sequence:
+                    seq_len = logits.shape[1]
+                    # Store final output for all captured positions
+                    for pos in range(min(seq_len, self.config.max_sequence_positions, 512)):
+                        if pos not in self.results.logit_lens_by_position:
+                            self.results.logit_lens_by_position[pos] = {}
+                        # For non-last positions, compute from full logits
+                        pos_logits = np.array(logits[0, pos, :].astype(mx.float32))
+                        max_logit = pos_logits.max()
+                        exp_logits = np.exp(pos_logits - max_logit)
+                        pos_probs = exp_logits / exp_logits.sum()
+                        pos_top_indices = np.argsort(pos_logits)[-5:][::-1]
+                        pos_preds = []
+                        for idx in pos_top_indices:
+                            idx_int = int(idx)
+                            prob = float(pos_probs[idx])
+                            text = self.decode_token(idx_int)
+                            if not text or text.isspace():
+                                text = f"<{idx_int}>"
+                            pos_preds.append((idx_int, prob, text))
+                        self.results.logit_lens_by_position[pos][final_layer_idx] = pos_preds
 
         # 5. Detect attention head specialization (after all patterns captured)
         if self.config.capture_attention and self.results.attention_patterns:
@@ -3053,14 +3101,15 @@ class CausalTracer:
         on each call, making actual cost O(L^2 * positions) rather than O(L * positions).
         A future optimization could cache per-layer activations to avoid recomputation.
         """
-        # Create causal attention mask
+        # Create causal attention mask with matching dtype
         seq_len = clean_embeddings.shape[1]
+        model_dtype = clean_embeddings.dtype
         try:
             from mlx.nn import MultiHeadAttention
-            causal_mask = MultiHeadAttention.create_additive_causal_mask(seq_len)
+            causal_mask = MultiHeadAttention.create_additive_causal_mask(seq_len, dtype=model_dtype)
             mx.eval(causal_mask)
         except Exception:
-            causal_mask = mx.full((seq_len, seq_len), -1e9, dtype=mx.float32)
+            causal_mask = mx.full((seq_len, seq_len), -1e9, dtype=model_dtype)
             causal_mask = mx.triu(causal_mask, k=1)
             mx.eval(causal_mask)
 
@@ -4442,9 +4491,18 @@ def plot_logit_lens(results: ProbeResults, tokenizer=None) -> go.Figure:
         [[str(token_ids[r][c]) for c in range(num_layers)] for r in range(max_rank)]
     ])
 
+    # Create x-axis labels - last entry is "Final" (actual output after normalization)
+    max_layer_idx = max(layers) if layers else 0
+    x_labels = []
+    for l in layers:
+        if l == max_layer_idx and l > 0:
+            x_labels.append("Final")  # The actual model output
+        else:
+            x_labels.append(f"L{l}")
+
     fig.add_trace(go.Heatmap(
         z=probs,
-        x=[f"L{l}" for l in layers],
+        x=x_labels,
         y=[f"Top-{i+1}" for i in range(max_rank)],
         colorscale='Viridis',
         colorbar=dict(title="Probability"),
@@ -4537,9 +4595,13 @@ def plot_logit_lens_trajectory(results: ProbeResults, target_token: str = None, 
 
     fig = go.Figure()
 
+    # Create x-axis labels - last entry is "Final" (actual output after normalization)
+    max_layer_idx = max(layers) if layers else 0
+    x_labels = [("Final" if l == max_layer_idx and l > 0 else f"L{l}") for l in layers]
+
     # Plot final token probability trajectory
     fig.add_trace(go.Scatter(
-        x=[f"L{l}" for l in layers],
+        x=x_labels,
         y=[p * 100 for p in final_token_probs],
         mode='lines+markers',
         name=f'P("{final_token[:15]}")',
@@ -4549,7 +4611,7 @@ def plot_logit_lens_trajectory(results: ProbeResults, target_token: str = None, 
 
     # Plot top-1 probability trajectory
     fig.add_trace(go.Scatter(
-        x=[f"L{l}" for l in layers],
+        x=x_labels,
         y=[p * 100 for p in top1_probs],
         mode='lines+markers',
         name='Top-1 Probability',
@@ -7393,7 +7455,7 @@ def _streamlit_app():
     capture_residual = st.sidebar.checkbox("Capture Residual Stream", value=True)
     capture_logit_lens = st.sidebar.checkbox("Capture Logit Lens", value=True,
         help="Project each layer's output through LM head to see per-layer predictions")
-    capture_logit_lens_full = st.sidebar.checkbox("  └ Full Sequence", value=False,
+    capture_logit_lens_full = st.sidebar.checkbox("  └ Full Sequence", value=True,
         help="Capture predictions at ALL positions (memory intensive for long sequences)",
         disabled=not capture_logit_lens)
 
@@ -7483,10 +7545,10 @@ def _streamlit_app():
         help="System instruction for the model (used when formatting the full prompt)"
     )
 
-    # User prompt (changed default to match AFM7)
+    # User prompt - simple factual query for logit lens testing
     user_prompt = st.text_area(
         "User Message",
-        value="Explain the concept of attention in neural networks in one paragraph.",
+        value="The capital of France is",
         height=100,
         help="The text you want to probe"
     )
@@ -8415,7 +8477,8 @@ def _streamlit_app():
                 with st.expander("🎯 Token Alternatives Inspector", expanded=False):
                     st.caption("See what other tokens the model considered at each generation step")
 
-                    alt_pos = st.slider("Generated Token Position", 0, max_gen_pos, 0, key="gen_token_alt_pos")
+                    max_alt_pos = len(results.generated_tokens) - 1
+                    alt_pos = st.slider("Generated Token Position", 0, max_alt_pos, 0, key="gen_token_alt_pos")
 
                     tok_id = results.generated_tokens[alt_pos]
                     tok_text = tokenizer.decode([tok_id])
@@ -9584,9 +9647,13 @@ This shows how much each component pushes toward the predicted token.
 
                     customdata = np.array([[token_texts[r][c] for c in range(len(layers))] for r in range(max_rank)])
 
+                    # Create x-axis labels - last entry is "Final" (actual output after normalization)
+                    max_layer_idx = max(layers) if layers else 0
+                    x_labels_pos = [("Final" if l == max_layer_idx and l > 0 else f"L{l}") for l in layers]
+
                     fig_pos_lens.add_trace(go.Heatmap(
                         z=probs_matrix,
-                        x=[f"L{l}" for l in layers],
+                        x=x_labels_pos,
                         y=[f"Top-{i+1}" for i in range(max_rank)],
                         colorscale='Viridis',
                         colorbar=dict(title="Prob"),
@@ -11622,14 +11689,25 @@ def main():
 
 if __name__ == "__main__":
     # Check if we're inside Streamlit runtime
+    # We need to detect this BEFORE deciding whether to launch or run
+    _inside_streamlit = False
     try:
         from streamlit.runtime.scriptrunner import get_script_run_ctx
-        if get_script_run_ctx() is not None:
-            # Running inside Streamlit - execute the app
-            _streamlit_app()
-        else:
-            # Running from command line - launch Streamlit
-            main()
+        _inside_streamlit = get_script_run_ctx() is not None
+    except ImportError:
+        # Streamlit not installed or import failed - definitely not inside Streamlit
+        _inside_streamlit = False
     except Exception:
-        # Fallback - launch Streamlit
+        # Other errors during context check - check environment variable as fallback
+        import os
+        _inside_streamlit = os.environ.get('STREAMLIT_RUNTIME_EXISTS', '') == '1'
+
+    if _inside_streamlit:
+        # Running inside Streamlit - execute the app
+        # Do NOT catch exceptions here - let Streamlit handle them
+        _streamlit_app()
+    else:
+        # Running from command line - launch Streamlit
+        import os
+        os.environ['STREAMLIT_RUNTIME_EXISTS'] = '1'
         main()
