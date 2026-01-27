@@ -52,7 +52,9 @@ A visual probing and interpretability tool for MLX language models on Apple Sili
 
 ## Installation
 
-### Option 1: Homebrew (Recommended)
+> **Important:** Choose ONE installation method. Installing via both Homebrew and pip can cause version conflicts.
+
+### Option 1: Homebrew (Recommended for Mac)
 
 ```bash
 brew install scouzi1966/afm/mlxlmprobe
@@ -61,6 +63,11 @@ brew install scouzi1966/afm/mlxlmprobe
 Then run:
 ```bash
 mlxlmprobe
+```
+
+To upgrade:
+```bash
+brew upgrade scouzi1966/afm/mlxlmprobe
 ```
 
 ### Option 2: pip
@@ -72,6 +79,11 @@ pip install mlxlmprobe
 Then run:
 ```bash
 mlxlmprobe
+```
+
+To upgrade:
+```bash
+pip install --upgrade mlxlmprobe
 ```
 
 ### Option 3: From Source
