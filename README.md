@@ -1,11 +1,11 @@
 # MLXLMProbe
 
-## TLDR install 
-brew install scouzi1966/afm/mlxlmprobe
-
-mlxlmprobe to run - That's it!
-
 A visual probing and interpretability tool for MLX language models on Apple Silicon.
+
+```bash
+pip install mlxlmprobe
+mlxlmprobe
+```
 
 > **Status:** Work in Progress - Currently testing with GPT-OSS and other MoE models
 
@@ -52,33 +52,8 @@ A visual probing and interpretability tool for MLX language models on Apple Sili
 
 ## Installation
 
-> **Important:** Choose ONE installation method. Installing via both Homebrew and pip can cause version conflicts.
-
-### Option 1: Homebrew (Recommended for Mac)
-
-```bash
-brew install scouzi1966/afm/mlxlmprobe
-```
-
-Then run:
-```bash
-mlxlmprobe
-```
-
-To upgrade:
-```bash
-brew upgrade scouzi1966/afm/mlxlmprobe
-```
-
-### Option 2: pip
-
 ```bash
 pip install mlxlmprobe
-```
-
-Then run:
-```bash
-mlxlmprobe
 ```
 
 To upgrade:
@@ -86,7 +61,7 @@ To upgrade:
 pip install --upgrade mlxlmprobe
 ```
 
-### Option 3: From Source
+### From Source
 
 ```bash
 git clone https://github.com/scouzi1966/MLXLMProbe.git
