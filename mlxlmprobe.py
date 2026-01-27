@@ -661,6 +661,7 @@ class ProbeConfig:
     capture_token_probs: bool = True
     capture_attention: bool = True  # Capture attention patterns
     capture_logit_lens: bool = True  # Capture Logit Lens predictions per layer
+    capture_logit_lens_full_sequence: bool = False  # Capture all positions (memory intensive)
     layer_indices: Optional[List[int]] = None
     max_sequence_positions: int = 512
 
@@ -780,6 +781,10 @@ class ProbeResults:
     # Logit Lens: per-layer predictions by projecting through LM head
     # {layer_idx: List[(token_id, probability, token_text)] for top-5 predictions}
     logit_lens_predictions: Dict[int, List[Tuple[int, float, str]]] = field(default_factory=dict)
+
+    # Logit Lens Full Sequence: per-position, per-layer predictions
+    # {position: {layer_idx: List[(token_id, probability, token_text)]}}
+    logit_lens_by_position: Dict[int, Dict[int, List[Tuple[int, float, str]]]] = field(default_factory=dict)
 
     # Attention Head Detection: per-head specialization labels
     # {layer_idx: {head_idx: {"type": str, "score": float, "description": str}}}
@@ -1814,6 +1819,8 @@ class ModelProber:
 
         This shows what each layer would "predict" if it were the final layer,
         revealing when the model "decides" on answers.
+
+        If capture_logit_lens_full_sequence is enabled, captures predictions for all positions.
         """
         try:
             # Apply output normalization (same as final layer)
@@ -1835,35 +1842,54 @@ class ModelProber:
 
             mx.eval(layer_logits)
 
-            # Get logits for last position only
-            logits_last = layer_logits[0, -1, :].astype(mx.float32)
-            mx.eval(logits_last)
+            # Determine which positions to capture
+            seq_len = layer_logits.shape[1]
+            max_pos = min(seq_len, self.config.max_sequence_positions)
 
-            # Convert to numpy
-            try:
-                logits_np = np.array(logits_last)
-            except (RuntimeError, TypeError, ValueError):
-                logits_np = np.array(logits_last.tolist(), dtype=np.float32)
+            if self.config.capture_logit_lens_full_sequence:
+                # Capture all positions
+                positions_to_capture = range(max_pos)
+            else:
+                # Only capture last position
+                positions_to_capture = [seq_len - 1]
 
-            # Compute probabilities
-            max_logit = logits_np.max()
-            exp_logits = np.exp(logits_np - max_logit)
-            probs = exp_logits / exp_logits.sum()
+            for pos in positions_to_capture:
+                logits_pos = layer_logits[0, pos, :].astype(mx.float32)
+                mx.eval(logits_pos)
 
-            # Get top-5 predictions
-            top_k = 5
-            top_indices = np.argsort(logits_np)[-top_k:][::-1]
+                # Convert to numpy
+                try:
+                    logits_np = np.array(logits_pos)
+                except (RuntimeError, TypeError, ValueError):
+                    logits_np = np.array(logits_pos.tolist(), dtype=np.float32)
 
-            predictions = []
-            for idx in top_indices:
-                idx_int = int(idx)
-                prob = float(probs[idx])
-                text = self.decode_token(idx_int)
-                if not text or text.isspace():
-                    text = f"<{idx_int}>"
-                predictions.append((idx_int, prob, text))
+                # Compute probabilities
+                max_logit = logits_np.max()
+                exp_logits = np.exp(logits_np - max_logit)
+                probs = exp_logits / exp_logits.sum()
 
-            self.results.logit_lens_predictions[layer_idx] = predictions
+                # Get top-5 predictions
+                top_k = 5
+                top_indices = np.argsort(logits_np)[-top_k:][::-1]
+
+                predictions = []
+                for idx in top_indices:
+                    idx_int = int(idx)
+                    prob = float(probs[idx])
+                    text = self.decode_token(idx_int)
+                    if not text or text.isspace():
+                        text = f"<{idx_int}>"
+                    predictions.append((idx_int, prob, text))
+
+                if self.config.capture_logit_lens_full_sequence:
+                    # Store by position, then layer
+                    if pos not in self.results.logit_lens_by_position:
+                        self.results.logit_lens_by_position[pos] = {}
+                    self.results.logit_lens_by_position[pos][layer_idx] = predictions
+
+                # Always store last position in the standard dict for backward compatibility
+                if pos == seq_len - 1:
+                    self.results.logit_lens_predictions[layer_idx] = predictions
 
         except Exception as e:
             # Logit lens capture failed - non-critical
@@ -7340,6 +7366,9 @@ def _streamlit_app():
     capture_residual = st.sidebar.checkbox("Capture Residual Stream", value=True)
     capture_logit_lens = st.sidebar.checkbox("Capture Logit Lens", value=True,
         help="Project each layer's output through LM head to see per-layer predictions")
+    capture_logit_lens_full = st.sidebar.checkbox("  └ Full Sequence", value=False,
+        help="Capture predictions at ALL positions (memory intensive for long sequences)",
+        disabled=not capture_logit_lens)
 
     # Max sequence positions
     max_seq_positions = st.sidebar.slider("Max Sequence Positions", 32, 512, 256,
@@ -7358,6 +7387,7 @@ def _streamlit_app():
         capture_residual_stream=capture_residual,
         capture_attention=capture_attention,
         capture_logit_lens=capture_logit_lens,
+        capture_logit_lens_full_sequence=capture_logit_lens_full and capture_logit_lens,
         max_sequence_positions=max_seq_positions
     )
 
@@ -9356,6 +9386,119 @@ This shows how much each component pushes toward the predicted token.
                                 st.info(f"Final prediction `{final_token}` not in top-5 at this layer")
                     else:
                         st.info("No predictions captured for this layer")
+
+            # Full Sequence Logit Lens (if enabled)
+            if results.logit_lens_by_position:
+                st.markdown("---")
+                st.markdown("### Full Sequence Analysis")
+                st.caption("Per-position predictions across layers (Full Sequence mode)")
+
+                positions = sorted(results.logit_lens_by_position.keys())
+                layers_available = sorted(results.logit_lens_by_position[positions[0]].keys()) if positions else []
+
+                if positions and layers_available:
+                    # Position selector
+                    col_pos_sel, col_pos_info = st.columns([1, 2])
+                    with col_pos_sel:
+                        # Build position labels with token text
+                        all_tokens = list(results.input_tokens) + results.generated_tokens
+                        pos_labels = {}
+                        for pos in positions:
+                            if pos < len(all_tokens):
+                                tok_text = tokenizer.decode([all_tokens[pos]]) if tokenizer else f"[{all_tokens[pos]}]"
+                                tok_text = tok_text[:15].replace('\n', '↵')
+                                pos_labels[pos] = f"Pos {pos}: {tok_text}"
+                            else:
+                                pos_labels[pos] = f"Pos {pos}"
+
+                        selected_pos = st.selectbox(
+                            "Select Position",
+                            positions,
+                            format_func=lambda x: pos_labels.get(x, f"Pos {x}"),
+                            key="logit_lens_pos_select"
+                        )
+
+                    with col_pos_info:
+                        if selected_pos < len(all_tokens):
+                            tok_id = all_tokens[selected_pos]
+                            tok_text = tokenizer.decode([tok_id]) if tokenizer else f"[{tok_id}]"
+                            st.info(f"**Token at position {selected_pos}:** `{tok_text}` (ID: {tok_id})")
+
+                    # Get predictions for selected position across all layers
+                    pos_data = results.logit_lens_by_position[selected_pos]
+
+                    # Build heatmap for this position
+                    layers = sorted(pos_data.keys())
+                    max_rank = 5
+
+                    probs_matrix = np.zeros((max_rank, len(layers)))
+                    token_texts = [['' for _ in range(len(layers))] for _ in range(max_rank)]
+
+                    for col_idx, layer_idx in enumerate(layers):
+                        preds = pos_data[layer_idx]
+                        for rank_idx, (tok_id, prob, tok_text) in enumerate(preds[:max_rank]):
+                            probs_matrix[rank_idx, col_idx] = prob
+                            token_texts[rank_idx][col_idx] = tok_text[:12]
+
+                    # Create heatmap
+                    fig_pos_lens = go.Figure()
+
+                    customdata = np.array([[token_texts[r][c] for c in range(len(layers))] for r in range(max_rank)])
+
+                    fig_pos_lens.add_trace(go.Heatmap(
+                        z=probs_matrix,
+                        x=[f"L{l}" for l in layers],
+                        y=[f"Top-{i+1}" for i in range(max_rank)],
+                        colorscale='Viridis',
+                        colorbar=dict(title="Prob"),
+                        customdata=customdata,
+                        hovertemplate="Layer %{x}<br>Rank: %{y}<br>Token: %{customdata}<br>Prob: %{z:.2%}<extra></extra>"
+                    ))
+
+                    # Add text annotations
+                    annotations = []
+                    for row_idx in range(max_rank):
+                        for col_idx in range(len(layers)):
+                            text = token_texts[row_idx][col_idx]
+                            prob = probs_matrix[row_idx, col_idx]
+                            if text and prob > 0.01:
+                                text_color = 'white' if prob > 0.5 else 'black'
+                                annotations.append(dict(
+                                    x=col_idx, y=row_idx, text=text[:8],
+                                    showarrow=False, font=dict(size=9, color=text_color),
+                                    xref='x', yref='y'
+                                ))
+
+                    fig_pos_lens.update_layout(
+                        title=f"Logit Lens at Position {selected_pos}",
+                        xaxis_title="Layer",
+                        yaxis_title="Prediction Rank",
+                        height=300,
+                        annotations=annotations
+                    )
+
+                    st.plotly_chart(fig_pos_lens, use_container_width=True)
+
+                    # Show top predictions at selected position for selected layer
+                    if selected_pos in results.logit_lens_by_position:
+                        col_ll_layer, col_ll_preds = st.columns([1, 2])
+                        with col_ll_layer:
+                            ll_layer = st.selectbox(
+                                "Layer",
+                                layers,
+                                format_func=lambda x: f"Layer {x}",
+                                key="logit_lens_pos_layer_select"
+                            )
+                        with col_ll_preds:
+                            if ll_layer in pos_data:
+                                preds = pos_data[ll_layer]
+                                pred_data = [{"Rank": i+1, "Token": t, "Probability": f"{p:.2%}"}
+                                             for i, (_, p, t) in enumerate(preds)]
+                                st.dataframe(pd.DataFrame(pred_data), hide_index=True, use_container_width=True)
+
+                    # Memory usage indicator
+                    total_entries = len(positions) * len(layers_available) * 5
+                    st.caption(f"📊 Full sequence data: {len(positions)} positions × {len(layers_available)} layers × 5 predictions = {total_entries:,} entries")
 
             # AI Interpretation
             if ai_interpret:
